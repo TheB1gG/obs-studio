@@ -110,6 +110,8 @@ static inline DXGI_FORMAT ConvertGSTextureFormatResource(gs_color_format format)
 		return DXGI_FORMAT_R16G16_UNORM;
 	case GS_AYUV:
 		return DXGI_FORMAT_AYUV;
+	case GS_Y410:
+		return DXGI_FORMAT_Y410;
 	}
 
 	return DXGI_FORMAT_UNKNOWN;
@@ -127,6 +129,8 @@ static inline DXGI_FORMAT ConvertGSTextureFormatView(gs_color_format format)
 	// Non-RGB formats require RGB views for shaders to access the underlying data.
 	case GS_AYUV:
 		return DXGI_FORMAT_R8G8B8A8_UNORM;
+	case GS_Y410:
+		return DXGI_FORMAT_R10G10B10A2_UNORM;
 	default:
 		return ConvertGSTextureFormatResource(format);
 	}
@@ -195,6 +199,8 @@ static inline gs_color_format ConvertDXGITextureFormat(DXGI_FORMAT format)
 		return GS_RG16;
 	case DXGI_FORMAT_AYUV:
 		return GS_AYUV;
+	case DXGI_FORMAT_Y410:
+		return GS_Y410;
 	}
 
 	return GS_UNKNOWN;
@@ -970,6 +976,7 @@ struct gs_device {
 	bool nv12Supported = false;
 	bool p010Supported = false;
 	bool ayuvSupported = false;
+	bool y410Supported = false;
 	bool fastClearSupported = false;
 
 	gs_texture_2d *curRenderTarget = nullptr;
@@ -1039,6 +1046,8 @@ struct gs_device {
 	void RebuildDevice();
 
 	bool HasBadNV12Output();
+
+	bool Y410Supported();
 
 	gs_monitor_color_info GetMonitorColorInfo(HMONITOR hMonitor);
 
