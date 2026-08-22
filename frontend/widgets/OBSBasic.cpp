@@ -1454,16 +1454,11 @@ static inline enum video_format GetVideoFormatFromName(const char *name)
 	else if (astrcmpi(name, "P416") == 0)
 		return VIDEO_FORMAT_P416;
 #ifdef _WIN32
-}
-else if (astrcmpi(name, "Y410") == 0)
-{
-	return VIDEO_FORMAT_Y410;
-}
-else if (astrcmpi(name, "R10l") == 0)
-{
-	return VIDEO_FORMAT_R10L;
+	else if (astrcmpi(name, "Y410") == 0)
+		return VIDEO_FORMAT_Y410;
+	else if (astrcmpi(name, "R10l") == 0)
+		return VIDEO_FORMAT_R10L;
 #endif
-}
 #if 0 //currently unsupported
 	else if (astrcmpi(name, "YVYU") == 0)
 		return VIDEO_FORMAT_YVYU;
@@ -1472,7 +1467,7 @@ else if (astrcmpi(name, "R10l") == 0)
 	else if (astrcmpi(name, "UYVY") == 0)
 		return VIDEO_FORMAT_UYVY;
 #endif
-else return VIDEO_FORMAT_BGRA;
+	else return VIDEO_FORMAT_BGRA;
 }
 
 static inline enum video_colorspace GetVideoColorSpaceFromName(const char *name)

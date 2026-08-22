@@ -159,19 +159,12 @@ mfxStatus _simple_alloc(mfxFrameAllocRequest *request, mfxFrameAllocResponse *re
 		format = DXGI_FORMAT_P8;
 	else if (MFX_FOURCC_P010 == request->Info.FourCC)
 		format = DXGI_FORMAT_P010;
-}
-else if (MFX_FOURCC_AYUV == request->Info.FourCC)
-{
-	format = DXGI_FORMAT_AYUV;
-}
-else if (MFX_FOURCC_Y410 == request->Info.FourCC)
-{
-	format = DXGI_FORMAT_Y410;
-}
-else
-{
-	format = DXGI_FORMAT_UNKNOWN;
-}
+	else if (MFX_FOURCC_AYUV == request->Info.FourCC)
+		format = DXGI_FORMAT_AYUV;
+	else if (MFX_FOURCC_Y410 == request->Info.FourCC)
+		format = DXGI_FORMAT_Y410;
+	else
+		format = DXGI_FORMAT_UNKNOWN;
 
 if (DXGI_FORMAT_UNKNOWN == format)
 	return MFX_ERR_UNSUPPORTED;

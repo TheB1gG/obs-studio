@@ -143,7 +143,7 @@ void WHIPOutput::ConfigureVideoTrack(std::string media_stream_id, std::string cn
 	video_description.addSSRC(ssrc, cname, media_stream_id, media_stream_track_id);
 
 	auto rtp_config = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, cname, video_payload_type,
-									rtc::H264RtpPacketizer::defaultClockRate);
+									rtc::H264RtpPacketizer::ClockRate);
 
 	const obs_encoder_t *encoder = obs_output_get_video_encoder2(output, 0);
 	if (!encoder)
@@ -628,13 +628,6 @@ void WHIPOutput::Send(void *data, uintptr_t size, uint64_t duration, std::shared
 
 	// Set new timestamp
 	rtp_config->timestamp = rtp_config->timestamp + elapsed_timestamp;
-
-	// Get elapsed time in clock rate from last RTCP sender report
-	auto report_elapsed_timestamp = rtp_config->timestamp - rtcp_sr_reporter->lastReportedTimestamp();
-
-	// Check if last report was at least 1 second ago
-	if (rtp_config->timestampToSeconds(report_elapsed_timestamp) > 1)
-		rtcp_sr_reporter->setNeedsToReport();
 
 	try {
 		track->send(sample);
