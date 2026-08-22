@@ -1598,6 +1598,8 @@ const char *get_scale_type_name(enum obs_scale_type type)
 		return "Lanczos";
 	case OBS_SCALE_AREA:
 		return "Area";
+	case OBS_SCALE_BLERP:
+		return "Blerp"; // or "Bicubic with interpolation" to match UI text
 	}
 
 	return "Unknown";
