@@ -1600,6 +1600,8 @@ const char *get_scale_type_name(enum obs_scale_type type)
 		return "Area";
 	case OBS_SCALE_BLERP:
 		return "Blerp"; // or "Bicubic with interpolation" to match UI text
+	case OBS_SCALE_BILINEAR_LOWRES:
+		return "Bilinear Low Quality";
 	}
 
 	return "Unknown";

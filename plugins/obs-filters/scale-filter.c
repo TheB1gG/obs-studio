@@ -21,6 +21,7 @@
 #define T_SAMPLING_LANCZOS              obs_module_text("ScaleFiltering.Lanczos")
 #define T_SAMPLING_AREA                 obs_module_text("ScaleFiltering.Area")
 #define T_SAMPLING_BLERP                obs_module_text("ScaleFiltering.Blerp")
+#define T_SAMPLING_BILINEAR_LOWRES      obs_module_text("ScaleFiltering.BilinearLowQuality")
 #define T_UNDISTORT                     obs_module_text("UndistortCenter")
 #define T_BASE                          obs_module_text("Base.Canvas")
 
@@ -30,6 +31,7 @@
 #define S_SAMPLING_LANCZOS              "lanczos"
 #define S_SAMPLING_AREA                 "area"
 #define S_SAMPLING_BLERP                "blerp"
+#define S_SAMPLING_BILINEAR_LOWRES      "bilinear_lowres"
 
 /* clang-format on */
 
@@ -113,6 +115,9 @@ static void scale_filter_update(void *data, obs_data_t *settings)
 	} else if (astrcmpi(sampling, S_SAMPLING_BLERP) == 0) {
 		filter->sampling = OBS_SCALE_BLERP;
 
+	} else if (astrcmpi(sampling, S_SAMPLING_BILINEAR_LOWRES) == 0) {
+		filter->sampling = OBS_SCALE_BILINEAR_LOWRES;
+
 	} else { /* S_SAMPLING_BICUBIC */
 		filter->sampling = OBS_SCALE_BICUBIC;
 	}
@@ -150,7 +155,6 @@ static void scale_filter_tick(void *data, float seconds)
 	struct scale_filter_data *filter = data;
 	enum obs_base_effect type;
 	obs_source_t *target;
-	bool lower_than_2x;
 	double cx_f;
 	double cy_f;
 	int cx;
@@ -217,12 +221,7 @@ static void scale_filter_tick(void *data, float seconds)
 
 	/* ------------------------- */
 
-	lower_than_2x = filter->cx_out < cx / 2 || filter->cy_out < cy / 2;
-
-	if (lower_than_2x && filter->sampling != OBS_SCALE_POINT) {
-		type = OBS_EFFECT_BILINEAR_LOWRES;
-	} else {
-		switch (filter->sampling) {
+	switch (filter->sampling) {
 		default:
 		case OBS_SCALE_POINT:
 		case OBS_SCALE_BILINEAR:
@@ -245,7 +244,9 @@ static void scale_filter_tick(void *data, float seconds)
 			if ((filter->cx_out >= cx) && (filter->cy_out >= cy))
 				filter->upscale = true;
 			break;
-		}
+		case OBS_SCALE_BILINEAR_LOWRES:
+			type = OBS_EFFECT_BILINEAR_LOWRES;
+			break;
 	}
 
 	filter->undistort_factor = filter->undistort ? (new_aspect / old_aspect) : 1.0;
@@ -479,6 +480,8 @@ static bool sampling_modified(obs_properties_t *props, obs_property_t *p, obs_da
 		has_undistort = false;
 	} else if (astrcmpi(sampling, S_SAMPLING_BLERP) == 0) {
 		has_undistort = true;
+	} else if (astrcmpi(sampling, S_SAMPLING_BILINEAR_LOWRES) == 0) {
+		has_undistort = false;
 	} else { /* S_SAMPLING_BICUBIC */
 		has_undistort = true;
 	}
@@ -521,6 +524,7 @@ static obs_properties_t *scale_filter_properties(void *data)
 	obs_property_list_add_string(p, T_SAMPLING_LANCZOS, S_SAMPLING_LANCZOS);
 	obs_property_list_add_string(p, T_SAMPLING_AREA, S_SAMPLING_AREA);
 	obs_property_list_add_string(p, T_SAMPLING_BLERP, S_SAMPLING_BLERP);
+	obs_property_list_add_string(p, T_SAMPLING_BILINEAR_LOWRES, S_SAMPLING_BILINEAR_LOWRES);
 
 	/* ----------------- */
 

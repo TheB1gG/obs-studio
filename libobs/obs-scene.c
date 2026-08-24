@@ -764,15 +764,15 @@ static void render_item_texture(struct obs_scene_item *item, enum gs_color_space
 
 		} else if (!close_float(item->output_scale.x, 1.0f, EPSILON) ||
 			   !close_float(item->output_scale.y, 1.0f, EPSILON)) {
-			if (item->output_scale.x < 0.5f || item->output_scale.y < 0.5f) {
-				effect = obs->video.bilinear_lowres_effect;
-			} else if (type == OBS_SCALE_BICUBIC || type == OBS_SCALE_BLERP) {
+			if (type == OBS_SCALE_BICUBIC || type == OBS_SCALE_BLERP) {
 				effect = obs->video.bicubic_effect;
 			} else if (type == OBS_SCALE_LANCZOS) {
 				effect = obs->video.lanczos_effect;
 			} else if (type == OBS_SCALE_AREA) {
 				effect = obs->video.area_effect;
 				upscale = (item->output_scale.x >= 1.0f) && (item->output_scale.y >= 1.0f);
+			} else if (type == OBS_SCALE_BILINEAR_LOWRES) {
+				effect = obs->video.bilinear_lowres_effect;
 			}
 
 			gs_eparam_t *const scale_param = gs_effect_get_param_by_name(effect, "base_dimension");
@@ -1232,6 +1232,8 @@ static void scene_load_item(struct obs_scene *scene, obs_data_t *item_data)
 			item->scale_filter = OBS_SCALE_AREA;
 		else if (astrcmpi(scale_filter_str, "blerp") == 0)
 			item->scale_filter = OBS_SCALE_BLERP;
+		else if (astrcmpi(scale_filter_str, "bilinear_lowres") == 0)
+			item->scale_filter = OBS_SCALE_BILINEAR_LOWRES;
 	}
 
 	blend_method_str = obs_data_get_string(item_data, "blend_method");
@@ -1396,6 +1398,8 @@ static void scene_save_item(obs_data_array_t *array, struct obs_scene_item *item
 		scale_filter = "area";
 	else if (item->scale_filter == OBS_SCALE_BLERP)
 		scale_filter = "blerp";
+	else if (item->scale_filter == OBS_SCALE_BILINEAR_LOWRES)
+		scale_filter = "bilinear_lowres";
 	else
 		scale_filter = "disable";
 

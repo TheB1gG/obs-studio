@@ -217,14 +217,6 @@ static inline void render_main_texture(struct obs_core_video_mix *video)
 static inline gs_effect_t *get_scale_effect_internal(struct obs_core_video_mix *mix)
 {
 	struct obs_core_video *video = &obs->video;
-	const struct video_output_info *info = video_output_get_info(mix->video);
-
-	/* if the dimension is under half the size of the original image,
-	 * bicubic/lanczos can't sample enough pixels to create an accurate
-	 * image, so use the bilinear low resolution effect instead */
-	if (info->width < (mix->ovi.base_width / 2) && info->height < (mix->ovi.base_height / 2)) {
-		return video->bilinear_lowres_effect;
-	}
 
 	switch (mix->ovi.scale_type) {
 	case OBS_SCALE_BILINEAR:
@@ -233,6 +225,8 @@ static inline gs_effect_t *get_scale_effect_internal(struct obs_core_video_mix *
 		return video->lanczos_effect;
 	case OBS_SCALE_AREA:
 		return video->area_effect;
+	case OBS_SCALE_BILINEAR_LOWRES:
+		return video->bilinear_lowres_effect;
 	case OBS_SCALE_BICUBIC:
 	case OBS_SCALE_BLERP:
 	default:;

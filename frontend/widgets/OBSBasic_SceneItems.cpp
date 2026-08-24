@@ -447,6 +447,7 @@ QMenu *OBSBasic::AddScaleFilteringMenu(QMenu *menu, obs_sceneitem_t *item)
 	ADD_MODE("ScaleFiltering.Lanczos", OBS_SCALE_LANCZOS);
 	ADD_MODE("ScaleFiltering.Area", OBS_SCALE_AREA);
 	ADD_MODE("ScaleFiltering.Blerp", OBS_SCALE_BLERP);
+	ADD_MODE("ScaleFiltering.BilinearLowQuality", OBS_SCALE_BILINEAR_LOWRES);
 #undef ADD_MODE
 
 	return menu;
