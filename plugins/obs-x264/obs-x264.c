@@ -61,9 +61,63 @@ struct obs_x264 {
 
 	uint32_t roi_increment;
 	float *quant_offsets;
+
+	/* Color settings chosen by the user (Option 1). These drive both the
+	 * x264 context parameters and get_video_info, so libobs delivers frames
+	 * in exactly this format/space/range. Changes apply on next start. */
+	enum video_format color_format;
+	enum video_colorspace color_space;
+	enum video_range_type color_range;
+
+	/* The csp/bitdepth the x264 context is currently built for (from create).
+	 * Used to detect settings changes in update() and keep live encode data
+	 * consistent with what libobs delivers until a restart. */
+	int active_csp;
+	uint32_t active_bitdepth;
 };
 
 /* ------------------------------------------------------------------------- */
+
+static int format_bit_depth(enum video_format format)
+{
+	switch (format) {
+	case VIDEO_FORMAT_P010:
+	case VIDEO_FORMAT_I010:
+		return 10;
+	default:
+		return 8;
+	}
+}
+
+static enum video_format color_format_from_name(const char *name)
+{
+	if (!name || strcmp(name, "I420") == 0)
+		return VIDEO_FORMAT_I420;
+	else if (strcmp(name, "P010") == 0)
+		return VIDEO_FORMAT_P010;
+	else if (strcmp(name, "I010") == 0)
+		return VIDEO_FORMAT_I010;
+	else if (strcmp(name, "I444") == 0)
+		return VIDEO_FORMAT_I444;
+
+	return VIDEO_FORMAT_NV12; /* default */
+}
+
+static void read_color_settings(obs_data_t *settings, enum video_format *format, enum video_colorspace *cs,
+				enum video_range_type *range)
+{
+	*format = color_format_from_name(obs_data_get_string(settings, "color_format"));
+	if (!obs_data_has_user_value(settings, "color_space")) {
+		*cs = VIDEO_CS_DEFAULT;
+	} else {
+		*cs = (enum video_colorspace)obs_data_get_int(settings, "color_space");
+	}
+	if (!obs_data_has_user_value(settings, "color_range")) {
+		*range = VIDEO_RANGE_DEFAULT;
+	} else {
+		*range = (enum video_range_type)obs_data_get_int(settings, "color_range");
+	}
+}
 
 static const char *obs_x264_getname(void *unused)
 {
@@ -114,6 +168,11 @@ static void obs_x264_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "tune", "");
 	obs_data_set_default_string(settings, "x264opts", "");
 	obs_data_set_default_bool(settings, "repeat_headers", false);
+
+	/* Color settings (Option 1): per-output color format/space/range */
+	obs_data_set_default_string(settings, "color_format", "NV12");
+	obs_data_set_default_int(settings, "color_space", VIDEO_CS_DEFAULT);
+	obs_data_set_default_int(settings, "color_range", VIDEO_RANGE_DEFAULT);
 }
 
 static inline void add_strings(obs_property_t *list, const char *const *strings)
@@ -136,6 +195,9 @@ static inline void add_strings(obs_property_t *list, const char *const *strings)
 #define TEXT_TUNE obs_module_text("Tune")
 #define TEXT_NONE obs_module_text("None")
 #define TEXT_X264_OPTS obs_module_text("EncoderOptions")
+#define TEXT_COLOR_FORMAT obs_module_text("ColorFormat")
+#define TEXT_COLOR_SPACE obs_module_text("ColorSpace")
+#define TEXT_COLOR_RANGE obs_module_text("ColorRange")
 
 static bool use_bufsize_modified(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings)
 {
@@ -165,6 +227,11 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs
 	p = obs_properties_get(ppts, "buffer_size");
 	obs_property_set_visible(p, !rc_crf && use_bufsize);
 	return true;
+}
+
+static void add_cs_entry(obs_property_t *list, const char *name, int value)
+{
+	obs_property_list_add_int(list, name, (long long)value);
 }
 
 static obs_properties_t *obs_x264_props(void *unused)
@@ -214,6 +281,28 @@ static obs_properties_t *obs_x264_props(void *unused)
 	obs_properties_add_bool(props, "vfr", TEXT_VFR);
 #endif
 
+	/* Color format / color space / color range (Option 1) */
+	list = obs_properties_add_list(props, "color_format", TEXT_COLOR_FORMAT, OBS_COMBO_TYPE_LIST,
+				       OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(list, "NV12 (8-bit)", "NV12");
+	obs_property_list_add_string(list, "I420 (8-bit)", "I420");
+	obs_property_list_add_string(list, "P010 (10-bit)", "P010");
+	obs_property_list_add_string(list, "I010 (10-bit)", "I010");
+	obs_property_list_add_string(list, "I444 (8-bit)", "I444");
+
+	list = obs_properties_add_list(props, "color_space", TEXT_COLOR_SPACE, OBS_COMBO_TYPE_LIST,
+				       OBS_COMBO_FORMAT_INT);
+	add_cs_entry(list, "(Default)", VIDEO_CS_DEFAULT);
+	add_cs_entry(list, "Rec. 709", VIDEO_CS_709);
+	add_cs_entry(list, "Rec. 601", VIDEO_CS_601);
+	add_cs_entry(list, "sRGB", VIDEO_CS_SRGB);
+
+	list = obs_properties_add_list(props, "color_range", TEXT_COLOR_RANGE, OBS_COMBO_TYPE_LIST,
+				       OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(list, "(Default)", (long long)VIDEO_RANGE_DEFAULT);
+	obs_property_list_add_int(list, "Partial (Limited)", (long long)VIDEO_RANGE_PARTIAL);
+	obs_property_list_add_int(list, "Full", (long long)VIDEO_RANGE_FULL);
+
 	obs_properties_add_text(props, "x264opts", TEXT_X264_OPTS, OBS_TEXT_DEFAULT);
 
 	headers = obs_properties_add_bool(props, "repeat_headers", "repeat_headers");
@@ -248,20 +337,20 @@ static void override_base_param(struct obs_x264 *obsx264, struct obs_option opti
 		if (valid_name) {
 			bfree(*preset);
 			*preset = bstrdup(val);
-		}
 
-	} else if (astrcmpi(name, "profile") == 0) {
-		const char *valid_name = validate(obsx264, val, "profile", x264_profile_names);
-		if (valid_name) {
-			bfree(*profile);
-			*profile = bstrdup(val);
-		}
+		} else if (astrcmpi(name, "profile") == 0) {
+			const char *valid_name = validate(obsx264, val, "profile", x264_profile_names);
+			if (valid_name) {
+				bfree(*profile);
+				*profile = bstrdup(val);
 
-	} else if (astrcmpi(name, "tune") == 0) {
-		const char *valid_name = validate(obsx264, val, "tune", x264_tune_names);
-		if (valid_name) {
-			bfree(*tune);
-			*tune = bstrdup(val);
+			} else if (astrcmpi(name, "tune") == 0) {
+				const char *valid_name = validate(obsx264, val, "tune", x264_tune_names);
+				if (valid_name) {
+					bfree(*tune);
+					*tune = bstrdup(val);
+				}
+			}
 		}
 	}
 }
@@ -345,6 +434,37 @@ static void obs_x264_video_info(void *data, struct video_scale_info *info);
 
 enum rate_control { RATE_CONTROL_CBR, RATE_CONTROL_VBR, RATE_CONTROL_ABR, RATE_CONTROL_CRF };
 
+/* Maps the user's chosen color format to the x264 csp + bitdepth.
+ * Returns false for formats x264 cannot encode (e.g. P216/P416). */
+static bool obs_x264_format_to_csp(enum video_format format, int *csp, uint32_t *bitdepth)
+{
+	switch (format) {
+	case VIDEO_FORMAT_NV12:
+		*csp = X264_CSP_NV12;
+		*bitdepth = 8;
+		break;
+	case VIDEO_FORMAT_I420:
+		*csp = X264_CSP_I420;
+		*bitdepth = 8;
+		break;
+	case VIDEO_FORMAT_P010:
+		*csp = X264_CSP_NV12; /* x264 uses NV12 csp with i_bitdepth=10 for P010 */
+		*bitdepth = 10;
+		break;
+	case VIDEO_FORMAT_I010:
+		*csp = X264_CSP_I420; /* x264 uses I420 csp with i_bitdepth=10 for I010 */
+		*bitdepth = 10;
+		break;
+	case VIDEO_FORMAT_I444:
+		*csp = X264_CSP_I444;
+		*bitdepth = 8;
+		break;
+	default:
+		return false; /* P216, P416, etc. are not supported by x264 */
+	}
+	return true;
+}
+
 static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const struct obs_options *options,
 			  bool update)
 {
@@ -352,9 +472,11 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 	const struct video_output_info *voi = video_output_get_info(video);
 	struct video_scale_info info;
 
-	info.format = voi->format;
-	info.colorspace = voi->colorspace;
-	info.range = voi->range;
+	/* The user's chosen color settings drive the x264 params. libobs will
+	 * deliver frames in exactly this format/space/range (see get_video_info). */
+	info.format = obsx264->color_format;
+	info.colorspace = obsx264->color_space;
+	info.range = obsx264->color_range;
 
 	obs_x264_video_info(obsx264, &info);
 
@@ -479,14 +601,15 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 		obsx264->params.rc.f_rf_constant = (float)crf;
 	}
 
-	if (info.format == VIDEO_FORMAT_NV12)
-		obsx264->params.i_csp = X264_CSP_NV12;
-	else if (info.format == VIDEO_FORMAT_I420)
-		obsx264->params.i_csp = X264_CSP_I420;
-	else if (info.format == VIDEO_FORMAT_I444)
-		obsx264->params.i_csp = X264_CSP_I444;
-	else
-		obsx264->params.i_csp = X264_CSP_NV12;
+	/* Derive x264 csp/bitdepth from the user's chosen color format */
+	int csp;
+	uint32_t bitdepth;
+	if (!obs_x264_format_to_csp(info.format, &csp, &bitdepth)) {
+		warn("Unsupported color format: %d", (int)info.format);
+		return;
+	}
+	obsx264->params.i_csp = csp;
+	obsx264->params.i_bitdepth = bitdepth;
 
 	for (size_t i = 0; i < options->ignored_word_count; ++i)
 		warn("ignoring invalid x264 option: %s", options->ignored_words[i]);
@@ -503,10 +626,12 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 		     "\tfps_den:      %d\n"
 		     "\twidth:        %d\n"
 		     "\theight:       %d\n"
-		     "\tkeyint:       %d\n",
+		     "\tkeyint:       %d\n"
+		     "\tcolor format: %d\n"
+		     "\tbit depth:    %u\n",
 		     rate_control, obsx264->params.rc.i_vbv_max_bitrate, obsx264->params.rc.i_vbv_buffer_size,
 		     (int)obsx264->params.rc.f_rf_constant, voi->fps_num, voi->fps_den, width, height,
-		     obsx264->params.i_keyint_max);
+		     obsx264->params.i_keyint_max, (int)info.format, bitdepth);
 	}
 }
 
@@ -589,17 +714,44 @@ static bool update_settings(struct obs_x264 *obsx264, obs_data_t *settings, bool
 static bool obs_x264_update(void *data, obs_data_t *settings)
 {
 	struct obs_x264 *obsx264 = data;
-	bool success = update_settings(obsx264, settings, true);
-	int ret;
 
-	if (success) {
-		ret = x264_encoder_reconfig(obsx264->context, &obsx264->params);
-		if (ret != 0)
-			warn("Failed to reconfigure: %d", ret);
-		return ret == 0;
+	/* Read the user's color settings into the struct */
+	enum video_format format;
+	enum video_colorspace cs;
+	enum video_range_type range;
+	read_color_settings(settings, &format, &cs, &range);
+
+	int csp;
+	uint32_t bitdepth;
+	bool ok_csp = obs_x264_format_to_csp(format, &csp, &bitdepth);
+	if (!ok_csp) {
+		warn("Unsupported color format: %d", (int)format);
+		return false;
 	}
 
-	return false;
+	/* Detect if the chosen color format changed since the context was built.
+	 * x264_encoder_reconfig cannot change i_csp/i_bitdepth/vui, so a context
+	 * rebuild is needed. libobs only re-negotiates raw input delivery on
+	 * stop/start (remove/add connection), so we log that and let the next
+	 * start pick up the new format — same model as svt-av1. */
+	bool csp_changed = obsx264->active_csp != csp || obsx264->active_bitdepth != bitdepth;
+
+	if (csp_changed) {
+		info("color format/space/range changed; the new settings apply when the encoder next starts");
+	} else {
+		bool success = update_settings(obsx264, settings, true);
+		int ret = 0;
+		if (success) {
+			ret = x264_encoder_reconfig(obsx264->context, &obsx264->params);
+			if (ret != 0)
+				warn("Failed to reconfigure: %d", ret);
+		}
+		return success && ret == 0;
+	}
+
+	/* csp changed: still update params so the next create() has correct values */
+	update_settings(obsx264, settings, true);
+	return true;
 }
 
 static void load_headers(struct obs_x264 *obsx264)
@@ -633,25 +785,35 @@ static void *obs_x264_create(obs_data_t *settings, obs_encoder_t *encoder)
 {
 	video_t *video = obs_encoder_video(encoder);
 	const struct video_output_info *voi = video_output_get_info(video);
-	switch (voi->format) {
-	case VIDEO_FORMAT_I010:
-	case VIDEO_FORMAT_P010:
-	case VIDEO_FORMAT_P216:
-	case VIDEO_FORMAT_P416:
-		obs_encoder_set_last_error(encoder, obs_module_text("HighPrecisionUnsupported"));
-		warn_enc(encoder, "OBS does not support using x264 with high-precision formats");
+
+	/* Reject PQ/HLG pipeline (cannot be encoded by x264 at all) */
+	if (voi->colorspace == VIDEO_CS_2100_PQ || voi->colorspace == VIDEO_CS_2100_HLG) {
+		obs_encoder_set_last_error(encoder, obs_module_text("HdrUnsupported"));
+		warn_enc(encoder, "OBS does not support using x264 with Rec. 2100");
 		return NULL;
-	default:
-		if (voi->colorspace == VIDEO_CS_2100_PQ || voi->colorspace == VIDEO_CS_2100_HLG) {
-			obs_encoder_set_last_error(encoder, obs_module_text("HdrUnsupported"));
-			warn_enc(encoder, "OBS does not support using x264 with Rec. 2100");
-			return NULL;
-		}
-		break;
 	}
 
 	struct obs_x264 *obsx264 = bzalloc(sizeof(struct obs_x264));
 	obsx264->encoder = encoder;
+
+	/* Read the user's color settings */
+	enum video_format format;
+	enum video_colorspace cs;
+	enum video_range_type range;
+	read_color_settings(settings, &format, &cs, &range);
+	obsx264->color_format = format;
+	obsx264->color_space = cs;
+	obsx264->color_range = range;
+
+	int csp;
+	uint32_t bitdepth;
+	if (!obs_x264_format_to_csp(format, &csp, &bitdepth)) {
+		warn_enc(encoder, "Unsupported color format: %d", (int)format);
+		bfree(obsx264);
+		return NULL;
+	}
+	obsx264->active_csp = csp;
+	obsx264->active_bitdepth = bitdepth;
 
 	if (update_settings(obsx264, settings, false)) {
 		obsx264->context = x264_encoder_open(&obsx264->params);
@@ -700,13 +862,21 @@ static inline void init_pic_data(struct obs_x264 *obsx264, x264_picture_t *pic, 
 	x264_picture_init(pic);
 
 	pic->i_pts = frame->pts;
-	pic->img.i_csp = obsx264->params.i_csp;
+	/* Use active_csp (what libobs is actually delivering right now), not
+	 * params.i_csp (which may already reflect a pending color change). */
+	pic->img.i_csp = obsx264->active_csp;
+	/* This build of x264 is templated: i_bitdepth=10 selects the HIGH_BIT_DEPTH flavor,
+     * whose frame copy requires X264_CSP_HIGH_DEPTH on every input csp. libobs already
+     * delivers 10-bit formats (P010/I010) as uint16 planes; flag the csp so x264 reads them
+     * correctly. 8-bit formats use the unflagged 8-bit flavor and must NOT be flagged. */
+	if (obsx264->active_bitdepth == 10)
+		pic->img.i_csp |= X264_CSP_HIGH_DEPTH;
 
-	if (obsx264->params.i_csp == X264_CSP_NV12)
+	if (obsx264->active_csp == X264_CSP_NV12)
 		pic->img.i_plane = 2;
-	else if (obsx264->params.i_csp == X264_CSP_I420)
+	else if (obsx264->active_csp == X264_CSP_I420)
 		pic->img.i_plane = 3;
-	else if (obsx264->params.i_csp == X264_CSP_I444)
+	else if (obsx264->active_csp == X264_CSP_I444)
 		pic->img.i_plane = 3;
 
 	for (int i = 0; i < pic->img.i_plane; i++) {
@@ -828,23 +998,16 @@ static bool obs_x264_sei(void *data, uint8_t **sei, size_t *size)
 	return true;
 }
 
-static inline bool valid_format(enum video_format format)
-{
-	return format == VIDEO_FORMAT_I420 || format == VIDEO_FORMAT_NV12 || format == VIDEO_FORMAT_I444;
-}
-
 static void obs_x264_video_info(void *data, struct video_scale_info *info)
 {
 	struct obs_x264 *obsx264 = data;
-	enum video_format pref_format;
 
-	pref_format = obs_encoder_get_preferred_video_format(obsx264->encoder);
-
-	if (!valid_format(pref_format)) {
-		pref_format = valid_format(info->format) ? info->format : VIDEO_FORMAT_NV12;
-	}
-
-	info->format = pref_format;
+	/* Request the user's chosen format/space/range from libobs.
+	 * libobs will CPU-convert to this per-input (pinned at connect time),
+	 * so the x264 context and delivered frames always match. */
+	info->format = obsx264->color_format;
+	info->colorspace = obsx264->color_space;
+	info->range = obsx264->color_range;
 }
 
 struct obs_encoder_info obs_x264_encoder = {
