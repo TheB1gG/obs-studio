@@ -72,8 +72,6 @@ struct obs_x264 {
 	/* The csp/bitdepth the x264 context is currently built for (from create).
 	 * Used to detect settings changes in update() and keep live encode data
 	 * consistent with what libobs delivers until a restart. */
-	/* DEBUG: one-shot first-frame dump state */
-	bool dbg_done;
 	int active_csp;
 	uint32_t active_bitdepth;
 
@@ -98,6 +96,8 @@ static enum video_format color_format_from_name(const char *name)
 		return VIDEO_FORMAT_BGRA;
 	else if (strcmp(name, "R10I") == 0)
 		return VIDEO_FORMAT_R10L; /* RGB 10-bit: libobs delivers packed X2BGR10LE */
+	else if (strcmp(name, "I412") == 0)
+		return VIDEO_FORMAT_I412; /* planar YUV 4:4:4 u16 (YUV444P12LE); x264 I444 + HIGH_DEPTH */
 	else if (strcmp(name, "I420") == 0)
 		return VIDEO_FORMAT_NV12; /* legacy: planar 4:2:0 collapses to the same NV12 stream */
 	else if (strcmp(name, "I010") == 0)
@@ -118,6 +118,8 @@ static enum video_format map_base_format_for_x264(enum video_format fmt)
 		return VIDEO_FORMAT_P010;
 	case VIDEO_FORMAT_I444:
 		return VIDEO_FORMAT_I444;
+	case VIDEO_FORMAT_I412:
+		return VIDEO_FORMAT_I412; /* planar 4:4:4 u16, x264 encodes it as I444 + HIGH_DEPTH */
 	case VIDEO_FORMAT_P216:
 		return VIDEO_FORMAT_P216;
 	case VIDEO_FORMAT_RGBA:
@@ -368,6 +370,7 @@ static obs_properties_t *obs_x264_props(void *unused)
 	obs_property_list_add_string(list, "NV12 (8-bit)", "NV12");
 	obs_property_list_add_string(list, "P010 (10-bit)", "P010");
 	obs_property_list_add_string(list, "I444 (8-bit)", "I444");
+	obs_property_list_add_string(list, "I412 (YUV 4:4:4, 10-bit planar)", "I412");
 	obs_property_list_add_string(list, "P216 (10-bit)", "P216");
 	obs_property_list_add_string(list, "BGRA (RGB 8-bit)", "BGRA");
 	obs_property_list_add_string(list, "R10I (RGB 10-bit)", "R10I");
@@ -536,6 +539,10 @@ static bool obs_x264_format_to_csp(enum video_format format, int *csp, uint32_t 
 		*csp = X264_CSP_I444;
 		*bitdepth = 8;
 		break;
+	case VIDEO_FORMAT_I412:
+		*csp = X264_CSP_I444; /* planar Y/U/V u16 (YUV444P12LE container); HIGH_DEPTH via i_bitdepth */
+		*bitdepth = 10;
+		break;
 	case VIDEO_FORMAT_P216:
 		*csp = X264_CSP_NV16; /* x264 uses NV16 csp with i_bitdepth=10 for P216 */
 		*bitdepth = 10;
@@ -557,7 +564,9 @@ static bool obs_x264_format_to_csp(enum video_format format, int *csp, uint32_t 
  * non-standard cv8x256 fixed-point convention that corrupts 8-bit chroma, so x264
  * would receive invalid values. Planar delivery carries proper [0..1023] values and
  * x264 interleaves U/V itself during its frame copy (I420 + HIGH_DEPTH) - the same
- * input layout ffmpeg's own libx264 wrapper uses for yuv420p10. */
+ * input layout ffmpeg's own libx264 wrapper uses for yuv420p10. Formats x264 can encode
+ * directly from planar delivery (NV12, I444, and I412 = YUV444P12LE) pass through
+ * unchanged - the plugin does no conversion; x264 ingests libobs's planes as-is. */
 static bool obs_x264_delivery_csp(enum video_format fmt, enum video_format *delivery,
 		int *csp, uint32_t *bitdepth)
 {
@@ -983,47 +992,6 @@ static void *obs_x264_create(obs_data_t *settings, obs_encoder_t *encoder)
 	return obsx264;
 }
 
-static void debug_dump_first_frame(struct obs_x264 *obsx264, struct encoder_frame *frame, x264_picture_t *pic)
-{
-	if (obsx264->dbg_done)
-		return;
-	obsx264->dbg_done = true;
-
-	const char *path = "C:\\Users\\User\\AppData\\Local\\Temp\\x264dbg_p010.dmp";
-	FILE *fp = fopen(path, "wb");
-	if (!fp)
-		return;
-
-	uint32_t plane_count = pic->img.i_plane ? (uint32_t)pic->img.i_plane : 1u;
-	uint32_t h = obs_encoder_get_height(obsx264->encoder);
-	for (uint32_t i = 0; i < plane_count && i < MAX_AV_PLANES; i++) {
-		if (!frame->data[i])
-			continue;
-		/* Chroma row counts: NV12 packed UV is h/2, I420 planar U/V are h/2 each,
-		 * NV16 (P216) UV is full-res. */
-		bool half = i > 0 && ((obsx264->active_csp == X264_CSP_NV12 && i == 1) ||
-				      obsx264->active_csp == X264_CSP_I420);
-		uint32_t ph = half ? h / 2u : h;
-		fwrite(frame->data[i], 1, (size_t)frame->linesize[i] * ph, fp);
-	}
-	fclose(fp);
-
-	FILE *mt = fopen("C:\\Users\\User\\AppData\\Local\\Temp\\x264dbg_p010.txt", "w");
-	if (mt) {
-		fprintf(mt,
-		      "active_csp=%d active_bitdepth=%u i_plane=%d csp_in_pic=0x%X\n"
-		      "plane[0] linesize=%u  plane[1] linesize=%u  height=%u\n",
-		      obsx264->active_csp, obsx264->active_bitdepth, (int)pic->img.i_plane,
-		      (unsigned)(pic->img.i_csp & 0xFF), frame->linesize[0], frame->linesize[1], h);
-		fclose(mt);
-	}
-
-	blog(LOG_INFO, "[x264 debug] dumped first input frame to %s "
-		     "(active_csp=%d bitdepth=%u i_plane=%d ls0=%u ls1=%u h=%u)",
-	     path, obsx264->active_csp, obsx264->active_bitdepth, (int)pic->img.i_plane, frame->linesize[0],
-	     frame->linesize[1], h);
-}
-
 static void parse_packet(struct obs_x264 *obsx264, struct encoder_packet *packet, x264_nal_t *nals, int nal_count,
 			 x264_picture_t *pic_out)
 {
@@ -1187,11 +1155,6 @@ static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct enco
 		return false;
 
 	init_pic_data(obsx264, &pic, frame);
-
-	/* DEBUG: one-shot dump of the first delivered raw frame so we can see exactly what x264 receives (P010 green-cast investigation).
-	 * Runs after init_pic_data so pic.img fields are valid. */
-	if (!obsx264->dbg_done)
-		debug_dump_first_frame(obsx264, frame, &pic);
 
 	if (obs_encoder_has_roi(obsx264->encoder))
 		add_roi(obsx264, &pic);
