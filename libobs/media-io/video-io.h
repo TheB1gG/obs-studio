@@ -105,6 +105,11 @@ enum video_format {
 
 	/* packed uncompressed 10-bit format. Same idea as GBRA but with 10 bpp. Fed into encoders as Y410. */
 	VIDEO_FORMAT_GBR10,
+
+	/* planar RGB 4:4:4, 10 bpp (G/B/R). Planar sibling of R10L; delivered to encoders
+	 * as three full-resolution u16 planes with G in the luma slot (x264 ingests it as
+	 * YUV444P | HIGH_DEPTH, same plane values/order as the packed X2BGR10LE path). */
+	VIDEO_FORMAT_R10P,
 };
 
 enum video_trc {
@@ -182,6 +187,7 @@ static inline bool format_is_yuv(enum video_format format)
 	case VIDEO_FORMAT_R10L:
 	case VIDEO_FORMAT_GBRA:
 	case VIDEO_FORMAT_GBR10:
+	case VIDEO_FORMAT_R10P:
 		return false;
 	}
 
@@ -247,6 +253,8 @@ static inline const char *get_video_format_name(enum video_format format)
 		return "Y410";
 	case VIDEO_FORMAT_GBR10:
 		return "GBR10";
+	case VIDEO_FORMAT_R10P:
+		return "R10p";
 	case VIDEO_FORMAT_NONE:;
 	}
 

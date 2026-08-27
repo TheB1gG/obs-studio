@@ -1216,6 +1216,80 @@ float4 PSGBR10_HLG(FragPos frag_in) : TARGET
 	return float4(rgb.b, rgb.g, rgb.r, 1.);
 }
 
+/* R10P (planar RGB 4:4:4, 10 bpp): one channel per pass into an R16 target. Like the
+ * PSR10L_* passes these operate on the linear RGBA16F canvas output; unlike R10L no bit
+ * packing is done - each value is pre-scaled (I010 style) so the driver stores raw
+ * [0..1023] in the u16, which x264 HIGH_DEPTH ingests as-is. */
+
+float4 PSR10P_G_SRGB(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	return float4(rgb.g * (1023. / 65535.), 0., 0., 1.);
+}
+
+float4 PSR10P_B_SRGB(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	return float4(rgb.b * (1023. / 65535.), 0., 0., 1.);
+}
+
+float4 PSR10P_R_SRGB(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	return float4(rgb.r * (1023. / 65535.), 0., 0., 1.);
+}
+
+float4 PSR10P_G_PQ(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
+	rgb = rec709_to_rec2020(rgb);
+	rgb = linear_to_st2084(rgb);
+	return float4(rgb.g * (1023. / 65535.), 0., 0., 1.);
+}
+
+float4 PSR10P_B_PQ(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
+	rgb = rec709_to_rec2020(rgb);
+	rgb = linear_to_st2084(rgb);
+	return float4(rgb.b * (1023. / 65535.), 0., 0., 1.);
+}
+
+float4 PSR10P_R_PQ(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
+	rgb = rec709_to_rec2020(rgb);
+	rgb = linear_to_st2084(rgb);
+	return float4(rgb.r * (1023. / 65535.), 0., 0., 1.);
+}
+
+float4 PSR10P_G_HLG(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
+	rgb = rec709_to_rec2020(rgb);
+	rgb = linear_to_hlg(rgb, hdr_lw);
+	return float4(rgb.g * (1023. / 65535.), 0., 0., 1.);
+}
+
+float4 PSR10P_B_HLG(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
+	rgb = rec709_to_rec2020(rgb);
+	rgb = linear_to_hlg(rgb, hdr_lw);
+	return float4(rgb.b * (1023. / 65535.), 0., 0., 1.);
+}
+
+float4 PSR10P_R_HLG(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
+	rgb = rec709_to_rec2020(rgb);
+	rgb = linear_to_hlg(rgb, hdr_lw);
+	return float4(rgb.r * (1023. / 65535.), 0., 0., 1.);
+}
+
 technique Planar_Y
 {
 	pass
@@ -2014,5 +2088,86 @@ technique GBR10_HLG
 	{
 		vertex_shader = VSPos(id);
 		pixel_shader  = PSGBR10_HLG(frag_in);
+	}
+}
+
+technique R10P_G_SRGB
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSR10P_G_SRGB(frag_in);
+	}
+}
+
+technique R10P_B_SRGB
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSR10P_B_SRGB(frag_in);
+	}
+}
+
+technique R10P_R_SRGB
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSR10P_R_SRGB(frag_in);
+	}
+}
+
+technique R10P_G_PQ
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSR10P_G_PQ(frag_in);
+	}
+}
+
+technique R10P_B_PQ
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSR10P_B_PQ(frag_in);
+	}
+}
+
+technique R10P_R_PQ
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSR10P_R_PQ(frag_in);
+	}
+}
+
+technique R10P_G_HLG
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSR10P_G_HLG(frag_in);
+	}
+}
+
+technique R10P_B_HLG
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSR10P_B_HLG(frag_in);
+	}
+}
+
+technique R10P_R_HLG
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSR10P_R_HLG(frag_in);
 	}
 }

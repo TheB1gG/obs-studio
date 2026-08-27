@@ -1635,6 +1635,9 @@ static inline enum convert_type get_convert_type(enum video_format format, bool 
 	case VIDEO_FORMAT_R10L:
 		return CONVERT_R10L;
 
+	case VIDEO_FORMAT_R10P:
+		return CONVERT_444P12LE; /* planar G/B/R u16 - same layout as I412 */
+
 	case VIDEO_FORMAT_P216:
 	case VIDEO_FORMAT_P416:
 	case VIDEO_FORMAT_GBRA:
@@ -2229,6 +2232,7 @@ static const char *select_conversion_technique(enum video_format format, bool fu
 	case VIDEO_FORMAT_P416:
 	case VIDEO_FORMAT_Y410:
 	case VIDEO_FORMAT_GBR10:
+	case VIDEO_FORMAT_R10P:
 		/* Unimplemented */
 		break;
 	}
@@ -3310,6 +3314,7 @@ static void copy_frame_data(struct obs_source_frame *dst, const struct obs_sourc
 	case VIDEO_FORMAT_I422:
 	case VIDEO_FORMAT_I210:
 	case VIDEO_FORMAT_I412:
+	case VIDEO_FORMAT_R10P:
 		copy_frame_data_plane(dst, src, 0, dst->height);
 		copy_frame_data_plane(dst, src, 1, dst->height);
 		copy_frame_data_plane(dst, src, 2, dst->height);

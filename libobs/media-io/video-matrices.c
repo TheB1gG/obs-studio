@@ -239,6 +239,7 @@ bool video_format_get_parameters_for_format(enum video_colorspace color_space, e
 	case VIDEO_FORMAT_R10L:
 	case VIDEO_FORMAT_Y410:
 	case VIDEO_FORMAT_GBR10:
+	case VIDEO_FORMAT_R10P:
 		bpc = 10;
 		break;
 	case VIDEO_FORMAT_I412:

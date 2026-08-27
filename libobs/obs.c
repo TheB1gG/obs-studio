@@ -155,6 +155,22 @@ static inline void calc_gpu_conversion_sizes(struct obs_core_video_mix *video)
 			video->conversion_techs[0] = "R10L_SRGB";
 		}
 		break;
+	case VIDEO_FORMAT_R10P:
+		video->conversion_needed = true;
+		if (info->colorspace == VIDEO_CS_2100_PQ) {
+			video->conversion_techs[0] = "R10P_G_PQ";
+			video->conversion_techs[1] = "R10P_B_PQ";
+			video->conversion_techs[2] = "R10P_R_PQ";
+		} else if (info->colorspace == VIDEO_CS_2100_HLG) {
+			video->conversion_techs[0] = "R10P_G_HLG";
+			video->conversion_techs[1] = "R10P_B_HLG";
+			video->conversion_techs[2] = "R10P_R_HLG";
+		} else {
+			video->conversion_techs[0] = "R10P_G_SRGB";
+			video->conversion_techs[1] = "R10P_B_SRGB";
+			video->conversion_techs[2] = "R10P_R_SRGB";
+		}
+		break;
 	case VIDEO_FORMAT_Y410:
 		video->conversion_needed = true;
 		if (info->colorspace == VIDEO_CS_2100_PQ) {
@@ -292,6 +308,16 @@ static bool obs_init_gpu_conversion(struct obs_core_video_mix *video)
 		if (!video->convert_textures[0] || !video->convert_textures[1] || !video->convert_textures[2])
 			success = false;
 		break;
+	case VIDEO_FORMAT_R10P:
+		video->convert_textures[0] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[1] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[2] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		if (!video->convert_textures[0] || !video->convert_textures[1] || !video->convert_textures[2])
+			success = false;
+		break;
 	case VIDEO_FORMAT_I010:
 		video->convert_textures[0] =
 			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
@@ -393,6 +419,17 @@ static bool obs_init_gpu_copy_surfaces(struct obs_core_video_mix *video, size_t 
 		if (!video->copy_surfaces[i][2])
 			return false;
 		break;
+	case VIDEO_FORMAT_R10P:
+		video->copy_surfaces[i][0] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][0])
+			return false;
+		video->copy_surfaces[i][1] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][1])
+			return false;
+		video->copy_surfaces[i][2] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][2])
+			return false;
+		break;
 	case VIDEO_FORMAT_I010:
 		video->copy_surfaces[i][0] = gs_stagesurface_create(info->width, info->height, GS_R16);
 		if (!video->copy_surfaces[i][0])
@@ -464,6 +501,7 @@ static bool obs_init_textures(struct obs_core_video_mix *video)
 	case VIDEO_FORMAT_R10L:
 	case VIDEO_FORMAT_Y410:
 	case VIDEO_FORMAT_GBR10:
+	case VIDEO_FORMAT_R10P:
 		format = GS_RGBA16F;
 		break;
 	default:
@@ -516,6 +554,7 @@ static bool obs_init_textures(struct obs_core_video_mix *video)
 		case VIDEO_FORMAT_R10L:
 		case VIDEO_FORMAT_Y410:
 		case VIDEO_FORMAT_GBR10:
+		case VIDEO_FORMAT_R10P:
 			space = GS_CS_SRGB_16F;
 			break;
 		default:

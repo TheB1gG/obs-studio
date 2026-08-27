@@ -339,7 +339,8 @@ static inline void get_colour_information(obs_encoder_t *enc, uint16_t *pri, uin
 
 	if (fmt != VIDEO_FORMAT_NONE || cs != VIDEO_CS_DEFAULT) {
 		/* Raw RGB components (identity matrix) - same nclx signalling as the BGRA fix. */
-		bool is_rgb_family = (fmt == VIDEO_FORMAT_BGRA) || (fmt == VIDEO_FORMAT_R10L);
+		bool is_rgb_family =
+			(fmt == VIDEO_FORMAT_BGRA) || (fmt == VIDEO_FORMAT_R10L) || (fmt == VIDEO_FORMAT_R10P);
 		preferred_colour_values(cs, is_rgb_family, pri, trc, spc);
 		bool full = is_rgb_family || rg == VIDEO_RANGE_FULL;
 		*full_range = full ? 1 : 0;

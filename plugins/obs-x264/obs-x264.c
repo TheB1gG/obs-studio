@@ -36,6 +36,8 @@
 
 #define warn(format, ...) do_log(LOG_WARNING, format, ##__VA_ARGS__)
 #define warn_enc(encoder, format, ...) do_log_enc(LOG_WARNING, encoder, format, ##__VA_ARGS__)
+#define err(format, ...) do_log(LOG_ERROR, format, ##__VA_ARGS__)
+#define err_enc(encoder, format, ...) do_log_enc(LOG_ERROR, encoder, format, ##__VA_ARGS__)
 #define info(format, ...) do_log(LOG_INFO, format, ##__VA_ARGS__)
 #define debug(format, ...) do_log(LOG_DEBUG, format, ##__VA_ARGS__)
 
@@ -75,9 +77,9 @@ struct obs_x264 {
 	int active_csp;
 	uint32_t active_bitdepth;
 
-	/* R10I (RGB 10-bit): per-frame scratch holding the delivered X2BGR10LE stream
-	 * unpacked into packed u16 [B,G,R] triplets, fed to x264 as BGR | HIGH_DEPTH. */
-	uint16_t *r10i_plane;
+	/* R10I (RGB 10-bit): libobs delivers three planar u16 textures [G][B][R]
+	 * (VIDEO_FORMAT_R10P), which x264 ingests directly as YUV444P | HIGH_DEPTH -
+	 * no per-frame scratch/unpack is needed on this side. */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -95,7 +97,9 @@ static enum video_format color_format_from_name(const char *name)
 	else if (strcmp(name, "BGRA") == 0)
 		return VIDEO_FORMAT_BGRA;
 	else if (strcmp(name, "R10I") == 0)
-		return VIDEO_FORMAT_R10L; /* RGB 10-bit: libobs delivers packed X2BGR10LE */
+		return VIDEO_FORMAT_R10L; /* RGB 10-bit: libobs delivers planar G/B/R u16 (R10P) */
+	else if (strcmp(name, "R10P") == 0)
+		return VIDEO_FORMAT_R10P; /* planar RGB 10-bit: delivered as [G][B][R] u16 planes directly */
 	else if (strcmp(name, "I412") == 0)
 		return VIDEO_FORMAT_I412; /* planar YUV 4:4:4 u16 (YUV444P12LE); x264 I444 + HIGH_DEPTH */
 	else if (strcmp(name, "I420") == 0)
@@ -103,7 +107,7 @@ static enum video_format color_format_from_name(const char *name)
 	else if (strcmp(name, "I010") == 0)
 		return VIDEO_FORMAT_P010; /* legacy: planar P010 collapses to the same P010 stream */
 
-	return VIDEO_FORMAT_NV12; /* default */
+	return VIDEO_FORMAT_NONE; /* unrecognized value: create/update rejects it loudly instead of silently downgrading to NV12 */
 }
 
 /* Maps an arbitrary base (Advanced -> Video) format onto one x264 can actually encode,
@@ -115,13 +119,18 @@ static enum video_format map_base_format_for_x264(enum video_format fmt)
 		return VIDEO_FORMAT_NV12;
 	case VIDEO_FORMAT_P010:
 	case VIDEO_FORMAT_I010:
+	case VIDEO_FORMAT_Y410: /* packed YUV 4:2:0 10-bit -> lossless as planar I010 (x264 I420 | HIGH_DEPTH) */
 		return VIDEO_FORMAT_P010;
 	case VIDEO_FORMAT_I444:
 		return VIDEO_FORMAT_I444;
 	case VIDEO_FORMAT_I412:
 		return VIDEO_FORMAT_I412; /* planar 4:4:4 u16, x264 encodes it as I444 + HIGH_DEPTH */
 	case VIDEO_FORMAT_P216:
+	case VIDEO_FORMAT_P416: /* packed YUV 4:2:2 10-bit -> lossless as planar I210 (x264 I422 | HIGH_DEPTH) */
 		return VIDEO_FORMAT_P216;
+	case VIDEO_FORMAT_R10L:
+	case VIDEO_FORMAT_R10P: /* RGB 10-bit -> lossless as planar [G][B][R] u16 (x264 I444 | HIGH_DEPTH) */
+		return VIDEO_FORMAT_R10P;
 	case VIDEO_FORMAT_RGBA:
 	case VIDEO_FORMAT_BGRA:
 	case VIDEO_FORMAT_BGRX:
@@ -194,7 +203,6 @@ static void clear_data(struct obs_x264 *obsx264)
 		x264_encoder_close(obsx264->context);
 		bfree(obsx264->sei);
 		bfree(obsx264->extra_data);
-		bfree(obsx264->r10i_plane);
 		bfree(obsx264->quant_offsets);
 
 		obsx264->context = NULL;
@@ -373,7 +381,9 @@ static obs_properties_t *obs_x264_props(void *unused)
 	obs_property_list_add_string(list, "I412 (YUV 4:4:4, 10-bit planar)", "I412");
 	obs_property_list_add_string(list, "P216 (10-bit)", "P216");
 	obs_property_list_add_string(list, "BGRA (RGB 8-bit)", "BGRA");
-	obs_property_list_add_string(list, "R10I (RGB 10-bit)", "R10I");
+	/* Planar RGB 10-bit replaces the removed packed R10l ("R10I") option; that name still maps to a
+	 * working planar path here so profiles saved before it was dropped keep encoding. */
+	obs_property_list_add_string(list, "R10p (planar RGB 10-bit)", "R10P");
 
 	list = obs_properties_add_list(props, "color_space", TEXT_COLOR_SPACE, OBS_COMBO_TYPE_LIST,
 				       OBS_COMBO_FORMAT_INT);
@@ -543,6 +553,10 @@ static bool obs_x264_format_to_csp(enum video_format format, int *csp, uint32_t 
 		*csp = X264_CSP_I444; /* planar Y/U/V u16 (YUV444P12LE container); HIGH_DEPTH via i_bitdepth */
 		*bitdepth = 10;
 		break;
+	case VIDEO_FORMAT_R10P:
+		*csp = X264_CSP_I444; /* planar G/B/R u16 (R10p delivery); HIGH_DEPTH via i_bitdepth */
+		*bitdepth = 10;
+		break;
 	case VIDEO_FORMAT_P216:
 		*csp = X264_CSP_NV16; /* x264 uses NV16 csp with i_bitdepth=10 for P216 */
 		*bitdepth = 10;
@@ -582,11 +596,19 @@ static bool obs_x264_delivery_csp(enum video_format fmt, enum video_format *deli
 		*bitdepth = 10;
 		return true;
 	case VIDEO_FORMAT_R10L:
-		/* R10I (RGB 10-bit): libobs delivers packed X2BGR10LE (u32, 4 B/pixel,
-		 * (msb)2X 10B 10G 10R(lsb)). x264 ingests a single packed u16 [B,G,R]
-		 * plane as BGR | HIGH_DEPTH; the plugin unpacks per frame. */
-		*delivery = VIDEO_FORMAT_R10L;
-		*csp = X264_CSP_BGR;
+		/* R10I (RGB 10-bit): libobs delivers three full-resolution planar u16 textures
+		 * [G][B][R] as the R10P format. x264 ingests them as YUV444P | HIGH_DEPTH with
+		 * G→plane[0], B→plane[1], R→plane[2] — the same values/planes the old packed
+		 * X2BGR10LE path produced, minus the per-frame CPU unpack. */
+		*delivery = VIDEO_FORMAT_R10P;
+		*csp = X264_CSP_I444;
+		*bitdepth = 10;
+		return true;
+	case VIDEO_FORMAT_R10P:
+		/* R10p (planar RGB 10-bit): libobs delivers the three full-resolution planar u16
+		 * textures [G][B][R] as-is; x264 ingests them directly. */
+		*delivery = VIDEO_FORMAT_R10P;
+		*csp = X264_CSP_I444;
 		*bitdepth = 10;
 		return true;
 	default:
@@ -709,18 +731,20 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 		break;
 	}
 
-	/* BGRA is stored by x264 as raw RGB components (G/B/R in the Y/Cb/Cr slots,
-	 * alpha discarded) with no YUV conversion. The only valid VUI for that data
+	/* BGRA and R10I are stored by x264 as raw RGB components (G/B/R in the Y/Cb/Cr slots,
+	 * alpha discarded for BGRA) with no YUV conversion. The only valid VUI for that data
 	 * is identity (GBR) colormatrix + full range: a bt.709 matrix or limited
 	 * range would be wrong for it. Force both regardless of the user's picks. */
-	if (info.format == VIDEO_FORMAT_BGRA || info.format == VIDEO_FORMAT_R10L) {
+	if (info.format == VIDEO_FORMAT_BGRA || info.format == VIDEO_FORMAT_R10L ||
+	    info.format == VIDEO_FORMAT_R10P) {
 		colmatrix =
 			"GBR"; /* SPS col_matrix_coef 0, identity matrix (x264_colmatrix_names[0]): R=plane[2], G=plane[0](luma slot), B=plane[1] */
 	}
 
 	obsx264->params.vui.i_sar_height = 1;
 	obsx264->params.vui.i_sar_width = 1;
-	bool is_rgb_family = (info.format == VIDEO_FORMAT_BGRA) || (info.format == VIDEO_FORMAT_R10L);
+	bool is_rgb_family = (info.format == VIDEO_FORMAT_BGRA) || (info.format == VIDEO_FORMAT_R10L) ||
+		              (info.format == VIDEO_FORMAT_R10P);
 	obsx264->params.vui.b_fullrange = is_rgb_family || info.range == VIDEO_RANGE_FULL;
 	if (is_rgb_family) {
 		/* Raw RGB components: no YUV transform, so primaries/transfer are unspecified
@@ -755,7 +779,7 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 	int csp;
 	uint32_t bitdepth;
 	if (!obs_x264_delivery_csp(obsx264->color_format, &delivery_fmt, &csp, &bitdepth)) {
-		warn("Unsupported color format: %d", (int)obsx264->color_format);
+		err("internal error: unsupported color format (%d) reached param setup", (int)obsx264->color_format);
 		return;
 	}
 	/* x264 consumes csp/bitdepth; libobs delivers delivery_fmt (P010 -> planar I010). */
@@ -871,16 +895,17 @@ static bool obs_x264_update(void *data, obs_data_t *settings)
 	enum video_colorspace cs;
 	enum video_range_type range;
 	read_color_settings(settings, &format, &cs, &range);
-	publish_preferred_settings(obsx264->encoder, format, cs, range);
 
 	enum video_format delivery_fmt;
 	int csp;
 	uint32_t bitdepth;
 	bool ok_csp = obs_x264_delivery_csp(format, &delivery_fmt, &csp, &bitdepth);
 	if (!ok_csp) {
-		warn("Unsupported color format: %d", (int)format);
+		err("color format '%s' is not supported by x264; refusing to fall back to another format",
+		    obs_data_get_string(settings, "color_format"));
 		return false;
 	}
+	publish_preferred_settings(obsx264->encoder, format, cs, range);
 
 	/* Detect if the chosen color format changed since the context was built.
 	 * x264_encoder_reconfig cannot change i_csp/i_bitdepth/vui, so a context
@@ -954,20 +979,22 @@ static void *obs_x264_create(obs_data_t *settings, obs_encoder_t *encoder)
 	enum video_colorspace cs;
 	enum video_range_type range;
 	read_color_settings(settings, &format, &cs, &range);
-	obsx264->color_format = format;
-	obsx264->color_space = cs;
-	obsx264->color_range = range;
-
-	publish_preferred_settings(encoder, format, cs, range);
 
 	enum video_format delivery_fmt;
 	int csp;
 	uint32_t bitdepth;
 	if (!obs_x264_delivery_csp(format, &delivery_fmt, &csp, &bitdepth)) {
-		warn_enc(encoder, "Unsupported color format: %d", (int)format);
+		err_enc(encoder, "color format '%s' is not supported by x264; refusing to fall back to another format",
+		        obs_data_get_string(settings, "color_format"));
+		obs_encoder_set_last_error(encoder, obs_module_text("ColorFormatUnsupported"));
 		bfree(obsx264);
 		return NULL;
 	}
+	obsx264->color_format = format;
+	obsx264->color_space = cs;
+	obsx264->color_range = range;
+
+	publish_preferred_settings(encoder, format, cs, range);
 	obsx264->active_csp = csp;
 	obsx264->active_bitdepth = bitdepth;
 
@@ -1013,27 +1040,6 @@ static void parse_packet(struct obs_x264 *obsx264, struct encoder_packet *packet
 	packet->keyframe = pic_out->b_keyframe != 0;
 }
 
-/* R10I: unpack the delivered packed X2BGR10LE (u32) stream into a packed u16
- * [B,G,R] triplet scratch. x264's BGR | HIGH_DEPTH input expects exactly that:
- * one plane, pw=3 u16 per pixel, component order B,G,R (plane_copy_deinterleave_rgb
- * maps src comp0->plane[1], comp1->luma slot, comp2->plane[2]). Reused across frames. */
-static void r10i_unpack_x2bgr10le(struct obs_x264 *obsx264, const uint8_t *src,
-		uint32_t w, uint32_t h)
-{
-	if (!obsx264->r10i_plane) {
-		size_t sz = (size_t)w * h;
-		obsx264->r10i_plane = bmalloc(sz * 3u * sizeof(uint16_t));
-	}
-	const uint32_t *in = (const uint32_t *)src;
-	uint16_t *out = obsx264->r10i_plane;
-	for (uint32_t n = 0; n < w * h; ++n) {
-		uint32_t v = in[n]; /* (msb)2X 10B 10G 10R(lsb) */
-		out[3u * n + 0] = (uint16_t)((v >> 20) & 0x3FF); /* B -> x264 plane[1] slot */
-		out[3u * n + 1] = (uint16_t)((v >> 10) & 0x3FF); /* G -> luma slot          */
-		out[3u * n + 2] = (uint16_t)(v & 0x3FF);         /* R -> plane[2]           */
-	}
-}
-
 static inline void init_pic_data(struct obs_x264 *obsx264, x264_picture_t *pic, struct encoder_frame *frame)
 {
 	x264_picture_init(pic);
@@ -1061,25 +1067,10 @@ static inline void init_pic_data(struct obs_x264 *obsx264, x264_picture_t *pic, 
 		pic->img.i_plane = 2; /* P216: Y + interleaved UV */
 	else if (obsx264->active_csp == X264_CSP_BGRA)
 		pic->img.i_plane = 1;
-	else if (obsx264->active_csp == X264_CSP_BGR) {
-		/* R10I: unpack the delivered X2BGR10LE into the packed u16 scratch; the
-		 * pointer override below hands x264 that scratch instead of frame->data. */
-		if (frame->data[0]) {
-			uint32_t w = obs_encoder_get_width(obsx264->encoder);
-			uint32_t h = obs_encoder_get_height(obsx264->encoder);
-			r10i_unpack_x2bgr10le(obsx264, frame->data[0], w, h);
-		}
-		pic->img.i_plane = 1;
-	}
 
 	for (int i = 0; i < pic->img.i_plane; i++) {
 		pic->img.i_stride[i] = (int)frame->linesize[i];
 		pic->img.plane[i] = frame->data[i];
-	}
-	if (obsx264->active_csp == X264_CSP_BGR && obsx264->r10i_plane) {
-		/* Hand x264 the unpacked packed-u16 [B,G,R] scratch (row = 3*w u16). */
-		pic->img.i_stride[0] = (int)(obs_encoder_get_width(obsx264->encoder) * 6u);
-		pic->img.plane[0] = (uint8_t *)obsx264->r10i_plane;
 	}
 }
 
@@ -1207,7 +1198,10 @@ static void obs_x264_video_info(void *data, struct video_scale_info *info)
 	 * so the x264 context and delivered frames always match.
 	 * P010 is requested as planar I010 (YUV420P10LE) - see obs_x264_delivery_csp. */
 	if (!obs_x264_delivery_csp(obsx264->color_format, &delivery_fmt, &csp, &bitdepth)) {
-		/* Unsupported: fall back to NV12 so libobs can still deliver something valid. */
+		/* Unreachable after create/update validation; NV12 is the last-resort delivery so libobs
+		 * still has a valid format. Logged loudly - never silent. */
+		err("unsupported color format (%d): x264 cannot encode it; delivering NV12 as last resort",
+		    (int)obsx264->color_format);
 		delivery_fmt = VIDEO_FORMAT_NV12;
 	}
 	info->format = delivery_fmt;

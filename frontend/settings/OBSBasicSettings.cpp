@@ -1010,6 +1010,7 @@ void OBSBasicSettings::LoadColorSpaces()
 #define CF_P216_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.P216")
 #define CF_P416_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.P416")
 #define CF_R10l_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.R10l")
+#define CF_R10p_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.R10p")
 #define CF_BGRA_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.BGRA")
 
 void OBSBasicSettings::LoadColorFormats()
@@ -1026,6 +1027,7 @@ void OBSBasicSettings::LoadColorFormats()
 	ui->colorFormat->addItem(CF_P416_STR, "P416");
 #ifdef _WIN32
 	ui->colorFormat->addItem(CF_R10l_STR, "R10l");
+	ui->colorFormat->addItem(CF_R10p_STR, "R10p"); // Planar G/B/R 10-bit (x264 R10I fast path)
 #endif
 	ui->colorFormat->addItem(CF_BGRA_STR, "RGB"); // Avoid config break
 }
@@ -2486,7 +2488,8 @@ void OBSBasicSettings::UpdateColorFormatSpaceWarning()
 	switch (ui->colorSpace->currentIndex()) {
 	case 3: /* Rec.2100 (PQ) */
 	case 4: /* Rec.2100 (HLG) */
-		if (format == "P010" || format == "Y410" || format == "P216" || format == "P416" || format == "R10l") {
+		if (format == "P010" || format == "Y410" || format == "P216" || format == "P416" || format == "R10l" ||
+		    format == "R10p") {
 			ui->advancedMsg2->clear();
 			ui->advancedMsg2->setVisible(false);
 		} else if (format == "I010") {
@@ -2502,7 +2505,7 @@ void OBSBasicSettings::UpdateColorFormatSpaceWarning()
 			ui->advancedMsg2->clear();
 			ui->advancedMsg2->setVisible(false);
 		} else if (format == "I010" || format == "P010" || format == "Y410" || format == "P216" ||
-			   format == "P416" || format == "R10l") {
+			   format == "P416" || format == "R10l" || format == "R10p") {
 			ui->advancedMsg2->setText(QTStr("Basic.Settings.Advanced.FormatWarningPreciseSdr"));
 			ui->advancedMsg2->setVisible(true);
 		} else {
