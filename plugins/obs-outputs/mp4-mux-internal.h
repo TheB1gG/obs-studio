@@ -272,12 +272,81 @@ static inline void get_speaker_positions(enum speaker_layout layout, uint8_t *ar
 	}
 }
 
+/* Maps a per-encoder colorspace (published via obs_encoder_set_preferred_color_space)
+ * to ITU-T T.3511 nclx values, mirroring what x264 writes into its SPS VUI so the colr
+ * box always matches the stream's actual chroma signalling. */
+static inline void preferred_colour_values(enum video_colorspace cs, bool is_rgb_family, uint16_t *pri, uint16_t *trc,
+					    uint16_t *spc)
+{
+	if (is_rgb_family) {
+		/* x264 stores RGB-family input (BGRA 8-bit and R10I/R10L 10-bit) as raw RGB
+		 * components with an identity matrix and full range. There is no YUV transform
+		 * for that data, so primaries/transfer are unspecified (0/0); only spc=0 +
+		 * full_range are meaningful nclx fields. */
+		*pri = 0; // OBSCOL_PRI_UNSPECIFIED
+		*trc = 0; // OBSCOL_TRC_UNSPECIFIED
+		*spc = 0; // identity matrix (GBR), matching the SPS col_matrix_coef=0
+		return;
+	}
+
+	switch (cs) {
+	case VIDEO_CS_601:
+		*pri = 6; // OBSCOL_PRI_SMPTE170M
+		*trc = 6;
+		*spc = 6;
+		break;
+	case VIDEO_CS_DEFAULT:
+	case VIDEO_CS_709:
+		*pri = 1; // OBSCOL_PRI_BT709
+		*trc = 1;
+		*spc = 1;
+		break;
+	case VIDEO_CS_SRGB:
+		*pri = 1;  // OBSCOL_PRI_BT709
+		*trc = 13; // OBSCOL_TRC_IEC61966_2_1
+		*spc = 1;  // OBSCOL_PRI_BT709
+		break;
+	case VIDEO_CS_2100_PQ:
+		*pri = 9;  // OBSCOL_PRI_BT2020
+		*trc = 16; // OBSCOL_TRC_SMPTE2084
+		*spc = 9;  // OBSCOL_SPC_BT2020_NCL
+		break;
+	case VIDEO_CS_2100_HLG:
+		*pri = 9;   // OBSCOL_PRI_BT2020
+		*trc = 18;  // OBSCOL_TRC_ARIB_STD_B67
+		*spc = 9;   // OBSCOL_SPC_BT2020_NCL
+		break;
+	default: /* unexpected enum: x264 leaves its VUI at bt.709 */
+		*pri = 1;
+		*trc = 1;
+		*spc = 1;
+		break;
+	}
+}
+
 static inline void get_colour_information(obs_encoder_t *enc, uint16_t *pri, uint16_t *trc, uint16_t *spc,
 					  uint8_t *full_range)
 {
 	video_t *video = obs_encoder_video(enc);
 	const struct video_output_info *info = video_output_get_info(video);
 
+	/* Prefer the encoder's published color settings (set by encoders that encode in a
+	 * fixed format/space/range independent of the base video info, e.g. x264). This keeps
+	 * the nclx box consistent with the stream's SPS VUI. */
+	enum video_format fmt = obs_encoder_get_preferred_video_format(enc);
+	enum video_colorspace cs = obs_encoder_get_preferred_color_space(enc);
+	enum video_range_type rg = obs_encoder_get_preferred_range(enc);
+
+	if (fmt != VIDEO_FORMAT_NONE || cs != VIDEO_CS_DEFAULT) {
+		/* Raw RGB components (identity matrix) - same nclx signalling as the BGRA fix. */
+		bool is_rgb_family = (fmt == VIDEO_FORMAT_BGRA) || (fmt == VIDEO_FORMAT_R10L);
+		preferred_colour_values(cs, is_rgb_family, pri, trc, spc);
+		bool full = is_rgb_family || rg == VIDEO_RANGE_FULL;
+		*full_range = full ? 1 : 0;
+		return;
+	}
+
+	/* No per-encoder override: fall back to the base video info */
 	*full_range = info->range == VIDEO_RANGE_FULL ? 1 : 0;
 
 	switch (info->colorspace) {
