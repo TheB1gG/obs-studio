@@ -66,6 +66,8 @@ extern void flv_packet_mux(struct encoder_packet *packet, int32_t dts_offset, ui
 // Y2023 spec
 extern void flv_packet_start(struct encoder_packet *packet, enum video_id_t codec, uint8_t **output, size_t *size,
 			     size_t idx);
+extern void flv_packet_start_ts(struct encoder_packet *packet, enum video_id_t codec, int32_t dts_offset, uint8_t **output,
+				size_t *size, size_t idx);
 extern void flv_packet_frames(struct encoder_packet *packet, enum video_id_t codec, int32_t dts_offset,
 			      uint8_t **output, size_t *size, size_t idx);
 extern void flv_packet_end(struct encoder_packet *packet, enum video_id_t codec, uint8_t **output, size_t *size,

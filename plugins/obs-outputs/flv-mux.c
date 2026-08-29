@@ -505,6 +505,15 @@ void flv_packet_start(struct encoder_packet *packet, enum video_id_t codec, uint
 	flv_packet_ex(packet, codec, 0, output, size, PACKETTYPE_SEQ_START, idx);
 }
 
+// SEQ_START with an explicit dts offset - used to re-emit a track's codec header mid-stream
+// (e.g. after an NVENC live-resolution change), where the tag must carry the current stream
+// timestamp instead of the raw/unoffset value used for stream-start headers.
+void flv_packet_start_ts(struct encoder_packet *packet, enum video_id_t codec, int32_t dts_offset, uint8_t **output, size_t *size,
+                          size_t idx)
+{
+	flv_packet_ex(packet, codec, dts_offset, output, size, PACKETTYPE_SEQ_START, idx);
+}
+
 void flv_packet_frames(struct encoder_packet *packet, enum video_id_t codec, int32_t dts_offset, uint8_t **output,
 		       size_t *size, size_t idx)
 {

@@ -88,31 +88,315 @@ static inline int nv_get_cap(struct nvenc_data *enc, NV_ENC_CAPS cap)
 	return v;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Live rate-control reconfiguration (CBR / VBR / CQVBR / CQP)               */
+/*                                                                           */
+/* NV_ENC_RECONFIGURE_ENCODER() re-initializes the encode session from       */
+/* `reInitEncodeParams` and, when resetEncoder is set, resets "rate control  */
+/* states and other internal encoder states" - only valid together with an   */
+/* IDR frame, which we force below. Because this fork always passes its own  */
+/* NV_ENC_CONFIG via enc->params.encodeConfig (see initialize_params()),     */
+/* writing the desired rateControlMode into enc->config before calling it    */
+/* makes NVIDIA restart encoding under that regime from a forced IDR.        */
+/* While streaming, the reconfigure is deferred to the next GOP boundary     */
+/* (nvenc_encode_base) so sibling encoders of a multitrack output keep      */
+/* their keyframes aligned (delay: up to one GOP).                           */
+/*                                                                           */
+/* NOTE: experimental / for evaluation - NVIDIA does not explicitly          */
+/* guarantee RC-regime switches mid-stream, so every switch is logged and    */
+/* failures leave the encoder in its previous mode/state.                    */
+
+static const char *nvenc_rc_mode_name(NV_ENC_PARAMS_RC_MODE mode)
+{
+	switch (mode) {
+	case NV_ENC_PARAMS_RC_CBR:     return "CBR";
+	case NV_ENC_PARAMS_RC_VBR:     return "VBR";
+	case NV_ENC_PARAMS_RC_CONSTQP: return "CQP";
+	}
+
+	return "unknown";
+}
+
+/* Applies the staged NV_ENC_CONFIG via NV_ENC_RECONFIGURE_ENCODER with a   */
+/* full reset of encoder state and a forced IDR. Must run on the encode     */
+/* thread while streaming (between frame submissions), or any time when the */
+/* encoder is inactive.                                                      */
+static bool apply_nvenc_reconfigure(struct nvenc_data *enc)
+{
+	NV_ENC_RECONFIGURE_PARAMS params = {0};
+	params.version            = NV_ENC_RECONFIGURE_PARAMS_VER;
+	params.reInitEncodeParams = enc->params; // carries enc->config (encodeConfig)
+	params.resetEncoder       = 1;          // resets rate-control state - requires IDR
+	params.forceIDR           = 1;
+
+	if (NV_FAILED(nv.nvEncReconfigureEncoder(enc->session, &params))) {
+		return false; // encoder keeps its previous mode/state
+	}
+
+	/* resetEncoder flushes every in-flight frame inside NVENC. Rewind   */
+	/* our submission accounting so get_encoded_packet() never locks (and */
+	/* blocks on) bitstreams or DTS entries that will never be filled.    */
+	enc->buffers_queued = 0;
+	deque_free(&enc->dts_list);
+	deque_init(&enc->dts_list);
+	enc->cur_bitstream  = enc->next_bitstream;
+
+	/* Re-arm sequence-parameter capture: the next locked frame is the   */
+	/* forced IDR of the reconfigured session, and get_encoded_packet()  */
+	/* refreshes enc->header via nvEncGetSequenceParams(), so muxers see */
+	/* the new SPS/VPS/PPS and can re-emit an updated codec header.      */
+	/* Players only reliably latch a fresh resolution from a dedicated   */
+	/* sequence-start packet, not from in-band NALs alone.               */
+	enc->first_packet = true;
+
+	return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Live resolution changes                                                     */
+/*                                                                           */
+/* obs_encoder_set_scaled_size() makes libobs start delivering frames at the  */
+/* new size on the very next tick, so - unlike RC changes - a resize cannot   */
+/* be deferred to the GOP boundary: this frame's input texture already has    */
+/* the new dimensions. We therefore apply it immediately (reconfigure with    */
+/* reset + forceIDR), which inevitably lands mid-GOP and shifts this track's  */
+/* keyframe phase off the shared multitrack grid. To re-lock, nvenc_encode_   */
+/* base() then stages one more forced keyframe exactly on the next shared     */
+/* boundary (align_pending / align_remaining countdown).                     */
+
+static bool apply_nvenc_resize(struct nvenc_data *enc, uint32_t w, uint32_t h)
+{
+	if (nv_get_cap(enc, NV_ENC_CAPS_SUPPORT_DYN_RES_CHANGE) != 1) {
+		warn("driver does not report support for dynamic resolution change; restart required");
+		return false;
+	}
+
+	int max_w = nv_get_cap(enc, NV_ENC_CAPS_WIDTH_MAX);
+	int max_h = nv_get_cap(enc, NV_ENC_CAPS_HEIGHT_MAX);
+
+	if ((max_w > 0 && (int)w > max_w) || (max_h > 0 && (int)h > max_h)) {
+		warn("live resize to %ux%u exceeds encoder limits (%dx%d), restart required", w, h, max_w, max_h);
+		return false;
+	}
+
+	info("applying live resolution change: %ux%u -> %ux%u (forced IDR this frame)", enc->cx, enc->cy, w, h);
+
+	/* Session parameters for the reconfigure below. */
+	enc->params.encodeWidth  = w;
+	enc->params.encodeHeight = h;
+	enc->params.darWidth     = w;
+	enc->params.darHeight    = h;
+	enc->cx                  = w;
+	enc->cy                  = h;
+
+#ifdef _WIN32
+	if (!enc->non_texture) {
+		d3d11_free_textures(enc); // unmaps/unregisters + releases (mapped-safe)
+	} else
+#endif
+	{
+		cuda_free_surfaces(enc);
+	}
+
+	const int flushed = enc->buffers_queued;
+
+	if (!apply_nvenc_reconfigure(enc)) // reset=1 + forceIDR, carries updated params (+ queue rewind)
+		return false;
+
+#ifdef _WIN32
+	if (!enc->non_texture) {
+		enc->textures.num = 0; // reuse reserved storage, re-init refills entries
+		if (!d3d11_init_textures(enc)) // register new-size resources on the resized session
+			return false;
+	} else
+#endif
+	{
+		enc->surfaces.num = 0;
+		if (!cuda_init_surfaces(enc))
+			return false;
+	}
+
+	/* The reconfigured session emits a fresh SPS/PPS (new resolution); */
+	/* refresh our cached header so get_extra_data() returns the new one. */
+	enc->first_packet = true;
+
+	info("resize reconfigure accepted: %d in-flight frame(s) discarded by reset", flushed);
+	return true;
+}
+
+bool nvenc_maybe_resize(struct nvenc_data *enc)
+{
+	uint32_t w = obs_encoder_get_width(enc->encoder);
+	uint32_t h = obs_encoder_get_height(enc->encoder);
+
+	if (w == enc->cx && h == enc->cy)
+		return false; // no pending change
+
+	if (!apply_nvenc_resize(enc, w, h)) {
+		error("live resize to %ux%u could not be applied - encoder left in previous state until the stream restarts",
+		      w, h);
+		return false; // caps check: nothing was touched, retried on the next frame
+	}
+
+	/* Stage realignment onto the shared keyframe grid. */
+	/* `frames_since_idr` resets to 0 when an IDR packet is observed,   */
+	/* which happens output_delay-1 ticks AFTER that IDR's submission.  */
+	/* Within each observation cycle the natural (shared) IDR           */
+	/* submissions sit at counter position s = gopLength-(delay-1),     */
+	/* i.e. exactly where nvenc_encode_base()'s boundary check fires.   */
+	const int64_t g = enc->config.gopLength;
+	if (!obs_encoder_active(enc->encoder) || g <= 0 || enc->output_delay < 2) {
+		info("resize applied off-grid (not streaming or no pipeline delay); alignment not staged");
+		return true;
+	}
+
+	const int64_t s = g - ((int64_t)enc->output_delay - 1); /* counter position of a shared keyframe tick */
+	const int64_t o = enc->frames_since_idr;                /* submissions since last observed IDR (pre-increment) */
+	const int64_t p = o + 1;                                /* this submission's position in the cycle [1..g] */
+
+	int64_t delta; // submissions after THIS one until the next shared keyframe tick (0 = this frame)
+	if (p < s)      delta = s - p;         /* grid point later in this observation cycle */
+	else if (p > s) delta = g - (p - s);  /* already past it, wraps to the next cycle */
+	else            delta = 0;            /* this frame is itself a shared keyframe tick */
+
+	if (delta == 0) {
+		info("resize landed exactly on a shared keyframe boundary - alignment preserved");
+		enc->reconfig_pending = false; /* any staged RC change already rode on this reset */
+	} else {
+		enc->align_pending   = true;
+		enc->align_remaining = delta + 1; /* pre-decremented in encode_base() starting with this frame */
+		info("staged resize realignment - forcing keyframe at next shared boundary "
+		     "(%lld frames, gopLength=%d output_delay=%d)",
+		     (long long)delta, (int)g, enc->output_delay);
+	}
+
+	return true;
+}
+
 static bool nvenc_update(void *data, obs_data_t *settings)
 {
 	struct nvenc_data *enc = data;
 
-	/* Only support reconfiguration of CBR bitrate */
-	if (enc->can_change_bitrate) {
-		enc->props.bitrate = obs_data_get_int(settings, "bitrate");
-		enc->props.max_bitrate = obs_data_get_int(settings, "max_bitrate");
+	int64_t bitrate     = obs_data_get_int(settings, "bitrate");
+	int64_t max_bitrate = obs_data_get_int(settings, "max_bitrate");
+	const char *rc_name = obs_data_get_string(settings, "rate_control");
 
-		bool vbr = (enc->config.rcParams.rateControlMode == NV_ENC_PARAMS_RC_VBR);
-		enc->config.rcParams.averageBitRate = (uint32_t)enc->props.bitrate * 1000;
-		enc->config.rcParams.maxBitRate = vbr ? (uint32_t)enc->props.max_bitrate * 1000
-						      : (uint32_t)enc->props.bitrate * 1000;
+	NV_ENC_CONFIG *config = &enc->config;
 
-		NV_ENC_RECONFIGURE_PARAMS params = {0};
-		params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-		params.reInitEncodeParams = enc->params;
-		params.resetEncoder = 1;
-		params.forceIDR = 1;
+	bool cqp    = astrcmpi(rc_name, "CQP") == 0;
+	bool vbr    = astrcmpi(rc_name, "VBR") == 0;
+	bool cq_vbr = astrcmpi(rc_name, "CQVBR") == 0;
+	int64_t cqp_val = obs_data_get_int(settings, "cqp");
+	int64_t tq_val  = obs_data_get_int(settings, "target_quality");
 
-		if (NV_FAILED(nv.nvEncReconfigureEncoder(enc->session, &params))) {
+	/* Lossless encoders use LOSSLESS tuning which is fixed at session init - */
+	/* switching away from (or to) it requires a full restart.                */
+	if (astrcmpi(enc->props.rate_control, "lossless") == 0 || astrcmpi(rc_name, "lossless") == 0) {
+		bool lossless_now = astrcmpi(enc->props.rate_control, "lossless") == 0;
+		bool lossless_req = astrcmpi(rc_name, "lossless") == 0;
+
+		if (lossless_now != lossless_req) {
+			warn("cannot switch %s rate control to %s while streaming; restart required",
+			     lossless_now ? "from LOSSLESS" : "to", rc_name);
 			return false;
 		}
+		return true; // pure lossless: nothing else is live-tunable here
 	}
 
+	/* --- resolve desired RC mode (unrecognized values keep the current one) */
+
+	NV_ENC_PARAMS_RC_MODE desired_mode = config->rcParams.rateControlMode;
+
+	if (cqp) {
+		desired_mode = NV_ENC_PARAMS_RC_CONSTQP;
+	} else if (vbr || cq_vbr) {
+		desired_mode = NV_ENC_PARAMS_RC_VBR;
+	} else if (astrcmpi(rc_name, "CBR") == 0) {
+		desired_mode = NV_ENC_PARAMS_RC_CBR;
+	}
+
+	const int64_t cqp_scaled = enc->codec == CODEC_AV1 ? cqp_val * 4 : cqp_val;
+
+	/* CQVBR runs in VBR mode with averageBitRate = 0 */
+	bool cq_state = config->rcParams.rateControlMode == NV_ENC_PARAMS_RC_VBR &&
+			config->rcParams.averageBitRate == 0;
+
+	bool rc_changed = desired_mode != config->rcParams.rateControlMode ||
+			(cq_vbr != cq_state) ||
+			(desired_mode == NV_ENC_PARAMS_RC_CONSTQP &&
+			 (int64_t)config->rcParams.constQP.qpIntra != cqp_scaled) ||
+			(cq_vbr && config->rcParams.targetQuality != (uint8_t)tq_val);
+
+	bool br_changed = enc->can_change_bitrate &&
+			(enc->props.bitrate != bitrate || enc->props.max_bitrate != max_bitrate);
+
+	if (!rc_changed && !br_changed)
+		return true; // nothing to do - avoids needless encoder reset + IDR churn
+
+	/* --- apply desired state --------------------------------------------- */
+
+	if (rc_changed) {
+		info("switching rate control from %s to %s while streaming (forced IDR)",
+		     nvenc_rc_mode_name(config->rcParams.rateControlMode), nvenc_rc_mode_name(desired_mode));
+
+		config->rcParams.rateControlMode = desired_mode;
+		config->rcParams.averageBitRate  = (uint32_t)bitrate * 1000;
+		config->rcParams.maxBitRate      = (vbr || cq_vbr) ? (uint32_t)max_bitrate * 1000 : (uint32_t)bitrate * 1000;
+		config->rcParams.vbvBufferSize   = (uint32_t)bitrate * 1000;
+
+		if (cqp) {
+			config->rcParams.constQP.qpInterP = (uint32_t)cqp_scaled;
+			config->rcParams.constQP.qpInterB = (uint32_t)cqp_scaled;
+			config->rcParams.constQP.qpIntra  = (uint32_t)cqp_scaled;
+		} else if (cq_vbr) {
+			config->rcParams.targetQuality   = (uint8_t)tq_val;
+			config->rcParams.averageBitRate  = 0;
+			config->rcParams.vbvBufferSize   = 0;
+		}
+
+		/* Two-pass state is not safe to carry across an RC-regime change */
+		config->rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
+
+		/* CBR padding - mirror create-time handling (init_encoder_h264) */
+		if (enc->codec == CODEC_H264) {
+			config->encodeCodecConfig.h264Config.enableFillerDataInsertion =
+				desired_mode == NV_ENC_PARAMS_RC_CBR ? 1 : 0;
+		}
+
+		enc->can_change_bitrate = cqp ? false
+					      : nv_get_cap(enc, NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE);
+	} else if (br_changed) {
+		info("changing bitrate from %lld to %lld while streaming", enc->props.bitrate, bitrate);
+
+		bool is_vbr = config->rcParams.rateControlMode == NV_ENC_PARAMS_RC_VBR;
+		config->rcParams.averageBitRate = (uint32_t)bitrate * 1000;
+		config->rcParams.maxBitRate     = is_vbr ? (uint32_t)max_bitrate * 1000 : (uint32_t)bitrate * 1000;
+	}
+
+	enc->props.bitrate     = bitrate;
+	enc->props.max_bitrate = max_bitrate;
+	if (cqp) {
+		enc->props.cqp = cqp_val;
+	} else if (cq_vbr) {
+		enc->props.target_quality = tq_val;
+	}
+
+	/* While streaming, the reconfigure is deferred to the next GOP      */
+	/* boundary. Forcing an IDR mid-GOP shifts this encoder's keyframe  */
+	/* phase relative to sibling encoders of a multitrack output (the   */
+	/* muxer requires every track's keyframes at identical pts), which  */
+	/* permanently desyncs the tracks. At the shared boundary,          */
+	/* nvenc_encode_base() fires the same reconfigure so all new GOPs   */
+	/* start together again (delay: up to one GOP).                     */
+	if (!obs_encoder_active(enc->encoder) || enc->config.gopLength == 0) {
+		return apply_nvenc_reconfigure(enc);
+	}
+
+	info("staged rate control change - applying at next keyframe (%u frames, boundary=%lld counter_now=%lld)",
+	     (unsigned int)enc->config.gopLength,
+	     (long long)((int64_t)enc->config.gopLength - ((int64_t)enc->output_delay - 1)),
+	     (long long)enc->frames_since_idr);
+	enc->reconfig_pending = true;
 	return true;
 }
 
@@ -157,6 +441,20 @@ static void initialize_params(struct nvenc_data *enc, const GUID *nv_preset, NV_
 	params->enablePTD = 1;
 	params->encodeConfig = &enc->config;
 	params->tuningInfo = nv_tuning;
+	/* Reserve dynamic-resolution headroom so live resizes can reconfigure this session. */
+	/* NVIDIA requires maxEncodeWidth/Height to be set at init time; if they stay zero, */
+	/* NvEncReconfigureEncoder rejects size changes with NV_ENC_ERR_INVALID_PARAM. The  */
+	/* device's maximum supported output dimensions cap it - the same caps that         */
+	/* apply_nvenc_resize() validates against at runtime.                               */
+	const uint32_t cap_w = (uint32_t)nv_get_cap(enc, NV_ENC_CAPS_WIDTH_MAX);
+	const uint32_t cap_h = (uint32_t)nv_get_cap(enc, NV_ENC_CAPS_HEIGHT_MAX);
+	if (cap_w && cap_h) {
+		params->maxEncodeWidth  = max(cap_w, width);
+		params->maxEncodeHeight = max(cap_h, height);
+		info("dynamic resize headroom reserved: up to %ux%u", params->maxEncodeWidth, params->maxEncodeHeight);
+	} else {
+		info("dynamic resolution change disabled for this session (caps unavailable)");
+	}
 #ifdef NVENC_12_1_OR_LATER
 	params->splitEncodeMode = (NV_ENC_SPLIT_ENCODE_MODE)enc->props.split_encode;
 #endif
@@ -326,6 +624,10 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 
 	const int output_delay = buf_count - 1;
 	enc->output_delay = output_delay;
+
+	info("pipeline params: gopLength=%d frameIntervalP=%d bf=%d buf_count=%d output_delay=%d",
+	     (int)config->gopLength, (int)config->frameIntervalP, (int)enc->props.bf, enc->buf_count,
+	     enc->output_delay);
 
 	if (lookahead) {
 		const int lkd_bound = output_delay - config->frameIntervalP - 4;
@@ -1056,7 +1358,11 @@ static bool get_encoded_packet(struct nvenc_data *enc, bool finalize)
 		lock.outputBitstream = bs->ptr;
 		lock.doNotWait = false;
 
-		if (NV_FAILED(nv.nvEncLockBitstream(s, &lock))) {
+		NVENCSTATUS err;
+
+		err = nv.nvEncLockBitstream(s, &lock);
+		if (NV_FAILED(err)) {
+			error("nvEncLockBitstream failed (err=%d) - in-flight state out of sync", (int)err);
 			return false;
 		}
 
@@ -1081,7 +1387,16 @@ static bool get_encoded_packet(struct nvenc_data *enc, bool finalize)
 		enc->packet_pts = (int64_t)lock.outputTimeStamp;
 		enc->packet_keyframe = lock.pictureType == NV_ENC_PIC_TYPE_IDR;
 
-		if (NV_FAILED(nv.nvEncUnlockBitstream(s, bs->ptr))) {
+		if (enc->packet_keyframe) {
+			enc->frames_since_idr = 0; /* resync GOP-boundary counter */
+			if (enc->reconfig_pending)
+				info("observed keyframe pts=%lld while RC change staged",
+				     (long long)lock.outputTimeStamp);
+		}
+
+		err = nv.nvEncUnlockBitstream(s, bs->ptr);
+		if (NV_FAILED(err)) {
+			error("nvEncUnlockBitstream failed (err=%d)", (int)err);
 			return false;
 		}
 
@@ -1211,6 +1526,53 @@ static void add_roi(struct nvenc_data *enc, NV_ENC_PIC_PARAMS *params)
 bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pic, int64_t pts,
 		       struct encoder_packet *packet, bool *received_packet)
 {
+	/* Count submissions since last observed IDR. get_encoded_packet() */
+	/* only starts returning packets once buffers_queued reaches       */
+	/* output_delay, so in steady state exactly output_delay - 1      */
+	/* frames are in flight between a frame's submission and its      */
+	/* packet observation (first lock happens on the same call that    */
+	/* bumps the queue to output_delay). This counter therefore        */
+	/* reaches gopLength - (output_delay - 1) precisely on the         */
+	/* submission that will naturally be an IDR; firing there forces   */
+	/* the new GOP to start exactly at the shared keyframe pts of     */
+	/* sibling encoders (the multitrack muxer requires identical pts  */
+	/* across all tracks).                                            */
+	++enc->frames_since_idr;
+
+	const int64_t pipeline_delay = (int64_t)enc->output_delay - 1; /* see get_encoded_packet() gate */
+	const int64_t keyframe_boundary = (int64_t)enc->config.gopLength - pipeline_delay;
+
+	/* Staged change firing.                                           */
+	/* RC changes ride the natural counter boundary above. Resize      */
+	/* realignment uses its own submission countdown instead: the       */
+	/* resize's forced IDR re-anchors this encoder mid-GOP, so the      */
+	/* observation resets (and with them the counter phase) resume from  */
+	/* that point - the plain boundary would fire off-grid.             */
+	bool fire_now = false;
+
+	if (enc->align_pending) {
+		if (--enc->align_remaining == 0)
+			fire_now = true;
+	} else if (enc->reconfig_pending && enc->frames_since_idr >= keyframe_boundary) {
+		fire_now = true;
+	}
+
+	if (fire_now) {
+		info("applying staged encoder reconfigure at shared keyframe boundary "
+		     "(align=%d rc=%d counter=%lld gopLength=%d output_delay=%d forced_frame_pts=%lld)",
+		     enc->align_pending, enc->reconfig_pending, (long long)enc->frames_since_idr,
+		     (int)enc->config.gopLength, enc->output_delay, pts);
+		bool ok = apply_nvenc_reconfigure(enc);
+
+		/* One reset+IDR at a shared tick re-anchors the GOP phase; any  */
+		/* staged RC change rides on it too. No per-GOP retry - restart  */
+		/* needed on failure.                                            */
+		enc->align_pending    = false;
+		enc->reconfig_pending = false;
+		if (ok)
+			enc->frames_since_idr = 0;
+	}
+
 	NV_ENC_PIC_PARAMS params = {0};
 	params.version = NV_ENC_PIC_PARAMS_VER;
 	params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;

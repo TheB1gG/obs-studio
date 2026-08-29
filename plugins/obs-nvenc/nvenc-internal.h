@@ -87,6 +87,21 @@ struct nvenc_data {
 	int64_t packet_pts;
 	bool packet_keyframe;
 
+	/* Live RC/bitrate changes are staged here and applied at the next */
+	/* GOP boundary so sibling encoders of a multitrack output stay   */
+	/* keyframe-aligned (see nvenc_update / nvenc_encode_base).       */
+	bool reconfig_pending;
+	int64_t frames_since_idr; /* submitted frames since last observed IDR packet */
+
+	/* Live RESOLUTION changes cannot be staged the same way: libobs  */
+	/* starts delivering frames at the new size on the very next tick,*/
+	/* so the NVENC session is resized immediately (forced mid-GOP    */
+	/* IDR). align_pending then counts down submissions and forces one*/
+	/* more keyframe exactly on the next shared GOP boundary so this  */
+	/* track re-locks onto its sibling encoders' keyframe pts grid.   */
+	bool align_pending;
+	int64_t align_remaining; /* encode() calls until realignment fires (incl. current) */
+
 #ifdef _WIN32
 	DARRAY(struct nv_texture) textures;
 	ID3D11Device *device;
@@ -156,6 +171,12 @@ struct nv_texture {
 
 bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pic, int64_t pts,
 		       struct encoder_packet *packet, bool *received_packet);
+
+/* Checks whether a live resolution change (obs_encoder_set_scaled_size) is */
+/* pending and, on the first frame that arrives at the new size, resizes  */
+/* the NVENC session in place. Called from every backend encode entry so  */
+/* it runs before any input resource copy of this frame.                  */
+bool nvenc_maybe_resize(struct nvenc_data *enc);
 
 /* ------------------------------------------------------------------------- */
 /* Backend-specific functions                                                */

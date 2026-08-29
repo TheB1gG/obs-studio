@@ -17,6 +17,8 @@ bool obs_module_load(void)
 		return false;
 	}
 
+	blog(LOG_INFO, "[obs-nvenc] build-stamp: keyframe-boundary staging v6 (post-reset queue rewind + resources registered after resize reconfigure; silent-failure logging)");
+
 	obs_nvenc_load();
 	obs_cuda_load();
 

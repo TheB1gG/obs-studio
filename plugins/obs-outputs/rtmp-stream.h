@@ -116,6 +116,10 @@ struct rtmp_stream {
 	enum audio_id_t audio_codec[MAX_OUTPUT_AUDIO_ENCODERS];
 	enum video_id_t video_codec[MAX_OUTPUT_VIDEO_ENCODERS];
 
+	/* Last-sent codec data per video track (mid-stream change detection) */
+	uint8_t *video_headers[MAX_OUTPUT_VIDEO_ENCODERS];
+	size_t video_header_sizes[MAX_OUTPUT_VIDEO_ENCODERS];
+
 	RTMP rtmp;
 
 	bool new_socket_loop;

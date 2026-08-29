@@ -78,6 +78,57 @@ static inline void free_packets(struct rtmp_stream *stream)
 	pthread_mutex_unlock(&stream->packets_mutex);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Mid-stream video codec header updates                                     */
+/*                                                                           */
+/* NVENC sessions can be reconfigured while streaming (live resolution      */
+/* changes, RC switches). That changes the sequence parameters and forces   */
+/* an IDR at the new settings. Decoders only reliably latch a fresh HVCC/   */
+/* AVC sequence header from a dedicated sequence-start packet, so each       */
+/* video track's encoder extra data is compared against what was last sent;  */
+/* on change that track's codec header is re-emitted right before the first */
+/* keyframe at the new settings.                                            */
+
+static bool send_video_header(struct rtmp_stream *stream, size_t idx);
+static bool send_video_header_ts(struct rtmp_stream *stream, size_t idx, struct encoder_packet *ref);
+
+static void update_video_header_snapshot(struct rtmp_stream *stream, size_t idx)
+{
+	obs_encoder_t *enc = obs_output_get_video_encoder2(stream->output, idx);
+	uint8_t *header;
+	size_t size = 0;
+
+	bfree(stream->video_headers[idx]);
+	stream->video_headers[idx] = NULL;
+	stream->video_header_sizes[idx] = 0;
+
+	if (enc && obs_encoder_get_extra_data(enc, &header, &size) && size > 0) {
+		stream->video_headers[idx] = bmemdup(header, size);
+		stream->video_header_sizes[idx] = size;
+	}
+}
+
+static void resend_video_header_if_changed(struct rtmp_stream *stream, struct encoder_packet *packet)
+{
+	size_t idx = packet->track_idx;
+	obs_encoder_t *enc = obs_output_get_video_encoder2(stream->output, idx);
+	uint8_t *header;
+	size_t size = 0;
+
+	if (!enc || !obs_encoder_get_extra_data(enc, &header, &size))
+		return;
+
+	if (stream->video_header_sizes[idx] == size && memcmp(stream->video_headers[idx], header, size) == 0)
+		return; // unchanged since last send
+
+	update_video_header_snapshot(stream, idx);
+	info("resending video codec header on track %zu (codec data changed mid-stream)", idx);
+
+	if (!send_video_header_ts(stream, idx, packet)) {
+		warn("failed to resend video codec header on track %zu", idx);
+	}
+}
+
 static inline bool stopping(struct rtmp_stream *stream)
 {
 	return os_event_try(stream->stop_event) != EAGAIN;
@@ -142,6 +193,9 @@ static void rtmp_stream_destroy(void *data)
 	os_event_destroy(stream->socket_available_event);
 	os_event_destroy(stream->send_thread_signaled_exit);
 	pthread_mutex_destroy(&stream->write_buf_mutex);
+
+	for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++)
+		bfree(stream->video_headers[i]);
 
 	if (stream->write_buf)
 		bfree(stream->write_buf);
@@ -457,6 +511,31 @@ static int send_packet_ex(struct rtmp_stream *stream, struct encoder_packet *pac
 	return ret;
 }
 
+static int send_packet_start_ts(struct rtmp_stream *stream, struct encoder_packet *packet, size_t idx)
+{
+	uint8_t *data;
+	size_t size = 0;
+	int ret = 0;
+
+	if (handle_socket_read(stream))
+		return -1;
+
+	flv_packet_start_ts(packet, stream->video_codec[idx], stream->start_dts_offset, &data, &size, idx);
+
+#ifdef TEST_FRAMEDROPS
+	droptest_cap_data_rate(stream, size);
+#endif
+
+	ret = RTMP_Write(&stream->rtmp, (char *)data, (int)size, 0);
+	bfree(data);
+
+	// manually created packets
+	bfree(packet->data);
+
+	stream->total_bytes_sent += size;
+	return ret;
+}
+
 static int send_audio_packet_ex(struct rtmp_stream *stream, struct encoder_packet *packet, bool is_header, size_t idx)
 {
 	uint8_t *data;
@@ -659,12 +738,21 @@ static void *send_thread(void *data)
 				os_atomic_set_bool(&stream->disconnected, true);
 				break;
 			}
+
+			for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++)
+				update_video_header_snapshot(stream, i);
 		}
 
 		if (stream->dbr_enabled) {
 			dbr_frame.send_beg = os_gettime_ns();
 			dbr_frame.size = packet.size;
 		}
+
+		/* a reconfigured encoder (live resize/reconfigure) changes its codec data and
+		 * forces an IDR at the new settings - emit that track's fresh sequence start
+		 * right before the first such keyframe so players latch the new parameters */
+		if (packet.type == OBS_ENCODER_VIDEO && packet.keyframe && stream->video_codec[packet.track_idx] != CODEC_NONE)
+			resend_video_header_if_changed(stream, &packet);
 
 		int sent;
 		if (packet.type == OBS_ENCODER_VIDEO &&
@@ -822,6 +910,55 @@ static bool send_video_header(struct rtmp_stream *stream, size_t idx)
 	}
 
 	return false;
+}
+
+/* Mid-stream re-emit of a track's codec header (see resend_video_header_if_changed).
+ * Unlike the stream-start headers above, this stamps the SEQ_START tag with the DTS of
+ * the keyframe it precedes and applies start_dts_offset like regular frames do, so the
+ * tag stays on the track's normal timestamp timeline instead of jumping back to zero. */
+static bool send_video_header_ts(struct rtmp_stream *stream, size_t idx, struct encoder_packet *ref)
+{
+	// The legacy single-track H.264 track has no Y2023 seq-start framing - keep the existing path as-is.
+	if (idx == 0 && stream->video_codec[idx] == CODEC_H264)
+		return send_video_header(stream, idx);
+
+	obs_output_t *context = stream->output;
+	obs_encoder_t *vencoder = obs_output_get_video_encoder2(context, idx);
+	uint8_t *header;
+	size_t size;
+
+	struct encoder_packet packet = {.type = OBS_ENCODER_VIDEO, .keyframe = true};
+	packet.dts          = ref->dts;
+	packet.pts          = ref->pts;
+	packet.timebase_den = ref->timebase_den ? (int32_t)ref->timebase_den : 1;
+
+	if (!vencoder)
+		return false;
+
+	if (!obs_encoder_get_extra_data(vencoder, &header, &size))
+		return false;
+
+	switch (stream->video_codec[idx]) {
+	case CODEC_NONE:
+		do_log(LOG_ERROR, "Codec not initialized for track %zu while resending header", idx);
+		return false;
+
+	case CODEC_H264:
+		packet.size = obs_parse_avc_header(&packet.data, header, size);
+		break;
+	case CODEC_HEVC:
+#ifdef ENABLE_HEVC
+		packet.size = obs_parse_hevc_header(&packet.data, header, size);
+#else
+		return false;
+#endif
+		break;
+	case CODEC_AV1:
+		packet.size = obs_parse_av1_header(&packet.data, header, size);
+		break;
+	}
+
+	return send_packet_start_ts(stream, &packet, idx) >= 0;
 }
 
 // only returns false if there's an error, not if no metadata needs to be sent

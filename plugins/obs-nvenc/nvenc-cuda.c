@@ -300,6 +300,9 @@ bool cuda_encode(void *data, struct encoder_frame *frame, struct encoder_packet 
 	struct nv_cuda_surface *surf;
 	struct nv_bitstream *bs;
 
+	/* Live resolution changes: this frame already carries the new size. */
+	nvenc_maybe_resize(enc);
+
 	bs = &enc->bitstreams.array[enc->next_bitstream];
 	surf = &enc->surfaces.array[enc->next_bitstream];
 

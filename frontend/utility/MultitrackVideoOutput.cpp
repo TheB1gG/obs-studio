@@ -674,7 +674,28 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 		    old_encoder_config.range != new_encoder_config.range ||
 		    old_encoder_config.format != new_encoder_config.format;
 
-		if (structural_video_change) {
+		obs_encoder_t *encoder = obs_output_get_video_encoder2(objects.output_, i);
+		if (!encoder) {
+			blog(LOG_ERROR, "MultitrackVideoOutput: failed to get video encoder %zu for live update", i);
+			continue;
+		}
+
+		const bool resolution_changed = old_encoder_config.width != new_encoder_config.width ||
+		    old_encoder_config.height != new_encoder_config.height;
+
+		if (resolution_changed && strstr(new_encoder_config.type.c_str(), "nvenc")) {
+			// NVENC supports live session resizing: libobs re-points the GPU rescale mix right away and
+			// obs-nvenc detects the new input size on its encode side, resizing the driver session in
+			// place. The forced keyframe realignment happens at the next shared GOP boundary so the
+			// multitrack tracks stay keyframe-aligned (see nvenc_maybe_resize).
+			char line[160];
+			snprintf(line, sizeof(line), "video encoder %zu resolution %" PRIu32 "x%" PRIu32 " -> %" PRIu32
+			             "x%" PRIu32,
+			         i, old_encoder_config.width, old_encoder_config.height, new_encoder_config.width,
+			         new_encoder_config.height);
+			blog(LOG_INFO, "MultitrackVideoOutput: applied live:%s (NVENC resizes at the next frame)", line);
+			obs_encoder_set_scaled_size(encoder, new_encoder_config.width, new_encoder_config.height);
+		} else if (structural_video_change) {
 			char line[160];
 			snprintf(line, sizeof(line), "video encoder %zu resolution/scale/color settings", i);
 			blog(LOG_WARNING,
@@ -689,11 +710,6 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 		}
 
 		OBSDataAutoRelease settings = obs_data_create_from_json(new_settings.dump().c_str());
-		obs_encoder_t *encoder = obs_output_get_video_encoder2(objects.output_, i);
-		if (!encoder) {
-			blog(LOG_ERROR, "MultitrackVideoOutput: failed to get video encoder %zu for live update", i);
-			continue;
-		}
 
 		log_changed_settings_fields("video", i, old_encoder_config.settings, new_settings);
 		obs_encoder_update(encoder, settings);

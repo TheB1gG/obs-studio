@@ -48,6 +48,10 @@ struct flv_output {
 	enum audio_id_t audio_codec[MAX_OUTPUT_AUDIO_ENCODERS];
 	enum video_id_t video_codec[MAX_OUTPUT_VIDEO_ENCODERS];
 
+	/* Last-sent codec data per video track (mid-stream change detection) */
+	uint8_t *video_headers[MAX_OUTPUT_VIDEO_ENCODERS];
+	size_t video_header_sizes[MAX_OUTPUT_VIDEO_ENCODERS];
+
 	pthread_mutex_t mutex;
 
 	bool got_first_packet;
@@ -163,6 +167,9 @@ static void flv_output_destroy(void *data)
 {
 	struct flv_output *stream = data;
 
+	for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++)
+		bfree(stream->video_headers[i]);
+
 	pthread_mutex_destroy(&stream->mutex);
 	dstr_free(&stream->path);
 	bfree(stream);
@@ -218,6 +225,23 @@ static int write_packet_ex(struct flv_output *stream, struct encoder_packet *pac
 		obs_encoder_packet_release(packet);
 
 	return ret;
+}
+
+static int write_packet_start_ts(struct flv_output *stream, struct encoder_packet *packet, size_t idx)
+{
+	uint8_t *data;
+	size_t size = 0;
+
+	stream->last_packet_ts = get_ms_time(packet, packet->dts);
+
+	flv_packet_start_ts(packet, stream->video_codec[idx], stream->start_dts_offset, &data, &size, idx);
+	fwrite(data, 1, size, stream->file);
+	bfree(data);
+
+	// manually created packets
+	bfree(packet->data);
+
+	return 0;
 }
 
 static int write_audio_packet_ex(struct flv_output *stream, struct encoder_packet *packet, bool is_header, size_t idx)
@@ -314,6 +338,57 @@ static bool write_video_header(struct flv_output *stream, size_t idx)
 	return true;
 }
 
+/* Mid-stream re-emit of a track's codec header (see resend_video_header_if_changed).
+ * Unlike the stream-start headers above, this stamps the SEQ_START tag with the DTS of
+ * the keyframe it precedes and applies start_dts_offset like regular frames do, so the
+ * tag stays on the track's normal timestamp timeline instead of jumping back to zero. */
+static bool write_video_header_ts(struct flv_output *stream, size_t idx, struct encoder_packet *ref)
+{
+	// The legacy single-track H.264 track has no Y2023 seq-start framing - keep the existing path as-is.
+	if (idx == 0 && stream->video_codec[idx] == CODEC_H264)
+		return write_video_header(stream, idx);
+
+	obs_output_t *context = stream->output;
+	obs_encoder_t *vencoder = obs_output_get_video_encoder2(context, idx);
+	uint8_t *header;
+	size_t size;
+
+	struct encoder_packet packet = {.type = OBS_ENCODER_VIDEO, .keyframe = true};
+	packet.dts          = ref->dts;
+	packet.pts          = ref->pts;
+	packet.timebase_den = ref->timebase_den ? (int32_t)ref->timebase_den : 1;
+
+	if (!vencoder)
+		return false;
+
+	if (!obs_encoder_get_extra_data(vencoder, &header, &size))
+		return false;
+
+	switch (stream->video_codec[idx]) {
+	case CODEC_NONE:
+		do_log(LOG_ERROR, "Codec not initialized for track %zu while resending header", idx);
+		return false;
+
+	case CODEC_H264:
+		packet.size = obs_parse_avc_header(&packet.data, header, size);
+		break;
+	case CODEC_HEVC:
+#ifdef ENABLE_HEVC
+		packet.size = obs_parse_hevc_header(&packet.data, header, size);
+#else
+		return false;
+#endif
+		break;
+	case CODEC_AV1:
+		packet.size = obs_parse_av1_header(&packet.data, header, size);
+		break;
+	}
+
+	write_packet_start_ts(stream, &packet, idx);
+
+	return true;
+}
+
 // only returns false if there's an error, not if no metadata needs to be sent
 static bool write_video_metadata(struct flv_output *stream, size_t idx)
 {
@@ -399,6 +474,54 @@ static bool write_video_metadata(struct flv_output *stream, size_t idx)
 	bfree(data);
 
 	return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Mid-stream video codec header updates                                    */
+/*                                                                          */
+/* NVENC sessions can be reconfigured while streaming (live resolution    */
+/* changes, RC switches). That changes the sequence parameters and forces  */
+/* an IDR at the new settings. Decoders only reliably latch a fresh HVCC/  */
+/* AVC sequence header from a dedicated sequence-start packet, so each     */
+/* video track's encoder extra data is compared against what was last      */
+/* written; on change that track's codec header is re-emitted right before */
+/* the first keyframe at the new settings.                                 */
+
+static void update_video_header_snapshot(struct flv_output *stream, size_t idx)
+{
+	obs_encoder_t *enc = obs_output_get_video_encoder2(stream->output, idx);
+	uint8_t *header;
+	size_t size = 0;
+
+	bfree(stream->video_headers[idx]);
+	stream->video_headers[idx] = NULL;
+	stream->video_header_sizes[idx] = 0;
+
+	if (enc && obs_encoder_get_extra_data(enc, &header, &size) && size > 0) {
+		stream->video_headers[idx] = bmemdup(header, size);
+		stream->video_header_sizes[idx] = size;
+	}
+}
+
+static void resend_video_header_if_changed(struct flv_output *stream, struct encoder_packet *packet)
+{
+	size_t idx = packet->track_idx;
+	obs_encoder_t *enc = obs_output_get_video_encoder2(stream->output, idx);
+	uint8_t *header;
+	size_t size = 0;
+
+	if (!enc || !obs_encoder_get_extra_data(enc, &header, &size))
+		return;
+
+	if (stream->video_header_sizes[idx] == size && memcmp(stream->video_headers[idx], header, size) == 0)
+		return; // unchanged since last write
+
+	update_video_header_snapshot(stream, idx);
+	info("resending video codec header on track %zu (codec data changed mid-stream)", idx);
+
+	if (!write_video_header_ts(stream, idx, packet)) {
+		warn("failed to resend video codec header on track %zu", idx);
+	}
 }
 
 static void write_headers(struct flv_output *stream)
@@ -548,6 +671,9 @@ static void flv_output_data(void *data, struct encoder_packet *packet)
 	if (!stream->sent_headers) {
 		write_headers(stream);
 		stream->sent_headers = true;
+
+		for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++)
+			update_video_header_snapshot(stream, i);
 	}
 
 	if (packet->type == OBS_ENCODER_VIDEO) {
@@ -555,6 +681,12 @@ static void flv_output_data(void *data, struct encoder_packet *packet)
 			stream->start_dts_offset = get_ms_time(packet, packet->dts);
 			stream->got_first_packet = true;
 		}
+
+		/* a reconfigured encoder (live resize/reconfigure) changes its codec data and
+		 * forces an IDR at the new settings - write that track's fresh sequence start
+		 * right before the first such keyframe so players latch the new parameters */
+		if (packet->keyframe && stream->video_codec[packet->track_idx] != CODEC_NONE)
+			resend_video_header_if_changed(stream, packet);
 
 		switch (stream->video_codec[packet->track_idx]) {
 		case CODEC_NONE:

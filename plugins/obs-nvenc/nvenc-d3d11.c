@@ -156,7 +156,9 @@ static bool d3d11_texture_init(struct nvenc_data *enc, struct nv_texture *nvtex)
 	res.height = enc->cy;
 	res.bufferFormat = nvenc_format(enc->encoder);
 
-	if (NV_FAILED(nv.nvEncRegisterResource(enc->session, &res))) {
+	NVENCSTATUS err = nv.nvEncRegisterResource(enc->session, &res);
+	if (NV_FAILED(err)) {
+		error("nvEncRegisterResource failed at %ux%u (err=%d)", enc->cx, enc->cy, (int)err);
 		tex->lpVtbl->Release(tex);
 		return false;
 	}
@@ -253,6 +255,11 @@ bool d3d11_encode(void *data, struct encoder_texture *texture, int64_t pts, uint
 	struct nv_texture *nvtex;
 	struct nv_bitstream *bs;
 
+	/* A live resolution change (obs_encoder_set_scaled_size) is detected */
+	/* here: this frame already carries the new size, so the NVENC session*/
+	/* + input textures are resized in place before any resource copy.    */
+	nvenc_maybe_resize(enc);
+
 	if (texture->handle == GS_INVALID_HANDLE) {
 		error("Encode failed: bad texture handle");
 		*next_key = lock_key;
@@ -270,8 +277,6 @@ bool d3d11_encode(void *data, struct encoder_texture *texture, int64_t pts, uint
 		return false;
 	}
 
-	deque_push_back(&enc->dts_list, &pts, sizeof(pts));
-
 	/* ------------------------------------ */
 	/* copy to output tex                   */
 
@@ -286,11 +291,15 @@ bool d3d11_encode(void *data, struct encoder_texture *texture, int64_t pts, uint
 
 	NV_ENC_MAP_INPUT_RESOURCE map = {NV_ENC_MAP_INPUT_RESOURCE_VER};
 	map.registeredResource = nvtex->res;
-	if (NV_FAILED(nv.nvEncMapInputResource(enc->session, &map))) {
-		return false;
+	NVENCSTATUS err = nv.nvEncMapInputResource(enc->session, &map);
+	if (NV_FAILED(err)) {
+		error("nvEncMapInputResource failed at %ux%u (err=%d)", enc->cx, enc->cy, (int)err);
+		return false; // dts not pushed: no frame was submitted this tick
 	}
 
 	nvtex->mapped_res = map.mappedResource;
+
+	deque_push_back(&enc->dts_list, &pts, sizeof(pts)); // only after a successful submission below
 
 	/* ------------------------------------ */
 	/* do actual encode call                */

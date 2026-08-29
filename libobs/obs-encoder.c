@@ -197,15 +197,18 @@ static inline bool gpu_encode_available(const struct obs_encoder *encoder)
  * will be created if it doesn't exist already to generate encoder
  * input
  */
-static void maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
+/**
+ * Find or create an encoder-only mix matching this encoder's current scaled size,
+ * scale type and output format/colorspace/range for the view of its media.
+ *
+ * Returns the mix with a refcount already incremented for us, or NULL if no
+ * rescale mix applies to this encoder (scaling disabled without conversion).
+ */
+static struct obs_core_video_mix *acquire_encoder_only_mix(struct obs_encoder *encoder)
 {
-	struct obs_core_video_mix *mix, *current_mix;
+	struct obs_core_video_mix *mix = NULL, *current_mix;
 	const bool is_tex_encoder = (encoder->info.caps & OBS_ENCODER_CAP_PASS_TEXTURE) != 0;
-	bool create_mix = true;
 	bool conversion_requested = false;
-	struct obs_video_info ovi;
-	const struct video_output_info *info;
-	struct video_scale_info encoder_info;
 	uint32_t width;
 	uint32_t height;
 	enum video_format format;
@@ -213,9 +216,9 @@ static void maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
 	enum video_range_type range;
 
 	if (!encoder->media)
-		return;
+		return NULL;
 
-	info = video_output_get_info(encoder->media);
+	const struct video_output_info *info = video_output_get_info(encoder->media);
 
 	if (is_tex_encoder) {
 		format = encoder->preferred_format;
@@ -224,6 +227,7 @@ static void maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
 
 		/* If a preferred format is not already set, allow the encoder to tell us which format it prefers to
 		 * determine  if we should opportunistically create a conversion mix even if scaling is disabled. */
+		struct video_scale_info encoder_info = {0};
 		get_video_info(encoder, &encoder_info);
 
 		if (format == VIDEO_FORMAT_NONE)
@@ -241,16 +245,16 @@ static void maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
 	}
 
 	if (encoder->gpu_scale_type == OBS_SCALE_DISABLE && !conversion_requested)
-		return;
+		return NULL;
 	if (!encoder->scaled_height && !encoder->scaled_width && !conversion_requested)
-		return;
+		return NULL;
 
 	width = encoder->scaled_width ? encoder->scaled_width : info->width;
 	height = encoder->scaled_height ? encoder->scaled_height : info->height;
 
 	current_mix = get_mix_for_video(encoder->media);
 	if (!current_mix)
-		return;
+		return NULL;
 
 	pthread_mutex_lock(&obs->video.mixes_mutex);
 	for (size_t i = 0; i < obs->video.mixes.num; i++) {
@@ -269,17 +273,15 @@ static void maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
 			continue;
 
 		current->encoder_refs += 1;
-		obs_encoder_set_video(encoder, current->video);
-		create_mix = false;
+		mix = current;
 		break;
 	}
-
 	pthread_mutex_unlock(&obs->video.mixes_mutex);
 
-	if (!create_mix)
-		return;
+	if (mix)
+		return mix;
 
-	ovi = current_mix->ovi;
+	struct obs_video_info ovi = current_mix->ovi;
 
 	ovi.output_format = format;
 	ovi.colorspace = space;
@@ -291,25 +293,25 @@ static void maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
 
 	ovi.gpu_conversion = true;
 
-	mix = obs_create_video_mix(&ovi);
-	if (!mix)
-		return;
+	struct obs_core_video_mix *created = obs_create_video_mix(&ovi);
+	if (!created)
+		return NULL;
 
 	/* Check that mix actually has the GPU texture format we want */
-	if (is_tex_encoder && mix->encoder_texture_format != format) {
+	if (is_tex_encoder && created->encoder_texture_format != format) {
 		blog(LOG_WARNING, "GPU scaling setup failed, texture format %s unavailable.",
 		     get_video_format_name(format));
-		obs_free_video_mix(mix);
-		return;
+		obs_free_video_mix(created);
+		return NULL;
 	}
 
-	mix->encoder_only_mix = true;
-	mix->encoder_refs = 1;
-	mix->view = current_mix->view;
+	created->encoder_only_mix = true;
+	created->encoder_refs = 1;
+	created->view = current_mix->view;
 
 	pthread_mutex_lock(&obs->video.mixes_mutex);
 
-	// double check that nobody else added a matching mix while we've created our mix
+	// double check that nobody else added a matching mix while we created it
 	for (size_t i = 0; i < obs->video.mixes.num; i++) {
 		struct obs_core_video_mix *current = obs->video.mixes.array[i];
 		const struct video_output_info *voi = video_output_get_info(current->video);
@@ -325,16 +327,14 @@ static void maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
 		if (voi->format != format || voi->colorspace != space || voi->range != range)
 			continue;
 
-		obs_encoder_set_video(encoder, current->video);
-		create_mix = false;
+		current->encoder_refs += 1;
+		mix = current;
 		break;
 	}
 
-	if (!create_mix) {
-		obs_free_video_mix(mix);
-	} else {
-		da_push_back(obs->video.mixes, &mix);
-		obs_encoder_set_video(encoder, mix->video);
+	if (!mix) {
+		da_push_back(obs->video.mixes, &created);
+		mix = created;
 
 		blog(LOG_INFO,
 		     "Created encoder-only mix for \"%s\"\n"
@@ -346,9 +346,26 @@ static void maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
 		     obs_encoder_get_name(encoder), width, height, get_scale_type_name(encoder->gpu_scale_type),
 		     get_video_format_name(format), get_video_colorspace_name(space),
 		     get_video_range_name(format, range));
+	} else {
+		obs_free_video_mix(created);
 	}
 
 	pthread_mutex_unlock(&obs->video.mixes_mutex);
+
+	return mix;
+}
+
+/**
+ * Set up GPU based rescaling for this encoder (init-time path). Binds the
+ * encoder to an existing or newly created encoder-only mix.
+ */
+static void maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
+{
+	struct obs_core_video_mix *mix = acquire_encoder_only_mix(encoder);
+	if (!mix)
+		return;
+
+	obs_encoder_set_video(encoder, mix->video);
 }
 
 static void add_connection(struct obs_encoder *encoder)
@@ -876,18 +893,76 @@ void obs_encoder_set_scaled_size(obs_encoder_t *encoder, uint32_t width, uint32_
 		     obs_encoder_get_name(encoder));
 		return;
 	}
+
 	if (encoder_active(encoder)) {
-		blog(LOG_WARNING,
-		     "encoder '%s': Cannot set the scaled "
-		     "resolution while the encoder is active",
-		     obs_encoder_get_name(encoder));
-		return;
-	}
-	if (encoder->initialized) {
-		blog(LOG_WARNING,
-		     "encoder '%s': Cannot set the scaled resolution "
-		     "after the encoder has been initialized",
-		     obs_encoder_get_name(encoder));
+		/* Live rescale while streaming (multitrack NVENC resolution override):
+		 * re-point this encoder at an encoder-only mix that renders the new size, so
+		 * frames arrive at the new dimensions from the next tick on. The video
+		 * encoder plugin detects the new size on its encode side (obs-nvenc applies
+		 * the NVENC session resize in place; other plugins may require a restart). */
+		if (width == encoder->scaled_width && height == encoder->scaled_height)
+			return; // no change
+
+		blog(LOG_INFO, "obs_encoder_set_scaled_size: live rescale for '%s' to %ux%u", obs_encoder_get_name(encoder),
+		     width, height);
+
+		const uint32_t prev_width = encoder->scaled_width;
+		const uint32_t prev_height = encoder->scaled_height;
+
+		struct obs_core_video_mix *old_mix = get_mix_for_video(encoder->media);
+		video_t *old_media = encoder->media;
+		const bool tex_path = gpu_encode_available(encoder); // evaluated against the current source
+
+		encoder->scaled_width = width;
+		encoder->scaled_height = height;
+
+		/* Detach this encoder from its current frame delivery source. */
+		if (tex_path) {
+			stop_gpu_encode(encoder);
+		} else if (old_media) {
+			stop_raw_video(old_media, receive_video, encoder);
+		}
+
+		struct obs_core_video_mix *new_mix = acquire_encoder_only_mix(encoder);
+		if (!new_mix) {
+			blog(LOG_WARNING, "obs_encoder_set_scaled_size: live rescale for '%s' could not be set up, reverting",
+			     obs_encoder_get_name(encoder));
+			encoder->scaled_width = prev_width;
+			encoder->scaled_height = prev_height;
+
+			if (tex_path) {
+				start_gpu_encode(encoder);
+			} else if (old_media) {
+				struct video_scale_info info = {0};
+				get_video_info(encoder, &info);
+				start_raw_video(old_media, &info, encoder->frame_rate_divisor, receive_video, encoder);
+			}
+			return;
+		}
+
+		/* Re-point the encoder at the new-size mix and re-subscribe its delivery. */
+		encoder_set_video(encoder, new_mix->video);
+
+		struct video_scale_info info = {0};
+		get_video_info(encoder, &info);
+
+		if (tex_path) {
+			start_gpu_encode(encoder);
+		} else {
+			start_raw_video(new_mix->video, &info, encoder->frame_rate_divisor, receive_video, encoder);
+		}
+
+		/* Retire the previous encoder-only mix if we orphaned it. A NULL view marks the mix for
+		 * reclamation by the graphics thread on its next tick. */
+		if (old_mix && old_mix->encoder_only_mix) {
+			old_mix->encoder_refs -= 1;
+			if (old_mix->encoder_refs <= 0) {
+				pthread_mutex_lock(&obs->video.mixes_mutex);
+				old_mix->view = NULL;
+				pthread_mutex_unlock(&obs->video.mixes_mutex);
+			}
+		}
+
 		return;
 	}
 
@@ -900,6 +975,14 @@ void obs_encoder_set_scaled_size(obs_encoder_t *encoder, uint32_t width, uint32_
 		     "disabled",
 		     obs_encoder_get_name(encoder));
 		encoder->scaled_width = encoder->scaled_height = 0;
+		return;
+	}
+
+	if (encoder->initialized) {
+		blog(LOG_WARNING,
+		     "encoder '%s': Cannot set the scaled resolution "
+		     "after the encoder has been initialized",
+		     obs_encoder_get_name(encoder));
 		return;
 	}
 
