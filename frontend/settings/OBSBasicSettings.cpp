@@ -5617,7 +5617,8 @@ void OBSBasicSettings::UpdateMultitrackVideo()
 	}
 
 	// Enhanced Broadcasting works on Windows, Apple Silicon Macs, and Linux.
-	// For other OS variants, only enable the GUI controls if developer mode was invoked.
+	// Developer mode is now always enabled (the --enable-multitrack-video-dev flag was removed),
+	// so these checks no longer restrict availability; they are kept for compatibility.
 #if !defined(_WIN32) && !(defined(__APPLE__) && defined(__aarch64__)) && !defined(__linux__)
 	available = available && MultitrackVideoDeveloperModeEnabled();
 #endif

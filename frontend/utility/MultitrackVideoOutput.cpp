@@ -36,16 +36,10 @@ Qt::ConnectionType BlockingConnectionTypeFor(QObject *object)
 
 bool MultitrackVideoDeveloperModeEnabled()
 {
-	static bool developer_mode = [] {
-		auto args = qApp->arguments();
-		for (const auto &arg : args) {
-			if (arg == "--enable-multitrack-video-dev") {
-				return true;
-			}
-		}
-		return false;
-	}();
-	return developer_mode;
+	// Developer mode is always enabled. The --enable-multitrack-video-dev command-line argument
+	// is no longer required (and is ignored). The function is kept so existing call sites in the
+	// settings UI continue to work unchanged.
+	return true;
 }
 
 static OBSServiceAutoRelease create_service(const GoLiveApi::Config &go_live_config,
