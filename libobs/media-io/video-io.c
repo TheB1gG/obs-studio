@@ -494,6 +494,29 @@ bool video_output_disconnect2(video_t *video, void (*callback)(void *param, stru
 	return idx != DARRAY_INVALID;
 }
 
+bool video_output_set_frame_rate_divisor(video_t *video, uint32_t frame_rate_divisor,
+		void (*callback)(void *param, struct video_data *frame), void *param)
+{
+	if (!video || !callback || frame_rate_divisor == 0)
+		return false;
+
+	video = get_root(video);
+
+	pthread_mutex_lock(&video->input_mutex);
+
+	size_t idx = video_get_input_idx(video, callback, param);
+	bool found = (idx != DARRAY_INVALID);
+	if (found) {
+		struct video_input *input = video->inputs.array + idx;
+		input->frame_rate_divisor = frame_rate_divisor;
+		input->frame_rate_divisor_counter = 0; // apply the new rate starting with the next frame
+	}
+
+	pthread_mutex_unlock(&video->input_mutex);
+
+	return found;
+}
+
 bool video_output_active(const video_t *video)
 {
 	if (!video)

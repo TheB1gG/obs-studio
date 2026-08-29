@@ -2224,9 +2224,17 @@ EXPORT void obs_encoder_set_gpu_scale_type(obs_encoder_t *encoder, enum obs_scal
  * a partial frame rate compared to the base frame rate, e.g. 60 FPS with
  * divisor = 2 will record at 30 FPS, with divisor = 3 at 20, etc.
  *
- * Can only be called on stopped encoders, changing this on the fly is not supported
+ * Can only be called on stopped encoders; use obs_encoder_update_frame_rate_divisor() for active encoders.
  */
 EXPORT bool obs_encoder_set_frame_rate_divisor(obs_encoder_t *encoder, uint32_t divisor);
+
+/**
+ * Update the frame rate divisor of a video encoder while it is running. This changes the effective output frame
+ * rate live (e.g. 60 FPS source with divisor = 2 -> divisor = 3 drops from 30 to 20 FPS). Frame skipping and
+ * packet timestamps follow the new divisor starting with subsequent frames; note that GOP/keyframe phase is not
+ * realigned, so a key frame may be slightly delayed or advanced after the change.
+ */
+EXPORT bool obs_encoder_update_frame_rate_divisor(obs_encoder_t *encoder, uint32_t divisor);
 
 /**
  * Adds region of interest (ROI) for an encoder. This allows prioritizing

@@ -660,13 +660,15 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 			continue;
 		}
 
+		const bool framerate_changed =
+		    old_encoder_config.framerate.has_value() != new_encoder_config.framerate.has_value() ||
+		    (old_encoder_config.framerate && new_encoder_config.framerate &&
+		     ((*old_encoder_config.framerate).numerator != (*new_encoder_config.framerate).numerator ||
+		      (*old_encoder_config.framerate).denominator != (*new_encoder_config.framerate).denominator));
+
 		const bool structural_video_change =
 		    old_encoder_config.width != new_encoder_config.width ||
 		    old_encoder_config.height != new_encoder_config.height ||
-		    (old_encoder_config.framerate.has_value() != new_encoder_config.framerate.has_value()) ||
-		    (old_encoder_config.framerate && new_encoder_config.framerate &&
-		     ((*old_encoder_config.framerate).numerator != (*new_encoder_config.framerate).numerator ||
-		      (*old_encoder_config.framerate).denominator != (*new_encoder_config.framerate).denominator)) ||
 		    old_encoder_config.gpu_scale_type != new_encoder_config.gpu_scale_type ||
 		    old_encoder_config.colorspace != new_encoder_config.colorspace ||
 		    old_encoder_config.range != new_encoder_config.range ||
@@ -674,7 +676,7 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 
 		if (structural_video_change) {
 			char line[160];
-			snprintf(line, sizeof(line), "video encoder %zu resolution/framerate/color settings", i);
+			snprintf(line, sizeof(line), "video encoder %zu resolution/scale/color settings", i);
 			blog(LOG_WARNING,
 			     "MultitrackVideoOutput: deferred change (%s) - applies when streaming restarts", line);
 		}
@@ -695,6 +697,38 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 
 		log_changed_settings_fields("video", i, old_encoder_config.settings, new_settings);
 		obs_encoder_update(encoder, settings);
+
+		if (framerate_changed) {
+			uint32_t new_divisor = 1u; // base frame rate when `framerate` is not specified
+			bool divisor_ok = true;
+
+			if (new_encoder_config.framerate.has_value()) {
+				obs_video_info canvas_ovi;
+				if (!obs_canvas_get_video_info(objects.canvases[new_encoder_config.canvas_index], &canvas_ovi)) {
+					blog(LOG_ERROR, "MultitrackVideoOutput: failed to get canvas video info for encoder %zu", i);
+					divisor_ok = false;
+				} else {
+					new_divisor = closest_divisor(canvas_ovi, *new_encoder_config.framerate);
+				}
+			}
+
+			if (divisor_ok && obs_encoder_update_frame_rate_divisor(encoder, new_divisor)) {
+				char line[160];
+				snprintf(line, sizeof(line), "video encoder %zu frame-rate divisor -> %u", i, new_divisor);
+				blog(LOG_INFO, "MultitrackVideoOutput: applied live:%s", line);
+			} else if (!divisor_ok) {
+				char line[160];
+				snprintf(line, sizeof(line), "video encoder %zu framerate", i);
+				blog(LOG_WARNING,
+				     "MultitrackVideoOutput: deferred change (%s) - applies when streaming restarts",
+				     line);
+			} else {
+				blog(LOG_ERROR,
+				     "MultitrackVideoOutput: failed to update frame-rate divisor for video encoder %zu,"
+				     " the old rate stays active until streaming restarts",
+				     i);
+			}
+		}
 	}
 
 	auto old_audios = collect_audio_configurations(old_config);

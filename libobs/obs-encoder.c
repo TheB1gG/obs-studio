@@ -1076,6 +1076,50 @@ uint32_t obs_encoder_get_frame_rate_divisor(const obs_encoder_t *encoder)
 	return encoder->frame_rate_divisor;
 }
 
+bool obs_encoder_update_frame_rate_divisor(obs_encoder_t *encoder, uint32_t frame_rate_divisor)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_update_frame_rate_divisor"))
+		return false;
+
+	if (encoder->info.type != OBS_ENCODER_VIDEO) {
+		blog(LOG_WARNING,
+		     "obs_encoder_update_frame_rate_divisor: "
+		     "encoder '%s' is not a video encoder",
+		     obs_encoder_get_name(encoder));
+		return false;
+	}
+
+	if (frame_rate_divisor == 0) {
+		blog(LOG_WARNING,
+		     "obs_encoder_update_frame_rate_divisor: cannot set frame rate divisor to 0");
+		return false;
+	}
+
+	// Unlike obs_encoder_set_frame_rate_divisor this is intended to be called while the encoder is active, so
+	// that per-track frame rates can be changed live (e.g. multitrack video). The divisor fields updated here are
+	// read by the encode path without a dedicated lock; only individual 32-bit stores are performed and the
+	// fps_override wrapper is rebuilt with the same create/free pair used at create time.
+	const bool gpu = gpu_encode_available(encoder);
+
+	if (!gpu && encoder->media) {
+		// Raw encoders skip frames using the divisor stored in their video-output connection state, so update
+		// that as well (also resets its counter). The new rate applies starting with the next frame.
+		video_output_set_frame_rate_divisor(encoder->media, frame_rate_divisor, receive_video, encoder);
+	}
+
+	// Used for packet timestamp/timebase scaling on both paths; takes effect for subsequent frames.
+	encoder->frame_rate_divisor = frame_rate_divisor;
+
+	if (encoder->fps_override) {
+		video_output_free_frame_rate_divisor(encoder->fps_override);
+		encoder->fps_override = NULL;
+	}
+	if (encoder->media)
+		encoder->fps_override = video_output_create_with_frame_rate_divisor(encoder->media, frame_rate_divisor);
+
+	return true;
+}
+
 uint32_t obs_encoder_get_sample_rate(const obs_encoder_t *encoder)
 {
 	if (!obs_encoder_valid(encoder, "obs_encoder_get_sample_rate"))

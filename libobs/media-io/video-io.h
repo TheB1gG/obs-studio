@@ -336,6 +336,11 @@ EXPORT void video_output_disconnect(video_t *video, void (*callback)(void *param
 EXPORT bool video_output_disconnect2(video_t *video, void (*callback)(void *param, struct video_data *frame),
 				     void *param);
 
+// Updates the frame rate divisor of an existing raw connection (identified by callback/param), so that live
+// per-connection frame rates can be changed while running. The new divisor applies starting with the next frame.
+EXPORT bool video_output_set_frame_rate_divisor(video_t *video, uint32_t frame_rate_divisor,
+		void (*callback)(void *param, struct video_data *frame), void *param);
+
 EXPORT bool video_output_active(const video_t *video);
 
 EXPORT const struct video_output_info *video_output_get_info(const video_t *video);
