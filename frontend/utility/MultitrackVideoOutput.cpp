@@ -17,6 +17,7 @@
 #include <QUrlQuery>
 
 #include <cinttypes>
+#include <stdio.h>
 
 // Codec profile strings
 static const char *h264_main = "Main";
@@ -449,6 +450,9 @@ void MultitrackVideoOutput::PrepareStreaming(
 	const auto &output_config = custom ? *custom : *go_live_config;
 	const auto &service_config = go_live_config ? *go_live_config : *custom;
 
+	// Stored with the output objects so live applies can diff against what is actually running.
+	std::string active_override_json = nlohmann::json(output_config).dump();
+
 	std::vector<OBSEncoderAutoRelease> audio_encoders;
 	std::shared_ptr<obs_encoder_group_t> video_encoder_group;
 	auto outputs = SetupOBSOutput(parent, multitrack_video_name, dump_stream_to_file_config, output_config,
@@ -507,6 +511,7 @@ void MultitrackVideoOutput::PrepareStreaming(
 				std::move(start_recording),
 				std::move(stop_recording),
 				std::move(recording_canvases),
+				active_override_json,
 			});
 		}
 	}
@@ -520,7 +525,217 @@ void MultitrackVideoOutput::PrepareStreaming(
 		std::move(start_streaming),
 		std::move(stop_streaming),
 		std::move(canvases),
+		active_override_json,
 	});
+}
+
+namespace {
+
+// Collects all audio encoder configurations in output order (live tracks first, then VOD), mirroring the way
+// encoders are attached to the multitrack video output at start time.
+std::vector<GoLiveApi::AudioEncoderConfiguration> collect_audio_configurations(const GoLiveApi::Config &config)
+{
+	std::vector<GoLiveApi::AudioEncoderConfiguration> configs;
+	configs.insert(configs.end(), config.audio_configurations.live.begin(), config.audio_configurations.live.end());
+	if (config.audio_configurations.vod.has_value()) {
+		configs.insert(configs.end(), config.audio_configurations.vod->begin(),
+			      config.audio_configurations.vod->end());
+	}
+	return configs;
+}
+
+// Logs which fields of an encoder's settings blob changed between the stored and new configuration.
+void log_changed_settings_fields(const char *kind, size_t index, const nlohmann::json &old_settings,
+				 const nlohmann::json &new_settings)
+{
+	std::string changes;
+	for (const auto &item : new_settings.items()) {
+		const auto &key = item.key();
+		if (!old_settings.contains(key))
+			continue;
+
+		if (item.value() == old_settings[key])
+			continue;
+
+		if (!changes.empty())
+			changes += ", ";
+
+		changes += key + " (" + old_settings[key].dump() + " -> " + item.value().dump() + ")";
+	}
+
+	if (changes.empty()) {
+		blog(LOG_INFO, "MultitrackVideoOutput: %s encoder %zu refreshed live settings", kind, index);
+		return;
+	}
+
+	std::string line = " changed fields: " + changes;
+	blog(LOG_INFO, "MultitrackVideoOutput: %s encoder %zu updated live:%s", kind, index, line.c_str());
+}
+
+} // namespace
+
+bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config_json, std::string *failure_reason)
+{
+	auto fail = [&](const char *reason) {
+		blog(LOG_ERROR, "MultitrackVideoOutput: failed to apply config override live: %s", reason);
+		if (failure_reason)
+			*failure_reason = reason;
+		return false;
+	};
+
+	if (custom_config_json.empty())
+		return fail("the config override text is empty");
+
+	GoLiveApi::Config new_config;
+	try {
+		new_config = nlohmann::json::parse(custom_config_json);
+	} catch (const nlohmann::json::exception &e) {
+		std::string reason = "invalid JSON: ";
+		reason += e.what();
+		return fail(reason.c_str());
+	}
+
+	if (new_config.encoder_configurations.empty())
+		return fail("the config contains no video encoder configurations");
+	for (const auto &encoder_config : new_config.encoder_configurations) {
+		if (!encoder_config.settings.is_object() || encoder_config.settings.empty())
+			return fail("a video encoder configuration has no settings object");
+	}
+
+	size_t canvas_count;
+	{
+		const std::lock_guard lock{current_mutex};
+		canvas_count = current ? current->canvases.size() : 0u;
+	}
+	for (const auto &encoder_config : new_config.encoder_configurations) {
+		if (encoder_config.canvas_index >= canvas_count)
+			return fail("the config references a canvas that is not in use");
+	}
+
+	const std::lock_guard lock{current_mutex};
+	if (!current || !current->output_)
+		return fail("no multitrack video output has been prepared yet");
+	if (!obs_output_active(current->output_))
+		return fail("the stream is not active yet");
+
+	auto &objects = *current;
+	if (objects.config_json_.empty())
+		return fail("the active session has no stored config to compare against");
+
+	GoLiveApi::Config old_config;
+	try {
+		old_config = nlohmann::json::parse(objects.config_json_);
+	} catch (const nlohmann::json::exception &e) {
+		std::string reason = "the stored session config is corrupted: ";
+		reason += e.what();
+		return fail(reason.c_str());
+	}
+
+	// Nothing changed, nothing to do.
+	if (objects.config_json_ == nlohmann::json(new_config).dump()) {
+		blog(LOG_INFO, "MultitrackVideoOutput: config override unchanged, nothing to apply");
+		return true;
+	}
+
+	const auto &new_videos = new_config.encoder_configurations;
+	const auto &old_videos = old_config.encoder_configurations;
+
+	if (old_videos.size() != new_videos.size()) {
+		char line[128];
+		snprintf(line, sizeof(line), "video track count %zu -> %zu", old_videos.size(), new_videos.size());
+		blog(LOG_WARNING, "MultitrackVideoOutput: deferred change (%s) - applies when streaming restarts",
+		     line);
+	}
+
+	for (size_t i = 0; old_videos.size() > i && new_videos.size() > i; i++) {
+		const auto &old_encoder_config = old_videos[i];
+		const auto &new_encoder_config = new_videos[i];
+
+		if (old_encoder_config.type != new_encoder_config.type) {
+			char line[192];
+			snprintf(line, sizeof(line), "video encoder %zu codec (%s -> %s)", i,
+				 old_encoder_config.type.c_str(), new_encoder_config.type.c_str());
+			blog(LOG_WARNING,
+			     "MultitrackVideoOutput: deferred change (%s) - applies when streaming restarts", line);
+			continue;
+		}
+
+		const bool structural_video_change =
+		    old_encoder_config.width != new_encoder_config.width ||
+		    old_encoder_config.height != new_encoder_config.height ||
+		    (old_encoder_config.framerate.has_value() != new_encoder_config.framerate.has_value()) ||
+		    (old_encoder_config.framerate && new_encoder_config.framerate &&
+		     ((*old_encoder_config.framerate).numerator != (*new_encoder_config.framerate).numerator ||
+		      (*old_encoder_config.framerate).denominator != (*new_encoder_config.framerate).denominator)) ||
+		    old_encoder_config.gpu_scale_type != new_encoder_config.gpu_scale_type ||
+		    old_encoder_config.colorspace != new_encoder_config.colorspace ||
+		    old_encoder_config.range != new_encoder_config.range ||
+		    old_encoder_config.format != new_encoder_config.format;
+
+		if (structural_video_change) {
+			char line[160];
+			snprintf(line, sizeof(line), "video encoder %zu resolution/framerate/color settings", i);
+			blog(LOG_WARNING,
+			     "MultitrackVideoOutput: deferred change (%s) - applies when streaming restarts", line);
+		}
+
+		nlohmann::json new_settings = new_encoder_config.settings;
+		if (strstr(new_encoder_config.type.c_str(), "vaapi")) {
+			// VAAPI encoders take an integer profile that is derived at create time only.
+			new_settings.erase("profile");
+			new_settings.erase("profile_str");
+		}
+
+		OBSDataAutoRelease settings = obs_data_create_from_json(new_settings.dump().c_str());
+		obs_encoder_t *encoder = obs_output_get_video_encoder2(objects.output_, i);
+		if (!encoder) {
+			blog(LOG_ERROR, "MultitrackVideoOutput: failed to get video encoder %zu for live update", i);
+			continue;
+		}
+
+		log_changed_settings_fields("video", i, old_encoder_config.settings, new_settings);
+		obs_encoder_update(encoder, settings);
+	}
+
+	auto old_audios = collect_audio_configurations(old_config);
+	auto new_audios = collect_audio_configurations(new_config);
+
+	if (old_audios.size() != new_audios.size()) {
+		char line[128];
+		snprintf(line, sizeof(line), "audio track count %zu -> %zu", old_audios.size(), new_audios.size());
+		blog(LOG_WARNING, "MultitrackVideoOutput: deferred change (%s) - applies when streaming restarts",
+		     line);
+	}
+
+	for (size_t i = 0; old_audios.size() > i && new_audios.size() > i; i++) {
+		if (old_audios[i].codec != new_audios[i].codec || old_audios[i].channels != new_audios[i].channels) {
+			char line[192];
+			snprintf(line, sizeof(line), "audio encoder %zu codec/channels (%s -> %s)", i,
+				 old_audios[i].codec.c_str(), new_audios[i].codec.c_str());
+			blog(LOG_WARNING,
+			     "MultitrackVideoOutput: deferred change (%s) - applies when streaming restarts", line);
+			continue;
+		}
+
+		if (i >= objects.audio_encoders_.size()) {
+			blog(LOG_ERROR, "MultitrackVideoOutput: missing audio encoder %zu for live update", i);
+			break;
+		}
+
+		OBSDataAutoRelease settings = obs_data_create_from_json(new_audios[i].settings.dump().c_str());
+		log_changed_settings_fields("audio", i, old_audios[i].settings, new_audios[i].settings);
+		obs_encoder_update(objects.audio_encoders_[i], settings);
+	}
+
+	objects.config_json_ = nlohmann::json(new_config).dump();
+	{
+		const std::lock_guard dump_lock{current_stream_dump_mutex};
+		if (current_stream_dump)
+			current_stream_dump->config_json_ = objects.config_json_;
+	}
+
+	blog(LOG_INFO, "MultitrackVideoOutput: applied live config override changes to the active stream");
+	return true;
 }
 
 signal_handler_t *MultitrackVideoOutput::StreamingSignalHandler()

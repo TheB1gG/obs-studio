@@ -222,8 +222,13 @@ void OBSBasicSettings::LoadStream1Settings()
 	UpdateServiceRecommendations();
 	UpdateMultitrackVideo();
 
+	// While streaming, disable everything that could affect the active output, but keep the multitrack video group
+	// available so its JSON override can be edited and applied live (see MultitrackVideoOutput::ApplyConfigOverride).
 	bool streamActive = obs_frontend_streaming_active();
-	ui->streamPage->setEnabled(!streamActive);
+	ui->widget_5->setEnabled(!streamActive);
+	ui->loginPage->setEnabled(!streamActive);
+	ui->destinationGroupBox->setEnabled(!streamActive);
+	ui->serviceAdvancedOptionsGroupBox->setEnabled(!streamActive);
 
 	ui->ignoreRecommended->setChecked(ignoreRecommended);
 
@@ -354,6 +359,22 @@ void OBSBasicSettings::SaveStream1Settings()
 	SaveCheckBox(ui->multitrackVideoConfigOverrideEnable, "Stream1", "MultitrackVideoConfigOverrideEnabled");
 	SaveText(ui->multitrackVideoConfigOverride, "Stream1", "MultitrackVideoConfigOverride");
 	SaveComboData(ui->multitrackVideoAdditionalCanvas, "Stream1", "MultitrackExtraCanvas");
+
+	// While a multitrack video stream is active, apply safe changes to it live; everything else that was saved above
+	// takes effect when the next stream starts.
+	if (!loading && obs_frontend_streaming_active() && ui->multitrackVideoConfigOverrideEnable->isChecked()) {
+		const QString override_text = ui->multitrackVideoConfigOverride->toPlainText();
+		if (!override_text.isEmpty()) {
+			const QByteArray json_data = override_text.toUtf8();
+			std::string json(json_data.constData(), json_data.size());
+
+			std::string reason;
+			if (!main->ApplyMultitrackConfigOverride(json, &reason))
+				QMessageBox::warning(this, QTStr("Basic.Settings.Stream.MultitrackVideoLabel"),
+					 QString("The config override could not be applied to the running stream: %1\n")
+							.arg(QString::fromStdString(reason)));
+		}
+	}
 
 	if (oldMultitrackVideoSetting != ui->enableMultitrackVideo->isChecked())
 		main->ResetOutputs();

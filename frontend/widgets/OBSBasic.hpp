@@ -1372,6 +1372,10 @@ public slots:
 
 	bool StreamingActive();
 
+	// Applies safe multitrack video config override changes to an active stream without restarting it (see
+	// MultitrackVideoOutput::ApplyConfigOverride). Returns false when no change was applied.
+	bool ApplyMultitrackConfigOverride(const std::string &json, std::string *failure_reason);
+
 private slots:
 	/* Stream action (start/stop) slot */
 	void StreamActionTriggered();

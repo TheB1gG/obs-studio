@@ -452,3 +452,14 @@ bool OBSBasic::StreamingActive()
 		return false;
 	return outputHandler->StreamingActive();
 }
+
+bool OBSBasic::ApplyMultitrackConfigOverride(const std::string &json, std::string *failure_reason)
+{
+	if (!outputHandler || !outputHandler->multitrackVideo || !outputHandler->multitrackVideoActive) {
+		if (failure_reason)
+			*failure_reason = "no multitrack video stream is active";
+		return false;
+	}
+
+	return outputHandler->multitrackVideo->ApplyConfigOverride(json, failure_reason);
+}

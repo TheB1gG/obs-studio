@@ -5651,12 +5651,15 @@ void OBSBasicSettings::UpdateMultitrackVideo()
 	ui->multitrackVideoConfigOverrideLabel->setVisible(available && MultitrackVideoDeveloperModeEnabled());
 	ui->multitrackVideoConfigOverride->setVisible(available && MultitrackVideoDeveloperModeEnabled());
 
+	// The JSON override stays editable while streaming so safe changes can be applied live (see
+	// MultitrackVideoOutput::ApplyConfigOverride). All other multitrack controls still require an inactive output.
+	const bool override_live_editable = ui->enableMultitrackVideo->isChecked() &&
+					   ui->multitrackVideoConfigOverrideEnable->isChecked();
+
 	ui->multitrackVideoStreamDumpEnable->setEnabled(toggle_available && ui->enableMultitrackVideo->isChecked());
 	ui->multitrackVideoConfigOverrideEnable->setEnabled(toggle_available && ui->enableMultitrackVideo->isChecked());
-	ui->multitrackVideoConfigOverrideLabel->setEnabled(toggle_available && ui->enableMultitrackVideo->isChecked() &&
-							   ui->multitrackVideoConfigOverrideEnable->isChecked());
-	ui->multitrackVideoConfigOverride->setEnabled(toggle_available && ui->enableMultitrackVideo->isChecked() &&
-						      ui->multitrackVideoConfigOverrideEnable->isChecked());
+	ui->multitrackVideoConfigOverrideLabel->setEnabled(override_live_editable);
+	ui->multitrackVideoConfigOverride->setEnabled(override_live_editable);
 
 	auto update_simple_output_settings = [&](bool mtv_enabled) {
 		auto recording_uses_stream_encoder = ui->simpleOutRecQuality->currentData().toString() == "Stream";

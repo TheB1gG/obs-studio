@@ -35,6 +35,12 @@ public:
 	bool HandleIncompatibleSettings(QWidget *parent, config_t *config, obs_service_t *service,
 					bool &enableDynBitrate);
 
+	// Applies safe changes from a custom Go-Live config JSON to the currently active stream without restarting it.
+	// Fields that cannot be applied while running (codec, resolution, framerate, ...) are kept in the stored
+	// config and take effect on the next start. The new config becomes the reference for future live applies.
+	// Returns false when nothing was applied; *failure_reason then describes why (and the stream is untouched).
+	bool ApplyConfigOverride(const std::string &custom_config_json, std::string *failure_reason);
+
 	OBSOutputAutoRelease StreamingOutput()
 	{
 		const std::lock_guard current_lock{current_mutex};
@@ -51,6 +57,7 @@ private:
 		OBSServiceAutoRelease multitrack_video_service_;
 		OBSSignal start_signal, stop_signal;
 		std::vector<OBSCanvasAutoRelease> canvases;
+		std::string config_json_; // active go-live/custom config JSON (reference for live apply diffs)
 	};
 
 	std::optional<OBSOutputObjects> take_current();
