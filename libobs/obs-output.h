@@ -85,6 +85,9 @@ struct obs_output_info {
 
 	/* required if OBS_OUTPUT_SERVICE */
 	const char *protocols;
+
+	/* optional: ungraceful abort hook - kills the session abruptly (no graceful shutdown) */
+	void (*abort)(void *data);
 };
 
 EXPORT void obs_register_output_s(const struct obs_output_info *info, size_t size);

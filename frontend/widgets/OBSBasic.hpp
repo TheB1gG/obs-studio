@@ -1356,12 +1356,15 @@ private:
 	std::shared_future<void> setupStreamingGuard;
 	bool streamingStopping = false;
 	bool streamingStarting = false;
+	// Set while an ungraceful kill (skull button) is in progress: the resulting "stop" signal must be treated like a normal stop (no error dialog).
+	bool streamingKillActive = false;
 
 public slots:
 	void DisplayStreamStartError();
 	void StartStreaming();
 	void StopStreaming();
 	void ForceStopStreaming();
+	void KillStreamingUngracefully();
 
 	void StreamDelayStarting(int sec);
 	void StreamDelayStopping(int sec);

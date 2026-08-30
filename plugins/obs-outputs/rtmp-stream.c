@@ -149,6 +149,11 @@ static inline bool disconnected(struct rtmp_stream *stream)
 	return os_atomic_load_bool(&stream->disconnected);
 }
 
+static inline bool aborted(const struct rtmp_stream *stream)
+{
+	return os_atomic_load_bool(&stream->aborted);
+}
+
 static void rtmp_stream_destroy(void *data)
 {
 	struct rtmp_stream *stream = data;
@@ -272,6 +277,26 @@ static void rtmp_stream_stop(void *data, uint64_t ts)
 			os_sem_post(stream->send_sem);
 	} else {
 		obs_output_signal_stop(stream->output, OBS_OUTPUT_SUCCESS);
+	}
+}
+
+static void rtmp_stream_abort(void *data)
+{
+	struct rtmp_stream *stream = data;
+
+	os_atomic_set_bool(&stream->aborted, true);
+
+	if (connecting(stream)) {
+		pthread_join(stream->connect_thread, NULL); /* wait for connect phase to finish */
+	}
+
+	if (active(stream)) {
+		info("Ungraceful abort requested - tearing down without graceful shutdown");
+		os_event_signal(stream->stop_event);
+		os_sem_post(stream->send_sem); /* wake send thread immediately */
+	} else {
+		debug("Abort requested before the stream became active - falling back to forced stop");
+		rtmp_stream_stop(data, 0);
 	}
 }
 
@@ -781,7 +806,9 @@ static void *send_thread(void *data)
 
 	bool encode_error = os_atomic_load_bool(&stream->encode_error);
 
-	if (disconnected(stream)) {
+	if (aborted(stream)) {
+		info("Ungraceful abort - skipping end-of-stream data, resetting connection");
+	} else if (disconnected(stream)) {
 		info("Disconnected from %s", stream->path.array);
 	} else if (encode_error) {
 		info("Encoder error, disconnecting");
@@ -803,6 +830,16 @@ static void *send_thread(void *data)
 		stream->rtmp.m_bCustomSend = false;
 	}
 
+	if (aborted(stream)) {
+		/* Force RST close so the remote side sees an abrupt disconnect:
+		 * linger(0) makes closesocket() send a reset instead of letting
+		 * buffered data drain out gracefully. */
+		struct linger linger_abort = {.l_onoff = 1, .l_linger = 0};
+		setsockopt(stream->rtmp.m_sb.sb_socket, SOL_SOCKET, SO_LINGER, (const char *)&linger_abort,
+					sizeof(linger_abort));
+		RTMPSockBuf_Close(&stream->rtmp.m_sb);
+	}
+
 	set_output_error(stream);
 
 	RTMP_Close(&stream->rtmp);
@@ -820,6 +857,11 @@ static void *send_thread(void *data)
 		obs_output_signal_stop(stream->output, OBS_OUTPUT_DISCONNECTED);
 	} else if (encode_error) {
 		obs_output_signal_stop(stream->output, OBS_OUTPUT_ENCODE_ERROR);
+	} else if (aborted(stream)) {
+		/* Error code keeps the core from treating this as a recoverable
+		 * disconnect and prevents automatic reconnection */
+		obs_output_set_last_error(stream->output, "Stream killed ungracefully");
+		obs_output_signal_stop(stream->output, OBS_OUTPUT_ERROR);
 	} else {
 		obs_output_end_data_capture(stream->output);
 	}
@@ -828,6 +870,7 @@ static void *send_thread(void *data)
 	os_event_reset(stream->stop_event);
 	os_atomic_set_bool(&stream->active, false);
 	stream->sent_headers = false;
+	os_atomic_set_bool(&stream->aborted, false);
 
 	return NULL;
 }
@@ -1949,6 +1992,7 @@ struct obs_output_info rtmp_output_info = {
 	.destroy = rtmp_stream_destroy,
 	.start = rtmp_stream_start,
 	.stop = rtmp_stream_stop,
+	.abort = rtmp_stream_abort,
 	.encoded_packet = rtmp_stream_data,
 	.get_defaults = rtmp_stream_defaults,
 	.get_properties = rtmp_stream_properties,

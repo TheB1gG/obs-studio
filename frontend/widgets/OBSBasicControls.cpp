@@ -45,6 +45,9 @@ OBSBasicControls::OBSBasicControls(OBSBasic *main) : QFrame(nullptr), ui(new Ui:
 	connect(
 		ui->settingsButton, &QPushButton::clicked, this, [this]() { emit this->SettingsButtonClicked(); },
 		Qt::DirectConnection);
+	connect(
+		ui->streamSkullButton, &QPushButton::clicked, this,
+		[this]() { emit this->KillStreamButtonClicked(); }, Qt::DirectConnection);
 
 	/* Transfer menu actions signals as OBSBasicControls signals */
 	connect(
@@ -64,6 +67,10 @@ OBSBasicControls::OBSBasicControls(OBSBasic *main) : QFrame(nullptr), ui(new Ui:
 	ui->saveReplayButton->setVisible(false);
 	ui->virtualCamButton->setVisible(false);
 	ui->virtualCamConfigButton->setVisible(false);
+
+	/* Kill button is only available while the stream is actually live */
+	ui->streamSkullButton->setEnabled(false);
+	ui->streamSkullButton->setToolTip(QTStr("Basic.Main.KillStreamTooltip"));
 
 	/* Set up state update connections */
 	connect(main, &OBSBasic::StreamingPreparing, this, &OBSBasicControls::StreamingPreparing);
@@ -101,11 +108,13 @@ void OBSBasicControls::StreamingPreparing()
 {
 	ui->streamButton->setEnabled(false);
 	ui->streamButton->setText(QTStr("Basic.Main.PreparingStream"));
+	ui->streamSkullButton->setEnabled(false);
 }
 
 void OBSBasicControls::StreamingStarting(bool broadcastAutoStart)
 {
 	ui->streamButton->setText(QTStr("Basic.Main.Connecting"));
+	ui->streamSkullButton->setEnabled(false);
 
 	if (!broadcastAutoStart) {
 		// well, we need to disable button while stream is not active
@@ -124,6 +133,7 @@ void OBSBasicControls::StreamingStarted(bool withDelay)
 	ui->streamButton->setEnabled(true);
 	setClasses(ui->streamButton, "state-active");
 	ui->streamButton->setText(QTStr("Basic.Main.StopStreaming"));
+	ui->streamSkullButton->setEnabled(true);
 
 	if (withDelay) {
 		ui->streamButton->setMenu(streamButtonMenu.get());
@@ -135,6 +145,7 @@ void OBSBasicControls::StreamingStarted(bool withDelay)
 void OBSBasicControls::StreamingStopping()
 {
 	ui->streamButton->setText(QTStr("Basic.Main.StoppingStreaming"));
+	ui->streamSkullButton->setEnabled(false);
 }
 
 void OBSBasicControls::StreamingStopped(bool withDelay)
@@ -142,6 +153,7 @@ void OBSBasicControls::StreamingStopped(bool withDelay)
 	ui->streamButton->setEnabled(true);
 	setClasses(ui->streamButton, "");
 	ui->streamButton->setText(QTStr("Basic.Main.StartStreaming"));
+	ui->streamSkullButton->setEnabled(false);
 
 	if (withDelay) {
 		if (!ui->streamButton->menu())

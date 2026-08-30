@@ -526,6 +526,23 @@ void obs_output_force_stop(obs_output_t *output)
 	obs_output_actual_stop(output, true, 0);
 }
 
+void obs_output_abort_stream(obs_output_t *output)
+{
+	if (!obs_output_valid(output, "obs_output_abort_stream"))
+		return;
+
+	if (active(output)) {
+		if (output->info.abort)
+			output->info.abort(output->context.data);
+		else
+			/* Fallback for outputs without abort support */
+			obs_output_force_stop(output);
+	} else if (reconnecting(output)) {
+		/* Abort an in-progress reconnect attempt */
+		obs_output_force_stop(output);
+	}
+}
+
 bool obs_output_active(const obs_output_t *output)
 {
 	return (output != NULL) ? (active(output) || reconnecting(output)) : false;

@@ -55,6 +55,7 @@ public:
 
 signals:
 	void StreamButtonClicked();
+	void KillStreamButtonClicked();
 	void BroadcastButtonClicked();
 	void RecordButtonClicked();
 	void PauseRecordButtonClicked();

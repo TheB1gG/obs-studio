@@ -48,6 +48,7 @@ public:
 	}
 
 	bool RestartOnError() { return restart_on_error; }
+	void SetRestartOnError(bool enabled) { restart_on_error = enabled; }
 
 private:
 	struct OBSOutputObjects {

@@ -13,6 +13,7 @@
 #include <Iphlpapi.h>
 #else
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #endif
 
 #define do_log(level, format, ...) \
@@ -68,6 +69,7 @@ struct rtmp_stream {
 	volatile bool active;
 	volatile bool disconnected;
 	volatile bool encode_error;
+	volatile bool aborted; /* ungraceful kill requested (RST close, no footers) */
 	pthread_t send_thread;
 
 	int max_shutdown_time_sec;

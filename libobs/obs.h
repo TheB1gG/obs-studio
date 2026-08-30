@@ -2105,6 +2105,14 @@ EXPORT void obs_output_set_reconnect_callback(obs_output_t *output,
 					      bool (*reconnect_cb)(void *data, obs_output_t *output, int code),
 					      void *param);
 
+/**
+ * Ungracefully aborts an active stream: skips graceful shutdown and queued-frame
+ * drain, sends no end-of-stream data and tears the connection down abruptly (RST
+ * where supported) so the remote side sees a crash-like disconnect. Outputs that
+ * do not support abort fall back to a force stop. No-ops when not streaming.
+ */
+EXPORT void obs_output_abort_stream(obs_output_t *output);
+
 /* ------------------------------------------------------------------------- */
 /* Functions used by outputs */
 

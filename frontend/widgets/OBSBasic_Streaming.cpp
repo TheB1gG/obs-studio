@@ -199,6 +199,46 @@ void OBSBasic::ForceStopStreaming()
 		StopReplayBuffer();
 }
 
+void OBSBasic::KillStreamingUngracefully()
+{
+	if (!outputHandler->StreamingActive())
+		return;
+
+	blog(LOG_INFO, "Force-killing active stream ungracefully (simulated crash)");
+
+	// Make sure automatic restart does not bring the stream back up
+	if (outputHandler->multitrackVideo)
+		outputHandler->multitrackVideo->SetRestartOnError(false);
+
+	OBSOutputAutoRelease output = outputHandler->StreamingOutput();
+	if (!output) {
+		blog(LOG_WARNING, "KillStreamingUngracefully: no active streaming output found");
+		return;
+	}
+
+	// Abruptly kill the RTMP session (RST close, no end-of-stream data). The UI is
+	// returned to idle by the normal "stop" signal path once teardown completes.
+	streamingKillActive = true;
+	obs_output_abort_stream(output);
+
+	// Reset broadcast state the same way as a hard stop
+	if (!autoStartBroadcast && !broadcastActive) {
+		broadcastActive = false;
+		autoStartBroadcast = true;
+		autoStopBroadcast = true;
+		broadcastReady = false;
+	}
+
+	if (autoStopBroadcast) {
+		broadcastActive = false;
+		broadcastReady = false;
+	}
+
+	emit BroadcastStreamReady(broadcastReady);
+
+	OnDeactivate();
+}
+
 void OBSBasic::StreamDelayStarting(int sec)
 {
 	emit StreamingStarted(true);
@@ -282,6 +322,16 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 	bool use_last_error = false;
 	bool encode_error = false;
 	bool should_reconnect = false;
+
+	// An ungraceful kill requested via the skull button must behave exactly like clicking "Stop Streaming":
+	// no error dialog, no reconnect handling -- just a clean stop.
+	// The marker string is written by plugins/obs-outputs' abort path (see rtmp_stream_abort), so any
+	// stop event carrying it is ours even if the streamingKillActive flag was consumed by an earlier stop.
+	const bool ungracefulKill = last_error.contains(QStringLiteral("Stream killed ungracefully"));
+	if (streamingKillActive || ungracefulKill) {
+		streamingKillActive = false;
+		code = OBS_OUTPUT_SUCCESS;
+	}
 
 	/* Ignore stream key error for multitrack output if its internal reconnect handling is active. */
 	if (code == OBS_OUTPUT_INVALID_STREAM && outputHandler->multitrackVideo &&
