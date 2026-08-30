@@ -52,6 +52,10 @@
     qproperty-icon: url(:/res/images/settings/general.svg);
 }
 
+.icon-skull {
+    qproperty-icon: url(:/res/images/settings/skull.svg);
+}
+
 .icon-dots-vert {
     qproperty-icon: url(:/res/images/dots-vert.svg);
 }

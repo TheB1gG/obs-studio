@@ -47,26 +47,71 @@
       <item>
        <layout class="QHBoxLayout" name="horizontalLayout_7">
         <item>
-         <widget class="QPushButton" name="streamButton">
-          <property name="enabled">
-           <bool>true</bool>
+         <layout class="QHBoxLayout" name="streamLayout">
+          <property name="spacing">
+           <number>2</number>
           </property>
-          <property name="sizePolicy">
-           <sizepolicy hsizetype="Ignored" vsizetype="Fixed">
-            <horstretch>0</horstretch>
-            <verstretch>0</verstretch>
-           </sizepolicy>
+          <property name="leftMargin">
+           <number>0</number>
           </property>
-          <property name="minimumSize">
-           <size>
-            <width>150</width>
-            <height>0</height>
-           </size>
+          <property name="topMargin">
+           <number>0</number>
           </property>
-          <property name="text">
-           <string>Basic.Main.StartStreaming</string>
+          <property name="rightMargin">
+           <number>0</number>
           </property>
-         </widget>
+          <property name="bottomMargin">
+           <number>0</number>
+          </property>
+          <item>
+           <widget class="QPushButton" name="streamButton">
+            <property name="enabled">
+             <bool>true</bool>
+            </property>
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Ignored" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <property name="minimumSize">
+             <size>
+              <width>140</width>
+              <height>0</height>
+             </size>
+            </property>
+            <property name="text">
+             <string>Basic.Main.StartStreaming</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="streamSkullButton">
+            <property name="enabled">
+             <bool>true</bool>
+            </property>
+            <property name="minimumSize">
+             <size>
+              <width>0</width>
+              <height>0</height>
+             </size>
+            </property>
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <property name="icon">
+             <iconset resource="obs.qrc">
+              <normaloff>:/res/images/settings/skull.svg</normaloff>:/res/images/settings/skull.svg</iconset>
+            </property>
+            <property name="class" stdset="0">
+             <string>icon-skull</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
         </item>
         <item>
          <widget class="QPushButton" name="broadcastButton">

@@ -93,6 +93,10 @@ QPushButton#sourceFiltersButton {
     qproperty-icon: url(theme:Light/settings/general.svg);
 }
 
+.icon-skull {
+    qproperty-icon: url(theme:Light/settings/skull.svg);
+}
+
 .icon-dots-vert {
     qproperty-icon: url(theme:Light/dots-vert.svg);
 }

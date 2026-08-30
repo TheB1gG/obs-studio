@@ -317,6 +317,10 @@
     qproperty-icon: url(theme:Dark/settings/general.svg);
 }
 
+.icon-skull {
+    qproperty-icon: url(theme:Dark/settings/skull.svg);
+}
+
 .icon-dots-vert {
     qproperty-icon: url(theme:Dark/dots-vert.svg);
 }
@@ -1231,7 +1235,8 @@ QDoubleSpinBox::down-arrow {
 
 #pauseRecordButton,
 #saveReplayButton,
-#virtualCamConfigButton {
+#virtualCamConfigButton,
+#streamSkullButton {
     padding: var(--padding_large) var(--padding_large);
     width: var(--input_height);
     max-width: var(--input_height);
