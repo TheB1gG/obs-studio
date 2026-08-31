@@ -811,10 +811,8 @@ struct obs_core_video_mix *obs_create_video_mix(struct obs_video_info *ovi)
 	return video;
 }
 
-static bool restore_canvases(void)
+static void restore_canvases(void)
 {
-	bool success = true;
-
 	pthread_mutex_lock(&obs->data.canvases_mutex);
 	struct obs_context_data *ctx, *tmp;
 	HASH_ITER (hh, (struct obs_context_data *)obs->data.canvases, ctx, tmp) {
@@ -822,14 +820,13 @@ static bool restore_canvases(void)
 		if (canvas->flags & MAIN)
 			continue;
 
-		if (!obs_canvas_reset_video_internal(canvas, NULL)) {
-			blog(LOG_ERROR, "Failed restoring video mix for canvas '%s'", canvas->context.name);
-			success = false;
-		}
+		/* Best effort: a canvas that fails to restore (e.g. created by a plugin that is no longer present)
+		 * must not prevent the main video feed from coming back up. */
+		if (!obs_canvas_reset_video_internal(canvas, NULL))
+			blog(LOG_WARNING, "Failed restoring video mix for canvas '%s'; continuing without it",
+			     canvas->context.name);
 	}
 	pthread_mutex_unlock(&obs->data.canvases_mutex);
-
-	return success;
 }
 
 static int obs_init_video(struct obs_video_info *ovi)
@@ -849,8 +846,7 @@ static int obs_init_video(struct obs_video_info *ovi)
 	if (!obs_canvas_reset_video_internal(obs->data.main_canvas, ovi))
 		return OBS_VIDEO_FAIL;
 	/* Reset mixes for remaining canvases using their existing video info. */
-	if (!restore_canvases())
-		return OBS_VIDEO_FAIL;
+	restore_canvases();
 
 	int errorcode;
 #ifdef __APPLE__
