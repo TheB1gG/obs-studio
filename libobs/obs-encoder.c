@@ -225,17 +225,57 @@ static struct obs_core_video_mix *acquire_encoder_only_mix(struct obs_encoder *e
 		space = encoder->preferred_space;
 		range = encoder->preferred_range;
 
-		/* If a preferred format is not already set, allow the encoder to tell us which format it prefers to
-		 * determine  if we should opportunistically create a conversion mix even if scaling is disabled. */
 		struct video_scale_info encoder_info = {0};
-		get_video_info(encoder, &encoder_info);
 
-		if (format == VIDEO_FORMAT_NONE)
+		if (format == VIDEO_FORMAT_NONE) {
+			/* No explicit preference: use the normal path (base canvas format → encoder callback). */
+			get_video_info(encoder, &encoder_info);
 			format = encoder_info.format;
-		if (space == VIDEO_CS_DEFAULT)
-			space = encoder_info.colorspace;
-		if (range == VIDEO_RANGE_DEFAULT)
-			range = encoder_info.range;
+			if (space == VIDEO_CS_DEFAULT)
+				space = encoder_info.colorspace;
+			if (range == VIDEO_RANGE_DEFAULT)
+				range = encoder_info.range;
+		} else {
+			/* User explicitly requested a format: ask the encoder what texture format it
+			 * would use for THAT specific input. This lets the encoder remap e.g. I444→AYUV,
+			 * BGRA→GBRA, R10L→GBR10, etc. */
+			encoder_info.format = format;
+			encoder_info.colorspace = (space != VIDEO_CS_DEFAULT) ? space : info->colorspace;
+			encoder_info.range = (range != VIDEO_RANGE_DEFAULT) ? range : info->range;
+			encoder_info.width = obs_encoder_get_width(encoder);
+			encoder_info.height = obs_encoder_get_height(encoder);
+
+			if (encoder->info.get_video_info)
+				encoder->info.get_video_info(encoder->context.data, &encoder_info);
+
+			/* The encoder callback may have remapped our format to its texture equivalent. */
+			if (encoder_info.format != format) {
+				if (format_conversion_is_lossless(format, encoder_info.format)) {
+					/* Lossless repack: use the encoder's actual texture format. */
+					blog(LOG_INFO,
+					     "Encoder \"%s\": texture input uses %s layout (requested %s, lossless equivalent).",
+					     obs_encoder_get_name(encoder),
+					     get_video_format_name(encoder_info.format),
+					     get_video_format_name(format));
+					format = encoder_info.format;
+				} else {
+					/* Lossy conversion: the encoder cannot handle the requested format via texture. */
+					blog(LOG_ERROR,
+					     "Encoder \"%s\": requested video format %s is not supported for GPU texture "
+					     "encoding. The encoder requires %s, which would require a lossy conversion "
+					     "(chroma subsampling or bit-depth reduction). No scaling mix will be created.",
+					     obs_encoder_get_name(encoder),
+					     get_video_format_name(format),
+					     get_video_format_name(encoder_info.format));
+					return NULL;
+				}
+			}
+
+			if (space == VIDEO_CS_DEFAULT)
+				space = encoder_info.colorspace;
+			if (range == VIDEO_RANGE_DEFAULT)
+				range = encoder_info.range;
+		}
 
 		conversion_requested = format != info->format || space != info->colorspace || range != info->range;
 	} else {
@@ -299,8 +339,10 @@ static struct obs_core_video_mix *acquire_encoder_only_mix(struct obs_encoder *e
 
 	/* Check that mix actually has the GPU texture format we want */
 	if (is_tex_encoder && created->encoder_texture_format != format) {
-		blog(LOG_WARNING, "GPU scaling setup failed, texture format %s unavailable.",
-		     get_video_format_name(format));
+		blog(LOG_ERROR,
+		     "Encoder \"%s\": GPU texture format %s is not available on this system/GPU. "
+		     "Cannot create scaling mix.",
+		     obs_encoder_get_name(encoder), get_video_format_name(format));
 		obs_free_video_mix(created);
 		return NULL;
 	}

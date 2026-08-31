@@ -194,6 +194,67 @@ static inline bool format_is_yuv(enum video_format format)
 	return false;
 }
 
+/* Returns the effective bit depth of the stored sample values. */
+static inline int video_format_bit_depth(enum video_format format)
+{
+	switch (format) {
+	case VIDEO_FORMAT_I010:
+	case VIDEO_FORMAT_P010:
+	case VIDEO_FORMAT_P216:
+	case VIDEO_FORMAT_P416:
+	case VIDEO_FORMAT_R10L:
+	case VIDEO_FORMAT_GBR10:
+	case VIDEO_FORMAT_Y410:
+	case VIDEO_FORMAT_I210:
+	case VIDEO_FORMAT_V210:
+		return 10;
+	case VIDEO_FORMAT_I412:
+		return 12;
+	default:
+		return 8;
+	}
+}
+
+/* Returns chroma subsampling factors. h/v = 1 means full resolution, 2 means halved. */
+static inline void video_format_chroma_subsample(enum video_format format, int *h, int *v)
+{
+	switch (format) {
+	case VIDEO_FORMAT_I420:
+	case VIDEO_FORMAT_NV12:
+	case VIDEO_FORMAT_I010:
+	case VIDEO_FORMAT_P010:
+		*h = 2; *v = 2;
+		break;
+	case VIDEO_FORMAT_I422:
+	case VIDEO_FORMAT_I210:
+	case VIDEO_FORMAT_P216:
+	case VIDEO_FORMAT_YVYU:
+	case VIDEO_FORMAT_YUY2:
+	case VIDEO_FORMAT_UYVY:
+		*h = 2; *v = 1;
+		break;
+	default: /* 4:4:4 and RGB formats */
+		*h = 1; *v = 1;
+		break;
+	}
+}
+
+/* Returns true if converting from 'from' to 'to' is a lossless repack:
+ * same color family (YUV or RGB), same chroma subsampling, same bit depth. */
+static inline bool format_conversion_is_lossless(enum video_format from, enum video_format to)
+{
+	if (from == to)
+		return true;
+	if (format_is_yuv(from) != format_is_yuv(to))
+		return false;
+	if (video_format_bit_depth(from) != video_format_bit_depth(to))
+		return false;
+	int fh, fv, th, tv;
+	video_format_chroma_subsample(from, &fh, &fv);
+	video_format_chroma_subsample(to, &th, &tv);
+	return fh == th && fv == tv;
+}
+
 static inline const char *get_video_format_name(enum video_format format)
 {
 	switch (format) {
