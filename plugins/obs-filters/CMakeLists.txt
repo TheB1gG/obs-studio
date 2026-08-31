@@ -18,6 +18,7 @@ target_sources(
     gain-filter.c
     gpu-delay.c
     hdr-tonemap-filter.c
+    integer-downscale-filter.c
     invert-audio-polarity.c
     limiter-filter.c
     luma-key-filter.c

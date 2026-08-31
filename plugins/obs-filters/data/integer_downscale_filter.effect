@@ -1,0 +1,549 @@
+/*
+ * Integer Downscale Filter (fixed-integer decimation kernels)
+ *
+ * Output pixel i covers source texels [i*R, i*R + R), where R is the fixed
+ * integer ratio of that pass (K2 = 2x, K3 = 3x). The shader therefore never
+ * interpolates between output pixels: every tap lands on whole texels and the
+ * per-tap weights are compile-time constants (windowed-sinc decimation kernels),
+ * so downscaling text stays crisp instead of blurring.
+ *
+ * Taps are anchored at the ideal output center xc = c + R/2, where c = i*R:
+ *   K2: 7 taps at absolute coords {c-2 .. c+4} (xc integer)
+ *   K3: 8 taps at absolute coords {c-2 .. c+5} (xc half-integer)
+ */
+
+#include "color.effect"
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float2 base_dimension;
+uniform float2 base_dimension_i;
+uniform float multiplier = 1.0;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+struct FragData {
+	float2 uv : TEXCOORD0;
+};
+
+struct VSOut {
+	float2 uv  : TEXCOORD0;
+	float4 pos : POSITION;
+};
+
+VSOut VSDefault(VertData v_in)
+{
+	VSOut vert_out;
+	vert_out.uv = v_in.uv * base_dimension; // fragment coords -> source texel units
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	return vert_out;
+}
+
+/* clamp a tap coordinate to the valid texture range (edges clamp) */
+int3 TapCoord(int tx, int ty)
+{
+	float fx = clamp((float)tx, 0.0f, base_dimension.x - 1.0f);
+	float fy = clamp((float)ty, 0.0f, base_dimension.y - 1.0f);
+	return int3((int)fx, (int)fy, 0);
+}
+
+/* ---------------- K2: fixed ÷2 decimation (output i covers source [c, c+2)) ------------ */
+
+/* Weighted 1-D scan of the 7-tap K2 window along X at a single row. Taps sit on the phase-locked
+ * grid x0..x0+6 with kernel weights inlined as literals: the OBS effect DSL does not support
+ * const arrays, and baking the static decimation weights directly keeps them compile-time fixed. */
+
+/* Ideal decimation kernel (1/2)*sinc(x/2), truncated to |x|<=3 and renormalized */
+float4 ScanX_K2Text(int x0, int y)
+{
+	float4 t = float4(0, 0, 0, 0);
+	t += image.Load(TapCoord(x0 + 0, y)) * -0.114778;
+	t += image.Load(TapCoord(x0 + 2, y)) * 0.344337;
+	t += image.Load(TapCoord(x0 + 3, y)) * 0.540886;
+	t += image.Load(TapCoord(x0 + 4, y)) * 0.344337;
+	t += image.Load(TapCoord(x0 + 6, y)) * -0.114778;
+	return t;
+}
+
+/* Windowed sinc with raised-cosine window (W=4), renormalized */
+float4 ScanX_K2Lanc(int x0, int y)
+{
+	float4 t = float4(0, 0, 0, 0);
+	t += image.Load(TapCoord(x0 + 0, y)) * -0.015348;
+	t += image.Load(TapCoord(x0 + 2, y)) * 0.268393;
+	t += image.Load(TapCoord(x0 + 3, y)) * 0.493894;
+	t += image.Load(TapCoord(x0 + 4, y)) * 0.268393;
+	t += image.Load(TapCoord(x0 + 6, y)) * -0.015348;
+	return t;
+}
+
+/* Area ÷2: a single hardware bilinear tap at the center of the 2x2 block is exactly
+ * the 2x2 box average, so one Sample replaces four point Loads (no intermediate pass). */
+float4 DrawK2Area(float2 pos)
+{
+	int i = (int)(floor(pos.x / 2.0));
+	int j = (int)(floor(pos.y / 2.0));
+	float2 uv = float2(2 * i + 1, 2 * j + 1) * base_dimension_i;
+	return image.Sample(textureSampler, uv);
+}
+
+float4 DrawK2Text(float2 pos)
+{
+	int sx = (int)(floor(pos.x / 2.0)) * 2 - 2;
+	int sy = (int)(floor(pos.y / 2.0)) * 2 - 2;
+
+	float4 total = float4(0, 0, 0, 0);
+	total += ScanX_K2Text(sx, sy + 0) * -0.114778;
+	total += ScanX_K2Text(sx, sy + 2) * 0.344337;
+	total += ScanX_K2Text(sx, sy + 3) * 0.540886;
+	total += ScanX_K2Text(sx, sy + 4) * 0.344337;
+	total += ScanX_K2Text(sx, sy + 6) * -0.114778;
+	return total;
+}
+
+float4 DrawK2Lanc(float2 pos)
+{
+	int sx = (int)(floor(pos.x / 2.0)) * 2 - 2;
+	int sy = (int)(floor(pos.y / 2.0)) * 2 - 2;
+
+	float4 total = float4(0, 0, 0, 0);
+	total += ScanX_K2Lanc(sx, sy + 0) * -0.015348;
+	total += ScanX_K2Lanc(sx, sy + 2) * 0.268393;
+	total += ScanX_K2Lanc(sx, sy + 3) * 0.493894;
+	total += ScanX_K2Lanc(sx, sy + 4) * 0.268393;
+	total += ScanX_K2Lanc(sx, sy + 6) * -0.015348;
+	return total;
+}
+/* ---------------- K3: fixed ÷3 decimation (output i covers source [c, c+3)) ------------ */
+
+/* Same literal-weight approach as K2; the 8-tap K3 window spans x0..x0+7. */
+
+/* Area: the three texels of [c, c+3) share equal weight (exact block average). */
+float4 ScanX_K3Area(int x0, int y)
+{
+	return image.Load(TapCoord(x0 + 2, y)) * (1.0 / 3.0) + image.Load(TapCoord(x0 + 3, y)) * (1.0 / 3.0) +
+	       image.Load(TapCoord(x0 + 4, y)) * (1.0 / 3.0);
+}
+
+/* Ideal decimation kernel (1/3)*sinc(x/3), truncated to |x|<=3.5 and renormalized */
+float4 ScanX_K3Text(int x0, int y)
+{
+	float4 t = float4(0, 0, 0, 0);
+	t += image.Load(TapCoord(x0 + 0, y)) * -0.041477;
+	t += image.Load(TapCoord(x0 + 1, y)) * 0.058011;
+	t += image.Load(TapCoord(x0 + 2, y)) * 0.193460;
+	t += image.Load(TapCoord(x0 + 3, y)) * 0.290059;
+	t += image.Load(TapCoord(x0 + 4, y)) * 0.290059;
+	t += image.Load(TapCoord(x0 + 5, y)) * 0.193460;
+	t += image.Load(TapCoord(x0 + 6, y)) * 0.058011;
+	t += image.Load(TapCoord(x0 + 7, y)) * -0.041477;
+	return t;
+}
+
+/* Windowed sinc with raised-cosine window (W=6), renormalized */
+float4 ScanX_K3Lanc(int x0, int y)
+{
+	float4 t = float4(0, 0, 0, 0);
+	t += image.Load(TapCoord(x0 + 0, y)) * -0.016246;
+	t += image.Load(TapCoord(x0 + 1, y)) * 0.038773;
+	t += image.Load(TapCoord(x0 + 2, y)) * 0.174683;
+	t += image.Load(TapCoord(x0 + 3, y)) * 0.302814;
+	t += image.Load(TapCoord(x0 + 4, y)) * 0.302814;
+	t += image.Load(TapCoord(x0 + 5, y)) * 0.174683;
+	t += image.Load(TapCoord(x0 + 6, y)) * 0.038773;
+	t += image.Load(TapCoord(x0 + 7, y)) * -0.016246;
+	return t;
+}
+
+float4 DrawK3Area(float2 pos)
+{
+	int sx = (int)(floor(pos.x / 3.0)) * 3 - 2;
+	int sy = (int)(floor(pos.y / 3.0)) * 3 - 2;
+
+	float4 total = float4(0, 0, 0, 0);
+	total += ScanX_K3Area(sx, sy + 2) * (1.0 / 3.0);
+	total += ScanX_K3Area(sx, sy + 3) * (1.0 / 3.0);
+	total += ScanX_K3Area(sx, sy + 4) * (1.0 / 3.0);
+	return total;
+}
+
+float4 DrawK3Text(float2 pos)
+{
+	int sx = (int)(floor(pos.x / 3.0)) * 3 - 2;
+	int sy = (int)(floor(pos.y / 3.0)) * 3 - 2;
+
+	float4 total = float4(0, 0, 0, 0);
+	total += ScanX_K3Text(sx, sy + 0) * -0.041477;
+	total += ScanX_K3Text(sx, sy + 1) * 0.058011;
+	total += ScanX_K3Text(sx, sy + 2) * 0.193460;
+	total += ScanX_K3Text(sx, sy + 3) * 0.290059;
+	total += ScanX_K3Text(sx, sy + 4) * 0.290059;
+	total += ScanX_K3Text(sx, sy + 5) * 0.193460;
+	total += ScanX_K3Text(sx, sy + 6) * 0.058011;
+	total += ScanX_K3Text(sx, sy + 7) * -0.041477;
+	return total;
+}
+
+float4 DrawK3Lanc(float2 pos)
+{
+	int sx = (int)(floor(pos.x / 3.0)) * 3 - 2;
+	int sy = (int)(floor(pos.y / 3.0)) * 3 - 2;
+
+	float4 total = float4(0, 0, 0, 0);
+	total += ScanX_K3Lanc(sx, sy + 0) * -0.016246;
+	total += ScanX_K3Lanc(sx, sy + 1) * 0.038773;
+	total += ScanX_K3Lanc(sx, sy + 2) * 0.174683;
+	total += ScanX_K3Lanc(sx, sy + 3) * 0.302814;
+	total += ScanX_K3Lanc(sx, sy + 4) * 0.302814;
+	total += ScanX_K3Lanc(sx, sy + 5) * 0.174683;
+	total += ScanX_K3Lanc(sx, sy + 6) * 0.038773;
+	total += ScanX_K3Lanc(sx, sy + 7) * -0.016246;
+	return total;
+}
+
+/* ---------------- single-pass bilinear area kernels --------------------------------- */
+/* An integer R x R area average tiles into (R/2)^2 non-overlapping 2x2 sub-blocks, and each
+ * sub-block is computed exactly by one hardware bilinear tap. This collapses the multi-pass
+ * Area pipeline into a single pass (no intermediate texture) for even ratios. The ÷3 case
+ * cannot tile this way and keeps the 9-tap K3Area kernel above. */
+
+/* Area ÷4: four bilinear taps (the four 2x2 quadrants of the 4x4 block). */
+float4 DrawK4AreaB(float2 pos)
+{
+	int i = (int)(floor(pos.x / 4.0));
+	int j = (int)(floor(pos.y / 4.0));
+	float2 p = base_dimension_i;
+	float4 total = image.Sample(textureSampler, float2(4 * i + 1, 4 * j + 1) * p);
+	total += image.Sample(textureSampler, float2(4 * i + 3, 4 * j + 1) * p);
+	total += image.Sample(textureSampler, float2(4 * i + 1, 4 * j + 3) * p);
+	total += image.Sample(textureSampler, float2(4 * i + 3, 4 * j + 3) * p);
+	return total * 0.25;
+}
+
+/* Area ÷6: nine bilinear taps (a 3x3 grid of 2x2 sub-blocks in the 6x6 block). */
+float4 DrawK6AreaB(float2 pos)
+{
+	int i = (int)(floor(pos.x / 6.0));
+	int j = (int)(floor(pos.y / 6.0));
+	float2 p = base_dimension_i;
+	float4 total = float4(0, 0, 0, 0);
+	total += image.Sample(textureSampler, float2(6 * i + 1, 6 * j + 1) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 3, 6 * j + 1) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 5, 6 * j + 1) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 1, 6 * j + 3) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 3, 6 * j + 3) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 5, 6 * j + 3) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 1, 6 * j + 5) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 3, 6 * j + 5) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 5, 6 * j + 5) * p);
+	return total * (1.0 / 9.0);
+}
+
+
+
+/* ---------------- pixel shader variants (color-space handling) ------------------------- */
+
+float4 PSDrawK2Area(FragData f_in) : TARGET
+{
+	return DrawK2Area(f_in.uv);
+}
+
+float4 PSDrawK2AreaMultiply(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK2Area(f_in.uv);
+	rgba.rgb *= multiplier;
+	return rgba;
+}
+
+float4 PSDrawK2AreaTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK2Area(f_in.uv);
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK2AreaMultiplyTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK2Area(f_in.uv);
+	rgba.rgb *= multiplier;
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK2Text(FragData f_in) : TARGET
+{
+	return DrawK2Text(f_in.uv);
+}
+
+float4 PSDrawK2TextMultiply(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK2Text(f_in.uv);
+	rgba.rgb *= multiplier;
+	return rgba;
+}
+
+float4 PSDrawK2TextTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK2Text(f_in.uv);
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK2TextMultiplyTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK2Text(f_in.uv);
+	rgba.rgb *= multiplier;
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK2Lanc(FragData f_in) : TARGET
+{
+	return DrawK2Lanc(f_in.uv);
+}
+
+float4 PSDrawK2LancMultiply(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK2Lanc(f_in.uv);
+	rgba.rgb *= multiplier;
+	return rgba;
+}
+
+float4 PSDrawK2LancTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK2Lanc(f_in.uv);
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK2LancMultiplyTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK2Lanc(f_in.uv);
+	rgba.rgb *= multiplier;
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+
+
+float4 PSDrawK3Area(FragData f_in) : TARGET
+{
+	return DrawK3Area(f_in.uv);
+}
+
+float4 PSDrawK3AreaMultiply(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK3Area(f_in.uv);
+	rgba.rgb *= multiplier;
+	return rgba;
+}
+
+float4 PSDrawK3AreaTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK3Area(f_in.uv);
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK3AreaMultiplyTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK3Area(f_in.uv);
+	rgba.rgb *= multiplier;
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK3Text(FragData f_in) : TARGET
+{
+	return DrawK3Text(f_in.uv);
+}
+
+float4 PSDrawK3TextMultiply(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK3Text(f_in.uv);
+	rgba.rgb *= multiplier;
+	return rgba;
+}
+
+float4 PSDrawK3TextTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK3Text(f_in.uv);
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK3TextMultiplyTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK3Text(f_in.uv);
+	rgba.rgb *= multiplier;
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK3Lanc(FragData f_in) : TARGET
+{
+	return DrawK3Lanc(f_in.uv);
+}
+
+float4 PSDrawK3LancMultiply(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK3Lanc(f_in.uv);
+	rgba.rgb *= multiplier;
+	return rgba;
+}
+
+float4 PSDrawK3LancTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK3Lanc(f_in.uv);
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK3LancMultiplyTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK3Lanc(f_in.uv);
+	rgba.rgb *= multiplier;
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+
+/* ---------------- techniques ----------------------------------------------------------- */
+
+technique K2Area { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2Area(f_in); } }
+technique K2AreaMultiply { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2AreaMultiply(f_in); } }
+technique K2AreaTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2AreaTonemap(f_in); } }
+technique K2AreaMultiplyTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2AreaMultiplyTonemap(f_in); } }
+
+technique K2Text { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2Text(f_in); } }
+technique K2TextMultiply { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2TextMultiply(f_in); } }
+technique K2TextTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2TextTonemap(f_in); } }
+technique K2TextMultiplyTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2TextMultiplyTonemap(f_in); } }
+
+technique K2Lanc { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2Lanc(f_in); } }
+technique K2LancMultiply { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2LancMultiply(f_in); } }
+technique K2LancTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2LancTonemap(f_in); } }
+technique K2LancMultiplyTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK2LancMultiplyTonemap(f_in); } }
+
+technique K3Area { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3Area(f_in); } }
+technique K3AreaMultiply { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3AreaMultiply(f_in); } }
+technique K3AreaTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3AreaTonemap(f_in); } }
+technique K3AreaMultiplyTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3AreaMultiplyTonemap(f_in); } }
+
+technique K3Text { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3Text(f_in); } }
+technique K3TextMultiply { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3TextMultiply(f_in); } }
+technique K3TextTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3TextTonemap(f_in); } }
+technique K3TextMultiplyTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3TextMultiplyTonemap(f_in); } }
+
+technique K3Lanc { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3Lanc(f_in); } }
+technique K3LancMultiply { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3LancMultiply(f_in); } }
+technique K3LancTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3LancTonemap(f_in); } }
+technique K3LancMultiplyTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK3LancMultiplyTonemap(f_in); } }
+
+/* ---------------- single-pass bilinear area variants ---------------------------------- */
+
+float4 PSDrawK4AreaBFrag(FragData f_in) : TARGET
+{
+	return DrawK4AreaB(f_in.uv);
+}
+
+float4 PSDrawK4AreaBMultiply(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK4AreaB(f_in.uv);
+	rgba.rgb *= multiplier;
+	return rgba;
+}
+
+float4 PSDrawK4AreaBTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK4AreaB(f_in.uv);
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK4AreaBMultiplyTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK4AreaB(f_in.uv);
+	rgba.rgb *= multiplier;
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK6AreaBFrag(FragData f_in) : TARGET
+{
+	return DrawK6AreaB(f_in.uv);
+}
+
+float4 PSDrawK6AreaBMultiply(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK6AreaB(f_in.uv);
+	rgba.rgb *= multiplier;
+	return rgba;
+}
+
+float4 PSDrawK6AreaBTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK6AreaB(f_in.uv);
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawK6AreaBMultiplyTonemap(FragData f_in) : TARGET
+{
+	float4 rgba = DrawK6AreaB(f_in.uv);
+	rgba.rgb *= multiplier;
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+technique K4BArea { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK4AreaBFrag(f_in); } }
+technique K4BAreaMultiply { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK4AreaBMultiply(f_in); } }
+technique K4BAreaTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK4AreaBTonemap(f_in); } }
+technique K4BAreaMultiplyTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK4AreaBMultiplyTonemap(f_in); } }
+
+technique K6BArea { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK6AreaBFrag(f_in); } }
+technique K6BAreaMultiply { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK6AreaBMultiply(f_in); } }
+technique K6BAreaTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK6AreaBTonemap(f_in); } }
+technique K6BAreaMultiplyTonemap { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSDrawK6AreaBMultiplyTonemap(f_in); } }
+

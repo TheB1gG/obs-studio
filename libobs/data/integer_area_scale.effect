@@ -1,0 +1,211 @@
+/*
+ * Integer-ratio Area downscale (exact box averaging for fixed ratios 2/3/4/6).
+ *
+ * Output pixel i covers exactly the source texels [i*R, i*R + R), so an exact
+ * box average is well defined. For even R the R x R block tiles into
+ * (R/2)^2 non-overlapping 2x2 sub-blocks and each 2x2 average equals one
+ * hardware bilinear tap at the sub-block center, so the whole box average is
+ * a small fixed set of Sample() calls in a single pass:
+ *   R=2: 1 tap, R=4: 4 taps, R=6: 9 taps.
+ * The R=3 case cannot tile this way and uses nine point Loads (equal weights).
+ *
+ * The ratio is derived from base_dimension and the per-pixel uv step, so the
+ * effect works with the standard core draw path (sprite over the full output)
+ * without extra uniforms. If the ratio is not an exact 2/3/4/6 downscale the
+ * shader falls back to a single bilinear sample; the C side (obs-video.c)
+ * prefers the standard area effect in that case.
+ */
+
+#include "color.effect"
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float2 base_dimension;
+uniform float2 base_dimension_i;
+uniform float multiplier;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+struct VertOut {
+	float2 uv  : TEXCOORD0;
+	float4 pos : POSITION;
+};
+
+struct FragData {
+	float2 uv : TEXCOORD0;
+};
+
+VertOut VSDefault(VertData v_in)
+{
+	VertOut vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+/* Area ÷2: the output pixel center sits exactly on the center of its 2x2
+ * source block, so one bilinear sample is the exact box average. */
+float4 DrawK2Area(float2 uv)
+{
+	return image.Sample(textureSampler, uv);
+}
+
+/* Area ÷3: nine point loads over the 3x3 block with equal weights. For an
+ * exact integer downscale every tap is inside the texture (no clamping). */
+float4 DrawK3Area(float2 pos)
+{
+	int i = (int)(floor(pos.x / 3.0));
+	int j = (int)(floor(pos.y / 3.0));
+
+	float4 total = float4(0, 0, 0, 0);
+	total += image.Load(int3(3 * i + 0, 3 * j + 0, 0));
+	total += image.Load(int3(3 * i + 1, 3 * j + 0, 0));
+	total += image.Load(int3(3 * i + 2, 3 * j + 0, 0));
+	total += image.Load(int3(3 * i + 0, 3 * j + 1, 0));
+	total += image.Load(int3(3 * i + 1, 3 * j + 1, 0));
+	total += image.Load(int3(3 * i + 2, 3 * j + 1, 0));
+	total += image.Load(int3(3 * i + 0, 3 * j + 2, 0));
+	total += image.Load(int3(3 * i + 1, 3 * j + 2, 0));
+	total += image.Load(int3(3 * i + 2, 3 * j + 2, 0));
+	return total * (1.0 / 9.0);
+}
+
+/* Area ÷4: four bilinear taps (the four 2x2 quadrants of the 4x4 block). */
+float4 DrawK4AreaB(float2 pos)
+{
+	int i = (int)(floor(pos.x / 4.0));
+	int j = (int)(floor(pos.y / 4.0));
+	float2 p = base_dimension_i;
+
+	float4 total = image.Sample(textureSampler, float2(4 * i + 1, 4 * j + 1) * p);
+	total += image.Sample(textureSampler, float2(4 * i + 3, 4 * j + 1) * p);
+	total += image.Sample(textureSampler, float2(4 * i + 1, 4 * j + 3) * p);
+	total += image.Sample(textureSampler, float2(4 * i + 3, 4 * j + 3) * p);
+	return total * 0.25;
+}
+
+/* Area ÷6: nine bilinear taps (a 3x3 grid of 2x2 sub-blocks in the 6x6 block). */
+float4 DrawK6AreaB(float2 pos)
+{
+	int i = (int)(floor(pos.x / 6.0));
+	int j = (int)(floor(pos.y / 6.0));
+	float2 p = base_dimension_i;
+
+	float4 total = float4(0, 0, 0, 0);
+	total += image.Sample(textureSampler, float2(6 * i + 1, 6 * j + 1) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 3, 6 * j + 1) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 5, 6 * j + 1) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 1, 6 * j + 3) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 3, 6 * j + 3) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 5, 6 * j + 3) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 1, 6 * j + 5) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 3, 6 * j + 5) * p);
+	total += image.Sample(textureSampler, float2(6 * i + 5, 6 * j + 5) * p);
+	return total * (1.0 / 9.0);
+}
+
+float4 DrawIntegerArea(FragData frag_in)
+{
+	float2 uv = frag_in.uv;
+	float2 uv_delta = float2(ddx(uv.x), ddy(uv.y));
+
+	// Handle potential OpenGL flip.
+	if (obs_glsl_compile)
+		uv_delta.y = abs(uv_delta.y);
+
+	float2 pos = uv * base_dimension; /* pixel center in source texel units */
+	float2 ratio = base_dimension * uv_delta; /* source texels per output pixel */
+	int r = (int)round(ratio.x);
+
+	/* Only exact integer 2/3/4/6 downscale is supported; anything else falls
+	 * back to a plain bilinear sample. */
+	if (abs(ratio.x - (float)r) > 0.01 || abs(ratio.y - (float)r) > 0.01)
+		return image.Sample(textureSampler, uv);
+
+	if (r == 2)
+		return DrawK2Area(uv);
+	else if (r == 3)
+		return DrawK3Area(pos);
+	else if (r == 4)
+		return DrawK4AreaB(pos);
+	else if (r == 6)
+		return DrawK6AreaB(pos);
+
+	return image.Sample(textureSampler, uv);
+}
+
+float4 PSDrawIntegerAreaRGBA(FragData frag_in) : TARGET
+{
+	return DrawIntegerArea(frag_in);
+}
+
+float4 PSDrawIntegerAreaRGBAMultiply(FragData frag_in) : TARGET
+{
+	float4 rgba = DrawIntegerArea(frag_in);
+	rgba.rgb *= multiplier;
+	return rgba;
+}
+
+float4 PSDrawIntegerAreaRGBATonemap(FragData frag_in) : TARGET
+{
+	float4 rgba = DrawIntegerArea(frag_in);
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+float4 PSDrawIntegerAreaRGBAMultiplyTonemap(FragData frag_in) : TARGET
+{
+	float4 rgba = DrawIntegerArea(frag_in);
+	rgba.rgb *= multiplier;
+	rgba.rgb = rec709_to_rec2020(rgba.rgb);
+	rgba.rgb = reinhard(rgba.rgb);
+	rgba.rgb = rec2020_to_rec709(rgba.rgb);
+	return rgba;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDrawIntegerAreaRGBA(frag_in);
+	}
+}
+
+technique DrawMultiply
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDrawIntegerAreaRGBAMultiply(frag_in);
+	}
+}
+
+technique DrawTonemap
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDrawIntegerAreaRGBATonemap(frag_in);
+	}
+}
+
+technique DrawMultiplyTonemap
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDrawIntegerAreaRGBAMultiplyTonemap(frag_in);
+	}
+}

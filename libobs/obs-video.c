@@ -227,6 +227,8 @@ static inline gs_effect_t *get_scale_effect_internal(struct obs_core_video_mix *
 		return video->area_effect;
 	case OBS_SCALE_BILINEAR_LOWRES:
 		return video->bilinear_lowres_effect;
+	case OBS_SCALE_INTEGER_AREA:
+		return video->integer_area_effect;
 	case OBS_SCALE_BICUBIC:
 	case OBS_SCALE_BLERP:
 	default:;
@@ -258,6 +260,21 @@ static inline gs_effect_t *get_scale_effect(struct obs_core_video_mix *mix, uint
 		return effect;
 	}
 }
+/* Integer Area only has exact kernels for whole 2/3/4/6 downscale ratios. */
+static inline bool integer_area_ratio_valid(uint32_t base_w, uint32_t base_h, uint32_t out_w, uint32_t out_h)
+{
+	uint32_t r;
+
+	if (out_w == 0 || out_h == 0)
+		return false;
+	if (base_w % out_w != 0 || base_h % out_h != 0)
+		return false;
+	r = base_w / out_w;
+	if (r != base_h / out_h)
+		return false;
+	return r == 2 || r == 3 || r == 4 || r == 6;
+}
+
 
 static const char *render_output_texture_name = "render_output_texture";
 static inline gs_texture_t *render_output_texture(struct obs_core_video_mix *mix)
@@ -274,6 +291,13 @@ static inline gs_texture_t *render_output_texture(struct obs_core_video_mix *mix
 
 	gs_effect_t *effect = get_scale_effect(mix, width, height);
 	gs_technique_t *tech = gs_effect_get_technique(effect, "Draw");
+
+	if (mix->ovi.scale_type == OBS_SCALE_INTEGER_AREA &&
+	    !integer_area_ratio_valid(ovi->base_width, ovi->base_height, width, height)) {
+		/* Not an exact 2/3/4/6 downscale: fall back to the standard area scaler. */
+		if (obs->video.area_effect)
+			effect = obs->video.area_effect;
+	}
 
 	gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
 	gs_eparam_t *bres = gs_effect_get_param_by_name(effect, "base_dimension");

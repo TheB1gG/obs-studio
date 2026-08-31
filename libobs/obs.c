@@ -688,6 +688,10 @@ static int obs_init_graphics(struct obs_video_info *ovi)
 	video->bilinear_lowres_effect = gs_effect_create_from_file(filename, NULL);
 	bfree(filename);
 
+	filename = obs_find_data_file("integer_area_scale.effect");
+	video->integer_area_effect = gs_effect_create_from_file(filename, NULL);
+	bfree(filename);
+
 	filename = obs_find_data_file("premultiplied_alpha.effect");
 	video->premultiplied_alpha_effect = gs_effect_create_from_file(filename, NULL);
 	bfree(filename);
@@ -1013,6 +1017,7 @@ static void obs_free_graphics(void)
 		gs_effect_destroy(video->lanczos_effect);
 		gs_effect_destroy(video->area_effect);
 		gs_effect_destroy(video->bilinear_lowres_effect);
+		gs_effect_destroy(video->integer_area_effect);
 		video->default_effect = NULL;
 
 		gs_leave_context();
@@ -1641,6 +1646,8 @@ const char *get_scale_type_name(enum obs_scale_type type)
 		return "Blerp"; // or "Bicubic with interpolation" to match UI text
 	case OBS_SCALE_BILINEAR_LOWRES:
 		return "Bilinear Low Quality";
+	case OBS_SCALE_INTEGER_AREA:
+		return "Integer Area";
 	}
 
 	return "Unknown";
@@ -2254,6 +2261,8 @@ gs_effect_t *obs_get_base_effect(enum obs_base_effect effect)
 		return obs->video.area_effect;
 	case OBS_EFFECT_BILINEAR_LOWRES:
 		return obs->video.bilinear_lowres_effect;
+	case OBS_EFFECT_INTEGER_AREA:
+		return obs->video.integer_area_effect;
 	case OBS_EFFECT_PREMULTIPLIED_ALPHA:
 		return obs->video.premultiplied_alpha_effect;
 	}

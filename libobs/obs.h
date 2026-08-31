@@ -128,6 +128,7 @@ enum obs_scale_type {
 	OBS_SCALE_AREA,
 	OBS_SCALE_BLERP,
 	OBS_SCALE_BILINEAR_LOWRES,
+	OBS_SCALE_INTEGER_AREA,
 };
 
 enum obs_blending_method {
@@ -745,6 +746,7 @@ enum obs_base_effect {
 	OBS_EFFECT_PREMULTIPLIED_ALPHA, /**< Premultiplied alpha */
 	OBS_EFFECT_REPEAT,              /**< RGB/YUV (repeating) */
 	OBS_EFFECT_AREA,                /**< Area rescale */
+	OBS_EFFECT_INTEGER_AREA,        /**< Integer-ratio area downscale (2/3/4/6) */
 };
 
 /** Returns a commonly used base effect */
