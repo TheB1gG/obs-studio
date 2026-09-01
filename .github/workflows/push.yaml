@@ -136,22 +136,11 @@ jobs:
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           command: pages publish . --project-name=${{ vars.CF_PAGES_PROJECT }} --commit-hash='${{ steps.setup.outputs.commitHash }}'
 
-  sign-windows-build:
-    name: Windows Signing ✍️
-    uses: obsproject/obs-studio/.github/workflows/sign-windows.yaml@ac19ea663375cd02997be92b7d8ff6dd89a511ad
-    if: github.repository_owner == 'obsproject' && github.ref_type == 'tag'
-    needs: build-project
-    permissions:
-      contents: 'read'
-      id-token: 'write'
-      attestations: 'write'
-    secrets: inherit
-
   create-release:
     name: Create Release 🛫
     if: github.ref_type == 'tag'
     runs-on: ubuntu-26.04
-    needs: [build-project, sign-windows-build]
+    needs: build-project
     defaults:
       run:
         shell: bash
