@@ -574,6 +574,66 @@ void log_changed_settings_fields(const char *kind, size_t index, const nlohmann:
 
 } // namespace
 
+static const char *scale_type_to_string(enum obs_scale_type type)
+{
+	switch (type) {
+	case OBS_SCALE_DISABLE:
+		return "OBS_SCALE_DISABLE";
+	case OBS_SCALE_POINT:
+		return "OBS_SCALE_POINT";
+	case OBS_SCALE_BICUBIC:
+		return "OBS_SCALE_BICUBIC";
+	case OBS_SCALE_BILINEAR:
+		return "OBS_SCALE_BILINEAR";
+	case OBS_SCALE_LANCZOS:
+		return "OBS_SCALE_LANCZOS";
+	case OBS_SCALE_AREA:
+		return "OBS_SCALE_AREA";
+	case OBS_SCALE_BLERP:
+		return "OBS_SCALE_BLERP";
+	case OBS_SCALE_BILINEAR_LOWRES:
+		return "OBS_SCALE_BILINEAR_LOWRES";
+	case OBS_SCALE_INTEGER_AREA:
+		return "OBS_SCALE_INTEGER_AREA";
+	}
+
+	return "unknown";
+}
+
+static const char *colorspace_to_string(enum video_colorspace space)
+{
+	switch (space) {
+	case VIDEO_CS_DEFAULT:
+		return "VIDEO_CS_DEFAULT";
+	case VIDEO_CS_601:
+		return "VIDEO_CS_601";
+	case VIDEO_CS_709:
+		return "VIDEO_CS_709";
+	case VIDEO_CS_SRGB:
+		return "VIDEO_CS_SRGB";
+	case VIDEO_CS_2100_PQ:
+		return "VIDEO_CS_2100_PQ";
+	case VIDEO_CS_2100_HLG:
+		return "VIDEO_CS_2100_HLG";
+	}
+
+	return "unknown";
+}
+
+static const char *range_to_string(enum video_range_type range)
+{
+	switch (range) {
+	case VIDEO_RANGE_DEFAULT:
+		return "VIDEO_RANGE_DEFAULT";
+	case VIDEO_RANGE_PARTIAL:
+		return "VIDEO_RANGE_PARTIAL";
+	case VIDEO_RANGE_FULL:
+		return "VIDEO_RANGE_FULL";
+	}
+
+	return "unknown";
+}
+
 bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config_json, std::string *failure_reason)
 {
 	auto fail = [&](const char *reason) {
@@ -674,27 +734,75 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 		    old_encoder_config.range != new_encoder_config.range ||
 		    old_encoder_config.format != new_encoder_config.format;
 
+		const bool is_nvenc = strstr(new_encoder_config.type.c_str(), "nvenc") != nullptr;
+		const bool resolution_changed = old_encoder_config.width != new_encoder_config.width ||
+		    old_encoder_config.height != new_encoder_config.height;
+		const bool scale_type_changed = old_encoder_config.gpu_scale_type != new_encoder_config.gpu_scale_type;
+		const bool colorspace_changed = old_encoder_config.colorspace != new_encoder_config.colorspace;
+		const bool range_changed = old_encoder_config.range != new_encoder_config.range;
+		const bool format_changed = old_encoder_config.format != new_encoder_config.format;
+
 		obs_encoder_t *encoder = obs_output_get_video_encoder2(objects.output_, i);
 		if (!encoder) {
 			blog(LOG_ERROR, "MultitrackVideoOutput: failed to get video encoder %zu for live update", i);
 			continue;
 		}
 
-		const bool resolution_changed = old_encoder_config.width != new_encoder_config.width ||
-		    old_encoder_config.height != new_encoder_config.height;
+		if (is_nvenc) {
+			// NVENC applies scale type and resolution changes live: the libobs setter re-points the
+			// GPU rescale mix right away (see live_rebind_encoder_mix in obs-encoder.c), and obs-nvenc
+			// detects input size changes on its encode side, resizing the driver session in place. The
+			// forced keyframe realignment happens at the next shared GOP boundary so the multitrack
+			// tracks stay keyframe-aligned (see nvenc_maybe_resize).
+			// Colorspace/range/format changes stay deferred until a stream restart: live rebinding does
+			// not update the NVENC session's color parameters mid-stream, so the encoded output would not
+			// reflect them reliably.
 
-		if (resolution_changed && strstr(new_encoder_config.type.c_str(), "nvenc")) {
-			// NVENC supports live session resizing: libobs re-points the GPU rescale mix right away and
-			// obs-nvenc detects the new input size on its encode side, resizing the driver session in
-			// place. The forced keyframe realignment happens at the next shared GOP boundary so the
-			// multitrack tracks stay keyframe-aligned (see nvenc_maybe_resize).
-			char line[160];
-			snprintf(line, sizeof(line), "video encoder %zu resolution %" PRIu32 "x%" PRIu32 " -> %" PRIu32
-			             "x%" PRIu32,
-			         i, old_encoder_config.width, old_encoder_config.height, new_encoder_config.width,
-			         new_encoder_config.height);
-			blog(LOG_INFO, "MultitrackVideoOutput: applied live:%s (NVENC resizes at the next frame)", line);
-			obs_encoder_set_scaled_size(encoder, new_encoder_config.width, new_encoder_config.height);
+			if (scale_type_changed && new_encoder_config.gpu_scale_type.has_value()) {
+				char line[160];
+				snprintf(line, sizeof(line), "video encoder %zu gpu_scale_type -> %s", i,
+					 scale_type_to_string(*new_encoder_config.gpu_scale_type));
+				blog(LOG_INFO, "MultitrackVideoOutput: applied live:%s", line);
+				obs_encoder_set_gpu_scale_type(encoder, *new_encoder_config.gpu_scale_type);
+			}
+
+			if (colorspace_changed) {
+				char line[160];
+				snprintf(line, sizeof(line), "video encoder %zu colorspace (%s -> %s)", i,
+					 colorspace_to_string(obs_encoder_get_preferred_color_space(encoder)),
+					 new_encoder_config.colorspace.has_value() ? colorspace_to_string(*new_encoder_config.colorspace)
+					                                                      : "default");
+				blog(LOG_WARNING,
+				     "MultitrackVideoOutput: deferred change (%s) - applies when streaming restarts", line);
+			}
+
+			if (range_changed) {
+				char line[160];
+				snprintf(line, sizeof(line), "video encoder %zu range (%s -> %s)", i,
+					 range_to_string(obs_encoder_get_preferred_range(encoder)),
+					 new_encoder_config.range.has_value() ? range_to_string(*new_encoder_config.range) : "default");
+				blog(LOG_WARNING,
+				     "MultitrackVideoOutput: deferred change (%s) - applies when streaming restarts", line);
+			}
+
+			if (format_changed) {
+				char line[160];
+				snprintf(line, sizeof(line), "video encoder %zu format (%s -> %s)", i,
+					 get_video_format_name(obs_encoder_get_preferred_video_format(encoder)),
+					 new_encoder_config.format.has_value() ? get_video_format_name(*new_encoder_config.format) : "default");
+				blog(LOG_WARNING,
+				     "MultitrackVideoOutput: deferred change (%s) - applies when streaming restarts", line);
+			}
+
+			if (resolution_changed) {
+				char line[160];
+				snprintf(line, sizeof(line), "video encoder %zu resolution %" PRIu32 "x%" PRIu32 " -> %" PRIu32
+				             "x%" PRIu32,
+				         i, old_encoder_config.width, old_encoder_config.height, new_encoder_config.width,
+				         new_encoder_config.height);
+				blog(LOG_INFO, "MultitrackVideoOutput: applied live:%s (NVENC resizes at the next frame)", line);
+				obs_encoder_set_scaled_size(encoder, new_encoder_config.width, new_encoder_config.height);
+			}
 		} else if (structural_video_change) {
 			char line[160];
 			snprintf(line, sizeof(line), "video encoder %zu resolution/scale/color settings", i);

@@ -924,6 +924,66 @@ uint32_t obs_encoder_get_encoded_frames(const obs_encoder_t *encoder)
 	return obs_encoder_valid(encoder, "obs_output_get_encoded_frames") ? encoder->encoded_frames : 0;
 }
 
+/**
+ * Live-rebind an active encoder to the scaling/conversion mix that matches its
+ * current scale type, scaled size and preferred format/colorspace/range.
+ *
+ * Generalized from the live-resize path in obs_encoder_set_scaled_size(): it
+ * detaches the encoder from its current frame delivery source, (re)acquires
+ * the encoder-only mix for the new settings, re-subscribes delivery and retires
+ * the old mix. The relevant encoder fields must already hold the new values
+ * when this is called. If the new settings map to the same mix nothing is done;
+ * if no mix can be acquired it returns false and the delivery is left untouched,
+ * so the caller can roll the settings back.
+ */
+static bool live_rebind_encoder_mix(struct obs_encoder *encoder)
+{
+	const bool tex_path = gpu_encode_available(encoder); // evaluated against the current source
+	struct obs_core_video_mix *old_mix = get_mix_for_video(encoder->media);
+
+	struct obs_core_video_mix *new_mix = acquire_encoder_only_mix(encoder);
+	if (new_mix == old_mix)
+		return true; // delivery already matches the new settings
+
+	if (!new_mix) {
+		blog(LOG_WARNING, "Encoder '%s': live rebind could not be set up, keeping previous delivery",
+		     obs_encoder_get_name(encoder));
+		return false;
+	}
+
+	/* Detach this encoder from its current frame delivery source. */
+	if (tex_path) {
+		stop_gpu_encode(encoder);
+	} else if (encoder->media) {
+		stop_raw_video(encoder->media, receive_video, encoder);
+	}
+
+	/* Re-point the encoder at the new mix and re-subscribe its delivery. */
+	encoder_set_video(encoder, new_mix->video);
+
+	struct video_scale_info info = {0};
+	get_video_info(encoder, &info);
+
+	if (tex_path) {
+		start_gpu_encode(encoder);
+	} else {
+		start_raw_video(new_mix->video, &info, encoder->frame_rate_divisor, receive_video, encoder);
+	}
+
+	/* Retire the previous encoder-only mix if we orphaned it. A NULL view marks the mix for
+	 * reclamation by the graphics thread on its next tick. */
+	if (old_mix && old_mix->encoder_only_mix) {
+		old_mix->encoder_refs -= 1;
+		if (old_mix->encoder_refs <= 0) {
+			pthread_mutex_lock(&obs->video.mixes_mutex);
+			old_mix->view = NULL;
+			pthread_mutex_unlock(&obs->video.mixes_mutex);
+		}
+	}
+
+	return true;
+}
+
 void obs_encoder_set_scaled_size(obs_encoder_t *encoder, uint32_t width, uint32_t height)
 {
 	if (!obs_encoder_valid(encoder, "obs_encoder_set_scaled_size"))
@@ -951,58 +1011,14 @@ void obs_encoder_set_scaled_size(obs_encoder_t *encoder, uint32_t width, uint32_
 		const uint32_t prev_width = encoder->scaled_width;
 		const uint32_t prev_height = encoder->scaled_height;
 
-		struct obs_core_video_mix *old_mix = get_mix_for_video(encoder->media);
-		video_t *old_media = encoder->media;
-		const bool tex_path = gpu_encode_available(encoder); // evaluated against the current source
-
 		encoder->scaled_width = width;
 		encoder->scaled_height = height;
 
-		/* Detach this encoder from its current frame delivery source. */
-		if (tex_path) {
-			stop_gpu_encode(encoder);
-		} else if (old_media) {
-			stop_raw_video(old_media, receive_video, encoder);
-		}
-
-		struct obs_core_video_mix *new_mix = acquire_encoder_only_mix(encoder);
-		if (!new_mix) {
+		if (!live_rebind_encoder_mix(encoder)) {
 			blog(LOG_WARNING, "obs_encoder_set_scaled_size: live rescale for '%s' could not be set up, reverting",
 			     obs_encoder_get_name(encoder));
 			encoder->scaled_width = prev_width;
 			encoder->scaled_height = prev_height;
-
-			if (tex_path) {
-				start_gpu_encode(encoder);
-			} else if (old_media) {
-				struct video_scale_info info = {0};
-				get_video_info(encoder, &info);
-				start_raw_video(old_media, &info, encoder->frame_rate_divisor, receive_video, encoder);
-			}
-			return;
-		}
-
-		/* Re-point the encoder at the new-size mix and re-subscribe its delivery. */
-		encoder_set_video(encoder, new_mix->video);
-
-		struct video_scale_info info = {0};
-		get_video_info(encoder, &info);
-
-		if (tex_path) {
-			start_gpu_encode(encoder);
-		} else {
-			start_raw_video(new_mix->video, &info, encoder->frame_rate_divisor, receive_video, encoder);
-		}
-
-		/* Retire the previous encoder-only mix if we orphaned it. A NULL view marks the mix for
-		 * reclamation by the graphics thread on its next tick. */
-		if (old_mix && old_mix->encoder_only_mix) {
-			old_mix->encoder_refs -= 1;
-			if (old_mix->encoder_refs <= 0) {
-				pthread_mutex_lock(&obs->video.mixes_mutex);
-				old_mix->view = NULL;
-				pthread_mutex_unlock(&obs->video.mixes_mutex);
-			}
 		}
 
 		return;
@@ -1043,22 +1059,17 @@ void obs_encoder_set_gpu_scale_type(obs_encoder_t *encoder, enum obs_scale_type 
 		     obs_encoder_get_name(encoder));
 		return;
 	}
-	if (encoder_active(encoder)) {
-		blog(LOG_WARNING,
-		     "encoder '%s': Cannot enable GPU scaling "
-		     "while the encoder is active",
-		     obs_encoder_get_name(encoder));
-		return;
-	}
-	if (encoder->initialized) {
-		blog(LOG_WARNING,
-		     "encoder '%s': Cannot enable GPU scaling "
-		     "after the encoder has been initialized",
-		     obs_encoder_get_name(encoder));
-		return;
-	}
 
+	const enum obs_scale_type prev = encoder->gpu_scale_type;
 	encoder->gpu_scale_type = gpu_scale_type;
+
+	if (encoder_active(encoder)) {
+		/* Live scale-type change while streaming (multitrack override): re-point the
+		 * encoder at a mix that renders with the new scaler. On failure roll back so
+		 * settings and delivery stay in sync until the stream restarts. */
+		if (!live_rebind_encoder_mix(encoder))
+			encoder->gpu_scale_type = prev;
+	}
 }
 
 bool obs_encoder_set_frame_rate_divisor(obs_encoder_t *encoder, uint32_t frame_rate_divisor)
