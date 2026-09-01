@@ -1369,6 +1369,10 @@ struct obs_encoder {
 	/* stores the video/audio media output pointer.  video_t *or audio_t **/
 	void *media;
 
+	/* original video source set via obs_encoder_set_video(); frame delivery may be
+	 * re-pointed at an encoder-only mix for scaling/conversion (see obs-encoder.c) */
+	video_t *source_video;
+
 	pthread_mutex_t callbacks_mutex;
 	DARRAY(struct encoder_callback) callbacks;
 
