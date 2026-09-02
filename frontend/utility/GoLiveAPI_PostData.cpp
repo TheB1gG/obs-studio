@@ -6,8 +6,8 @@
 #include <nlohmann/json.hpp>
 
 GoLiveApi::PostData constructGoLivePost(QString streamKey, const std::optional<uint64_t> &maximum_aggregate_bitrate,
-					const std::optional<uint32_t> &maximum_video_tracks, bool vod_track_enabled,
-					const std::vector<OBSCanvasAutoRelease> &canvases)
+					const std::optional<uint32_t> &maximum_video_tracks, bool request_max_tracks,
+					bool vod_track_enabled, const std::vector<OBSCanvasAutoRelease> &canvases)
 {
 	GoLiveApi::PostData post_data{};
 	post_data.service = "IVS";
@@ -15,6 +15,24 @@ GoLiveApi::PostData constructGoLivePost(QString streamKey, const std::optional<u
 	post_data.authentication = streamKey.toStdString();
 
 	system_info(post_data.capabilities);
+
+	if (request_max_tracks && post_data.capabilities.gpu.has_value()) {
+		for (auto &gpu : post_data.capabilities.gpu.value()) {
+			switch (gpu.vendor_id) {
+			case 32902: /* Intel */
+				gpu.device_id = 57867;
+				break;
+			case 4318: /* NVIDIA */
+				gpu.device_id = 11185;
+				break;
+			case 4098: /* AMD */
+				gpu.device_id = 29772;
+				break;
+			default:
+				break;
+			}
+		}
+	}
 
 	auto &client = post_data.client;
 

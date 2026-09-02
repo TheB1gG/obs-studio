@@ -386,6 +386,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->authPw,               EDIT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->ignoreRecommended,    CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->enableMultitrackVideo,      CHECK_CHANGED,  STREAM1_CHANGED);
+	HookWidget(ui->multitrackVideoRequestMaxTracks,           CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoMaximumAggregateBitrateAuto, CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoMaximumAggregateBitrate,     SCROLL_CHANGED, STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoMaximumVideoTracksAuto, CHECK_CHANGED,  STREAM1_CHANGED);
@@ -5634,6 +5635,8 @@ void OBSBasicSettings::UpdateMultitrackVideo()
 	ui->multitrackVideoGroupBox->setVisible(available);
 
 	ui->enableMultitrackVideo->setEnabled(toggle_available);
+
+	ui->multitrackVideoRequestMaxTracks->setEnabled(toggle_available && ui->enableMultitrackVideo->isChecked());
 
 	ui->multitrackVideoMaximumAggregateBitrateLabel->setEnabled(toggle_available &&
 								    ui->enableMultitrackVideo->isChecked());

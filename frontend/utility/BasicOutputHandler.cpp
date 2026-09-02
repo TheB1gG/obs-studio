@@ -499,6 +499,11 @@ std::shared_future<void> BasicOutputHandler::SetupMultitrackVideo(obs_service_t 
 					    : std::make_optional<uint32_t>(config_get_int(
 						      main->Config(), "Stream1", "MultitrackVideoMaximumVideoTracks"));
 
+	auto request_max_tracks = config_get_bool(main->Config(), "Stream1", "MultitrackVideoRequestMaxTracks");
+
+	if (request_max_tracks)
+		maximum_video_tracks = MAX_OUTPUT_VIDEO_ENCODERS;
+
 	auto stream_dump_config = GenerateMultitrackVideoStreamDumpConfig();
 
 	auto continue_on_main_thread = [&, start_streaming_guard, service = OBSService{service},
@@ -537,7 +542,7 @@ std::shared_future<void> BasicOutputHandler::SetupMultitrackVideo(obs_service_t 
 		try {
 			multitrackVideo->PrepareStreaming(main, service_name.c_str(), service, custom_rtmp_url, key,
 							  audio_encoder_id.c_str(), maximum_aggregate_bitrate,
-							  maximum_video_tracks, custom_config, stream_dump_config,
+						maximum_video_tracks, request_max_tracks, custom_config, stream_dump_config,
 							  main_audio_mixer, vod_track_mixer, use_rtmps,
 							  extraCanvasUUID);
 		} catch (const MultitrackVideoError &error_) {

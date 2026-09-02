@@ -336,7 +336,7 @@ static void SetupSignalHandlers(bool recording, MultitrackVideoOutput *self, obs
 void MultitrackVideoOutput::PrepareStreaming(
 	QWidget *parent, const char *service_name, obs_service_t *service, const std::optional<std::string> &rtmp_url,
 	const QString &stream_key, const char *audio_encoder_id, std::optional<uint32_t> maximum_aggregate_bitrate,
-	std::optional<uint32_t> maximum_video_tracks, std::optional<std::string> custom_config,
+	std::optional<uint32_t> maximum_video_tracks, bool request_max_tracks, std::optional<std::string> custom_config,
 	obs_data_t *dump_stream_to_file_config, size_t main_audio_mixer, std::optional<size_t> vod_track_mixer,
 	std::optional<bool> use_rtmps, std::optional<QString> extra_canvas)
 {
@@ -393,13 +393,15 @@ void MultitrackVideoOutput::PrepareStreaming(
 	     "    config url:     %s\n"
 	     "  settings:\n"
 	     "    service:               %s\n"
-	     "    max aggregate bitrate: %s (%" PRIu32 ")\n"
-	     "    max video tracks:      %s (%" PRIu32 ")\n"
+	     "    request max tracks:    %s\n"
+	"    max aggregate bitrate: %s (\"%" PRIu32 "\")\n"
+	"    max video tracks:      %s (\"%" PRIu32 "\")\n"
 	     "    custom rtmp url:       %s ('%s')\n"
 	     "    vod track:             %s\n"
 	     "    canvases:              %s",
 	     is_custom_config ? "Yes" : "No", !auto_config_url.isEmpty() ? auto_config_url_data.constData() : "(null)",
-	     service_name, maximum_aggregate_bitrate.has_value() ? "Set" : "Auto",
+	     service_name, request_max_tracks ? "Yes" : "No",
+	     maximum_aggregate_bitrate.has_value() ? "Set" : "Auto",
 	     maximum_aggregate_bitrate.value_or(0), maximum_video_tracks.has_value() ? "Set" : "Auto",
 	     maximum_video_tracks.value_or(0), rtmp_url.has_value() ? "Yes" : "No",
 	     rtmp_url.has_value() ? rtmp_url->c_str() : "",
@@ -410,8 +412,9 @@ void MultitrackVideoOutput::PrepareStreaming(
 					strcmp(obs_service_get_id(service), "rtmp_custom") == 0;
 
 	if (!custom_config_only) {
-		auto go_live_post = constructGoLivePost(stream_key, maximum_aggregate_bitrate, maximum_video_tracks,
-							vod_track_mixer.has_value(), canvases);
+		auto go_live_post =
+			constructGoLivePost(stream_key, maximum_aggregate_bitrate, maximum_video_tracks, request_max_tracks,
+					     vod_track_mixer.has_value(), canvases);
 
 		go_live_config = DownloadGoLiveConfig(parent, auto_config_url, go_live_post, multitrack_video_name);
 	}

@@ -176,7 +176,7 @@ bool AutoConfigStreamPage::validatePage()
 			std::vector<OBSCanvasAutoRelease> canvases;
 			canvases.emplace_back(obs_get_main_canvas());
 			auto postData = constructGoLivePost(QString::fromStdString(wiz->key), std::nullopt,
-							    std::nullopt, false, canvases);
+						std::nullopt, false, false, canvases);
 
 			OBSDataAutoRelease service_settings = obs_service_get_settings(service);
 			auto multitrack_video_name = QTStr("Basic.Settings.Stream.MultitrackVideoLabel");

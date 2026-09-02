@@ -84,6 +84,8 @@ void OBSBasicSettings::InitStreamPage()
 	connect(ui->ignoreRecommended, &QCheckBox::toggled, this, &OBSBasicSettings::UpdateResFPSLimits);
 
 	connect(ui->enableMultitrackVideo, &QCheckBox::toggled, this, &OBSBasicSettings::UpdateMultitrackVideo);
+	connect(ui->multitrackVideoRequestMaxTracks, &QCheckBox::toggled, this,
+		&OBSBasicSettings::UpdateMultitrackVideo);
 	connect(ui->multitrackVideoMaximumAggregateBitrateAuto, &QCheckBox::toggled, this,
 		&OBSBasicSettings::UpdateMultitrackVideo);
 	connect(ui->multitrackVideoMaximumVideoTracksAuto, &QCheckBox::toggled, this,
@@ -145,6 +147,9 @@ void OBSBasicSettings::LoadStream1Settings()
 	}
 
 	ui->enableMultitrackVideo->setChecked(config_get_bool(main->Config(), "Stream1", "EnableMultitrackVideo"));
+
+	ui->multitrackVideoRequestMaxTracks->setChecked(
+		config_get_bool(main->Config(), "Stream1", "MultitrackVideoRequestMaxTracks"));
 
 	ui->multitrackVideoMaximumAggregateBitrateAuto->setChecked(
 		config_get_bool(main->Config(), "Stream1", "MultitrackVideoMaximumAggregateBitrateAuto"));
@@ -350,6 +355,7 @@ void OBSBasicSettings::SaveStream1Settings()
 	} else {
 		SaveCheckBox(ui->enableMultitrackVideo, "Stream1", "EnableMultitrackVideo");
 	}
+	SaveCheckBox(ui->multitrackVideoRequestMaxTracks, "Stream1", "MultitrackVideoRequestMaxTracks");
 	SaveCheckBox(ui->multitrackVideoMaximumAggregateBitrateAuto, "Stream1",
 		     "MultitrackVideoMaximumAggregateBitrateAuto");
 	SaveSpinBox(ui->multitrackVideoMaximumAggregateBitrate, "Stream1", "MultitrackVideoMaximumAggregateBitrate");
