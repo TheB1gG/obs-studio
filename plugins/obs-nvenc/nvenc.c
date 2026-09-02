@@ -366,7 +366,7 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 		enc->can_change_bitrate = cqp ? false
 					      : nv_get_cap(enc, NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE);
 	} else if (br_changed) {
-		info("changing bitrate from %lld to %lld while streaming", enc->props.bitrate, bitrate);
+		info("changing bitrate from %lld to %lld while streaming", (long long)enc->props.bitrate, (long long)bitrate);
 
 		bool is_vbr = config->rcParams.rateControlMode == NV_ENC_PARAMS_RC_VBR;
 		config->rcParams.averageBitRate = (uint32_t)bitrate * 1000;
@@ -1622,7 +1622,7 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 		info("applying staged encoder reconfigure at shared keyframe boundary "
 		     "(align=%d rc=%d counter=%lld gopLength=%d output_delay=%d forced_frame_pts=%lld)",
 		     enc->align_pending, enc->reconfig_pending, (long long)enc->frames_since_idr,
-		     (int)enc->config.gopLength, enc->output_delay, pts);
+		     (int)enc->config.gopLength, enc->output_delay, (long long)pts);
 		bool ok = apply_nvenc_reconfigure(enc);
 
 		/* One reset+IDR at a shared tick re-anchors the GOP phase; any  */
