@@ -143,7 +143,11 @@ void WHIPOutput::ConfigureVideoTrack(std::string media_stream_id, std::string cn
 	video_description.addSSRC(ssrc, cname, media_stream_id, media_stream_track_id);
 
 	auto rtp_config = std::make_shared<rtc::RtpPacketizationConfig>(ssrc, cname, video_payload_type,
+#if RTC_VERSION_MAJOR == 0 && RTC_VERSION_MINOR > 22 || RTC_VERSION_MAJOR > 0
 									rtc::H264RtpPacketizer::ClockRate);
+#else
+									rtc::H264RtpPacketizer::defaultClockRate);
+#endif
 
 	const obs_encoder_t *encoder = obs_output_get_video_encoder2(output, 0);
 	if (!encoder)
