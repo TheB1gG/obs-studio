@@ -10,8 +10,6 @@ jobs:
         shell: bash
     outputs:
       package: ${{ steps.setup.outputs.package }}
-      codesign: ${{ steps.setup.outputs.codesign }}
-      notarize: ${{ steps.setup.outputs.notarize }}
       config: ${{ steps.setup.outputs.config }}
       commitHash: ${{ steps.setup.outputs.commitHash }}
     steps:
@@ -28,25 +26,23 @@ jobs:
 
           case "${GITHUB_EVENT_NAME}" in
             pull_request)
-              config_data=('codesign:false' 'notarize:false' 'package:false' 'config:RelWithDebInfo')
+              config_data=('package:false' 'config:RelWithDebInfo')
               if gh pr view ${{ github.event.number }} --json labels \
                 | jq -e -r '.labels[] | select(.name == "Seeking Testers")' > /dev/null; then
-                config_data[0]='codesign:true'
-                config_data[2]='package:true'
+                config_data[0]='package:true'
               fi
               ;;
             push)
-              config_data=('codesign:true' 'notarize:false' 'package:true' 'config:RelWithDebInfo')
+              config_data=('package:true' 'config:RelWithDebInfo')
               if [[ ${GITHUB_REF_NAME} =~ ^[0-9]+.[0-9]+.[0-9]+(-(rc|beta).+)?$ ]]; then
-                config_data[1]='notarize:true'
-                config_data[3]='config:Release'
+                config_data[1]='config:Release'
               fi
               ;;
             workflow_dispatch)
-              config_data=('codesign:true' 'notarize:false' 'package:false' 'config:RelWithDebInfo')
+              config_data=('package:false' 'config:RelWithDebInfo')
               ;;
             schedule)
-              config_data=('codesign:true' 'notarize:false' 'package:true' 'config:RelWithDebInfo')
+              config_data=('package:true' 'config:RelWithDebInfo')
               ;;
             *) ;;
           esac
@@ -111,19 +107,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-xcode-${{ matrix.target }}-
 
-      - name: Set Up Code Signing 🔑
-        uses: ./.github/actions/setup-macos-codesigning
-        if: fromJSON(needs.check-event.outputs.codesign)
-        id: codesign
-        with:
-          codesignIdentity: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-          codesignCertificate: ${{ secrets.MACOS_SIGNING_CERT }}
-          certificatePassword: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
-          keychainPassword: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
-          provisioningProfile: ${{ secrets.MACOS_SIGNING_PROVISIONING_PROFILE }}
-          notarizationUser: ${{ secrets.MACOS_NOTARIZATION_USERNAME }}
-          notarizationPassword: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
-
       - name: Build OBS Studio 🧱
         uses: ./.github/actions/build-obs
         env:
@@ -139,10 +122,6 @@ jobs:
         with:
           target: ${{ matrix.target }}
           config: ${{ needs.check-event.outputs.config }}
-          codesign: ${{ fromJSON(needs.check-event.outputs.codesign) }}
-          codesignIdent: ${{ steps.codesign.outputs.codesignIdent }}
-          codesignTeam: ${{ steps.codesign.outputs.codesignTeam }}
-          provisioningProfileUUID: ${{ steps.codesign.outputs.provisioningProfileUUID }}
 
       - name: Package OBS Studio 📀
         uses: ./.github/actions/package-obs
@@ -151,11 +130,6 @@ jobs:
           target: ${{ matrix.target }}
           config: ${{ needs.check-event.outputs.config }}
           package: ${{ fromJSON(needs.check-event.outputs.package) }}
-          codesign: ${{ fromJSON(needs.check-event.outputs.codesign) && fromJSON(steps.codesign.outputs.haveCodesignIdent) }}
-          codesignIdent: ${{ steps.codesign.outputs.codesignIdent }}
-          notarize: ${{ fromJSON(needs.check-event.outputs.notarize) && fromJSON(steps.codesign.outputs.haveNotarizationUser) }}
-          codesignUser: ${{ secrets.MACOS_NOTARIZATION_USERNAME }}
-          codesignPass: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
 
       - name: Upload Artifacts 📡
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
