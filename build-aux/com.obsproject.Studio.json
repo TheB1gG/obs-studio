@@ -4,8 +4,10 @@
     "runtime-version": "6.11",
     "sdk": "org.kde.Sdk",
     "command": "obs",
-    "env": {
-        "CMAKE_POLICY_VERSION_MINIMUM": "3.5"
+    "build-options": {
+        "env": {
+            "CMAKE_POLICY_VERSION_MINIMUM": "3.5"
+        }
     },
     "finish-args": [
         "--socket=wayland",
