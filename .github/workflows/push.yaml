@@ -98,44 +98,6 @@ jobs:
         with:
           disableLinkExtensions: ${{ github.ref_type == 'tag' }}
 
-  deploy-documentation:
-    name: Deploy Documentation to Cloudflare ☁️
-    if: github.repository_owner == 'obsproject' && github.ref_type == 'tag'
-    runs-on: ubuntu-26.04
-    needs: update-documentation
-    defaults:
-      run:
-        shell: bash
-    environment:
-      name: cf-pages-deploy
-    steps:
-      - name: Get Commit Information 🆔
-        id: setup
-        run: |
-          : Get Commit Hash 🆔
-          echo "commitHash=${GITHUB_SHA:0:9}" >> $GITHUB_OUTPUT
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: OBS Studio Docs (No Extensions) ${{ steps.setup.outputs.commitHash }}
-          path: docs
-
-      - name: Set Up Redirects 🔄
-        run: |
-          : Set Up Redirects 🔄
-          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-
-          echo "/previous/27.2 https://obsproject.com/docs/27.2 302" >> docs/_redirects
-          echo "/previous/:major.:minor https://:major-:minor.${{ vars.CF_PAGES_PROJECT }}.pages.dev 302" >> docs/_redirects
-
-      - name: Publish to Live Page
-        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
-        with:
-          workingDirectory: docs
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          command: pages publish . --project-name=${{ vars.CF_PAGES_PROJECT }} --commit-hash='${{ steps.setup.outputs.commitHash }}'
-
   create-release:
     name: Create Release 🛫
     if: github.ref_type == 'tag'
@@ -186,11 +148,8 @@ jobs:
           ubuntu_2604_x86_64_artifact_name="obs-studio-ubuntu-26.04-x86_64-${commit_hash}"
           ubuntu_2604_x86_64_debug_name="obs-studio-ubuntu-26.04-x86_64-${commit_hash}-dbgsym"
           ubuntu_2604_sources_name="obs-studio-ubuntu-26.04-sources-${commit_hash}"
-          windows_x64_artifact_name="obs-studio-windows-x64-${{ steps.check.outputs.version }}-signed"
-          windows_x64_installer_name="obs-studio-windows-x64-${{ steps.check.outputs.version }}-installer"
-          windows_x64_debug_name="obs-studio-windows-x64-${{ steps.check.outputs.version }}-pdbs"
-          windows_arm64_artifact_name="obs-studio-windows-arm64-${{ steps.check.outputs.version }}-signed"
-          windows_arm64_debug_name="obs-studio-windows-arm64-${{ steps.check.outputs.version }}-pdbs"
+          windows_x64_artifact_name="obs-studio-windows-x64-${commit_hash}"
+          windows_arm64_artifact_name="obs-studio-windows-arm64-${commit_hash}"
 
           echo '::group::Renaming Artifacts'
           mv -v "${macos_arm64_artifact_name}/"obs-studio-*-macos-apple.dmg \
@@ -207,16 +166,10 @@ jobs:
             "${root_dir}"/OBS-Studio-${{ steps.check.outputs.version }}-Ubuntu-26.04-x86_64-dbsym.ddeb
           mv -v "${ubuntu_2604_sources_name}/"obs-studio-*-sources.tar.gz \
             "${root_dir}"/OBS-Studio-${{ steps.check.outputs.version }}-Sources.tar.gz
-          mv -v "${windows_x64_artifact_name}/"OBS-Studio-*.zip \
+          mv -v "${windows_x64_artifact_name}/"obs-studio-*-windows-x64.zip \
             "${root_dir}"/OBS-Studio-${{ steps.check.outputs.version }}-Windows-x64.zip
-          mv -v "${windows_x64_installer_name}/"OBS-Studio-*.exe \
-            "${root_dir}"/OBS-Studio-${{ steps.check.outputs.version }}-Windows-x64-Installer.exe
-          mv -v "${windows_x64_debug_name}/"OBS-Studio-*-pdbs.zip \
-            "${root_dir}"/OBS-Studio-${{ steps.check.outputs.version }}-Windows-x64-PDBs.zip
-          mv -v "${windows_arm64_artifact_name}/"OBS-Studio-*.zip \
+          mv -v "${windows_arm64_artifact_name}/"obs-studio-*-windows-arm64.zip \
             "${root_dir}"/OBS-Studio-${{ steps.check.outputs.version }}-Windows-arm64.zip
-          mv -v "${windows_arm64_debug_name}/"OBS-Studio-*-pdbs.zip \
-            "${root_dir}"/OBS-Studio-${{ steps.check.outputs.version }}-Windows-arm64-PDBs.zip
           echo '::endgroup::'
 
       - name: Generate Checksums 🪪
@@ -248,7 +201,4 @@ jobs:
             ${{ github.workspace }}/OBS-Studio-${{ steps.check.outputs.version }}-Ubuntu-*.ddeb
             ${{ github.workspace }}/OBS-Studio-${{ steps.check.outputs.version }}-Sources.tar.gz
             ${{ github.workspace }}/OBS-Studio-${{ steps.check.outputs.version }}-Windows-x64.zip
-            ${{ github.workspace }}/OBS-Studio-${{ steps.check.outputs.version }}-Windows-x64-Installer.exe
-            ${{ github.workspace }}/OBS-Studio-${{ steps.check.outputs.version }}-Windows-x64-PDBs.zip
             ${{ github.workspace }}/OBS-Studio-${{ steps.check.outputs.version }}-Windows-arm64.zip
-            ${{ github.workspace }}/OBS-Studio-${{ steps.check.outputs.version }}-Windows-arm64-PDBs.zip

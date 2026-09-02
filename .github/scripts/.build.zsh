@@ -160,24 +160,6 @@ build() {
         build
       )
 
-      local -a archive_args=(
-        ONLY_ACTIVE_ARCH=NO
-        -project obs-studio.xcodeproj
-        -scheme obs-studio
-        -destination "generic/platform=macOS,name=Any Mac"
-        -archivePath obs-studio.xcarchive
-        -parallelizeTargets
-        -hideShellScriptEnvironment
-        archive
-      )
-
-      local -a export_args=(
-        -exportArchive
-        -archivePath obs-studio.xcarchive
-        -exportOptionsPlist exportOptions.plist
-        -exportPath ${project_root}/build_macos
-      )
-
       local -a analyze_args=(
         CLANG_ANALYZER_OUTPUT=sarif
         CLANG_ANALYZER_OUTPUT_DIR=${project_root}/analytics
@@ -194,16 +176,11 @@ build() {
       if (( analyze )) {
         run_xcodebuild ${analyze_args}
       } else {
-        if [[ ${GITHUB_EVENT_NAME} == push && ${GITHUB_REF_NAME} =~ [0-9]+.[0-9]+.[0-9]+(-(rc|beta).+)? ]] {
-          run_xcodebuild ${archive_args}
-          run_xcodebuild ${export_args}
-        } else {
-          run_xcodebuild ${build_args}
+        run_xcodebuild ${build_args}
 
-          rm -rf OBS.app
-          mkdir OBS.app
-          ditto frontend/${config}/OBS.app OBS.app
-        }
+        rm -rf OBS.app
+        mkdir OBS.app
+        ditto frontend/${config}/OBS.app OBS.app
       }
       popd
       ;;
