@@ -547,6 +547,21 @@ std::vector<GoLiveApi::AudioEncoderConfiguration> collect_audio_configurations(c
 	return configs;
 }
 
+// If the audio encoder is CoreAudio AAC, override settings to use TVBR at maximum quality (127).
+// Any bitrate value from the JSON config is ignored in that case. Non-AAC encoders are left unchanged.
+static nlohmann::json apply_audio_vbr_override(const GoLiveApi::AudioEncoderConfiguration &config,
+                                               const char *encoder_id)
+{
+	auto settings = config.settings;
+
+	if (strcmp(encoder_id, "CoreAudio_AAC") != 0)
+		return settings;
+
+	settings["vbr"] = true;
+	settings["quality_target"] = 127;
+	return settings;
+}
+
 // Logs which fields of an encoder's settings blob changed between the stored and new configuration.
 void log_changed_settings_fields(const char *kind, size_t index, const nlohmann::json &old_settings,
 				 const nlohmann::json &new_settings)
@@ -883,8 +898,10 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 			break;
 		}
 
-		OBSDataAutoRelease settings = obs_data_create_from_json(new_audios[i].settings.dump().c_str());
-		log_changed_settings_fields("audio", i, old_audios[i].settings, new_audios[i].settings);
+		nlohmann::json track_settings =
+			apply_audio_vbr_override(new_audios[i], obs_encoder_get_id(objects.audio_encoders_[i]));
+		log_changed_settings_fields("audio", i, old_audios[i].settings, track_settings);
+		OBSDataAutoRelease settings = obs_data_create_from_json(track_settings.dump().c_str());
 		obs_encoder_update(objects.audio_encoders_[i], settings);
 	}
 
@@ -1113,7 +1130,8 @@ static void create_audio_encoders(const GoLiveApi::Config &go_live_config,
 
 		for (size_t i = 0; i < configs.size(); i++) {
 			dstr_printf(encoder_name_buffer, "%s %zu", name_prefix, i);
-			OBSDataAutoRelease settings = obs_data_create_from_json(configs[i].settings.dump().c_str());
+			nlohmann::json track_settings = apply_audio_vbr_override(configs[i], audio_encoder_id);
+			OBSDataAutoRelease settings = obs_data_create_from_json(track_settings.dump().c_str());
 			OBSEncoderAutoRelease audio_encoder =
 				create_audio_encoder(encoder_name_buffer->array, audio_encoder_id, settings, mixer_idx);
 

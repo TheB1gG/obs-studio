@@ -46,6 +46,39 @@ static bool CreateSimpleOpusEncoder(OBSEncoder &res, int bitrate, const char *na
 
 extern bool EncoderAvailable(const char *encoder);
 
+static bool SimpleAudioVBRActive(config_t *config)
+{
+	const char *audio_encoder = config_get_string(config, "SimpleOutput", "StreamAudioEncoder");
+	if (strcmp(audio_encoder, "opus") == 0)
+		return false;
+
+	if (strcmp(config_get_string(config, "SimpleOutput", "ABitrateMode"), "VBR") != 0)
+		return false;
+
+	return EncoderAvailable("CoreAudio_AAC");
+}
+
+static int SimpleAudioQualityTarget(config_t *config)
+{
+	int quality = (int)config_get_int(config, "SimpleOutput", "AQualityTarget");
+	if (quality < 0)
+		quality = 0;
+	if (quality > 127)
+		quality = 127;
+	return quality;
+}
+
+static bool CreateSimpleAACEncoderVBR(OBSEncoder &res, const char *name, size_t idx)
+{
+	res = obs_audio_encoder_create("CoreAudio_AAC", name, nullptr, idx, nullptr);
+	if (res) {
+		obs_encoder_release(res);
+		return true;
+	}
+
+	return false;
+}
+
 void SimpleOutput::LoadRecordingPreset_Lossless()
 {
 	fileOutput = obs_output_create("ffmpeg_output", "simple_ffmpeg_output", nullptr, nullptr);
@@ -147,10 +180,13 @@ void SimpleOutput::LoadRecordingPreset()
 
 		bool success = false;
 
-		if (strcmp(audio_encoder, "opus") == 0)
+		if (strcmp(audio_encoder, "opus") == 0) {
 			success = CreateSimpleOpusEncoder(audioRecording, 192, "simple_opus_recording", 0);
-		else
+		} else if (SimpleAudioVBRActive(main->Config())) {
+			success = CreateSimpleAACEncoderVBR(audioRecording, "simple_aac_recording", 0);
+		} else {
 			success = CreateSimpleAACEncoder(audioRecording, 192, "simple_aac_recording", 0);
+		}
 
 		if (!success)
 			throw "Failed to create audio recording encoder "
@@ -160,6 +196,9 @@ void SimpleOutput::LoadRecordingPreset()
 			if (strcmp(audio_encoder, "opus") == 0) {
 				snprintf(name, sizeof name, "simple_opus_recording%d", i);
 				success = CreateSimpleOpusEncoder(audioTrack[i], GetAudioBitrate(), name, i);
+			} else if (SimpleAudioVBRActive(main->Config())) {
+				snprintf(name, sizeof name, "simple_aac_recording%d", i);
+				success = CreateSimpleAACEncoderVBR(audioTrack[i], name, i);
 			} else {
 				snprintf(name, sizeof name, "simple_aac_recording%d", i);
 				success = CreateSimpleAACEncoder(audioTrack[i], GetAudioBitrate(), name, i);
@@ -182,18 +221,24 @@ SimpleOutput::SimpleOutput(OBSBasic *main_) : BasicOutputHandler(main_)
 
 	bool success = false;
 
-	if (strcmp(audio_encoder, "opus") == 0)
+	if (strcmp(audio_encoder, "opus") == 0) {
 		success = CreateSimpleOpusEncoder(audioStreaming, GetAudioBitrate(), "simple_opus", 0);
-	else
+	} else if (SimpleAudioVBRActive(main->Config())) {
+		success = CreateSimpleAACEncoderVBR(audioStreaming, "simple_aac", 0);
+	} else {
 		success = CreateSimpleAACEncoder(audioStreaming, GetAudioBitrate(), "simple_aac", 0);
+	}
 
 	if (!success)
 		throw "Failed to create audio streaming encoder (simple output)";
 
-	if (strcmp(audio_encoder, "opus") == 0)
+	if (strcmp(audio_encoder, "opus") == 0) {
 		success = CreateSimpleOpusEncoder(audioArchive, GetAudioBitrate(), SIMPLE_ARCHIVE_NAME, 1);
-	else
+	} else if (SimpleAudioVBRActive(main->Config())) {
+		success = CreateSimpleAACEncoderVBR(audioArchive, SIMPLE_ARCHIVE_NAME, 1);
+	} else {
 		success = CreateSimpleAACEncoder(audioArchive, GetAudioBitrate(), SIMPLE_ARCHIVE_NAME, 1);
+	}
 
 	if (!success)
 		throw "Failed to create audio archive encoder (simple output)";
@@ -312,8 +357,13 @@ void SimpleOutput::Update()
 	if (advanced)
 		obs_data_set_string(videoSettings, "x264opts", custom);
 
-	obs_data_set_string(audioSettings, "rate_control", "CBR");
-	obs_data_set_int(audioSettings, "bitrate", audioBitrate);
+	if (SimpleAudioVBRActive(main->Config())) {
+		obs_data_set_bool(audioSettings, "vbr", true);
+		obs_data_set_int(audioSettings, "quality_target", SimpleAudioQualityTarget(main->Config()));
+	} else {
+		obs_data_set_string(audioSettings, "rate_control", "CBR");
+		obs_data_set_int(audioSettings, "bitrate", audioBitrate);
+	}
 
 	obs_service_apply_encoder_settings(main->GetService(), videoSettings, audioSettings);
 
@@ -357,8 +407,14 @@ void SimpleOutput::Update()
 void SimpleOutput::UpdateRecordingAudioSettings()
 {
 	OBSDataAutoRelease settings = obs_data_create();
-	obs_data_set_int(settings, "bitrate", 192);
-	obs_data_set_string(settings, "rate_control", "CBR");
+
+	if (SimpleAudioVBRActive(main->Config())) {
+		obs_data_set_bool(settings, "vbr", true);
+		obs_data_set_int(settings, "quality_target", SimpleAudioQualityTarget(main->Config()));
+	} else {
+		obs_data_set_int(settings, "bitrate", 192);
+		obs_data_set_string(settings, "rate_control", "CBR");
+	}
 
 	int tracks = config_get_int(main->Config(), "SimpleOutput", "RecTracks");
 	const char *recFormat = config_get_string(main->Config(), "SimpleOutput", "RecFormat2");
@@ -591,6 +647,8 @@ std::shared_future<void> SimpleOutput::SetupStreaming(obs_service_t *service, Se
 
 	auto audio_bitrate = GetAudioBitrate();
 	auto vod_track_mixer = IsVodTrackEnabled(service) ? std::optional{1} : std::nullopt;
+	const char *aac_encoder_id = SimpleAudioVBRActive(main->Config()) ? "CoreAudio_AAC"
+	                                                                  : GetSimpleAACEncoderForBitrate(audio_bitrate);
 
 	auto handle_multitrack_video_result = [=](std::optional<bool> multitrackVideoResult) {
 		if (multitrackVideoResult.has_value())
@@ -631,7 +689,7 @@ std::shared_future<void> SimpleOutput::SetupStreaming(obs_service_t *service, Se
 		return true;
 	};
 
-	return SetupMultitrackVideo(service, GetSimpleAACEncoderForBitrate(audio_bitrate), 0, vod_track_mixer,
+	return SetupMultitrackVideo(service, aac_encoder_id, 0, vod_track_mixer,
 				    [=](std::optional<bool> res) {
 					    continuation(handle_multitrack_video_result(res));
 				    });

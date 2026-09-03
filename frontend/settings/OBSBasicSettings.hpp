@@ -446,6 +446,11 @@ private slots:
 	void SimpleStreamAudioEncoderChanged();
 	void AdvAudioEncodersChanged();
 
+	void SimpleAudioBitrateModeChanged(bool vbr);
+	void UpdateSimpleAudioBitrateModeUI();
+	void AdvTrackBitrateModeChanged(bool vbr);
+	void UpdateAdvTrackBitrateModeUI();
+
 protected:
 	virtual void closeEvent(QCloseEvent *event) override;
 	virtual void showEvent(QShowEvent *event) override;

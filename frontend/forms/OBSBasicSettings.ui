@@ -2433,16 +2433,78 @@
                         </widget>
                        </item>
                        <item row="1" column="0">
-                        <widget class="QLabel" name="simpleOutputABitrateLabel">
-                         <property name="text">
-                          <string>Basic.Settings.Output.AudioBitrate</string>
-                         </property>
-                         <property name="buddy">
-                          <cstring>simpleOutputABitrate</cstring>
-                         </property>
-                        </widget>
+                         <widget class="QWidget" name="simpleOutputABitrateLabelWidget" native="false">
+                          <layout class="QHBoxLayout" name="simpleOutputABitrateLabelLayout">
+                           <property name="leftMargin">
+                            <number>0</number>
+                           </property>
+                           <property name="topMargin">
+                            <number>0</number>
+                           </property>
+                           <property name="rightMargin">
+                            <number>0</number>
+                           </property>
+                           <property name="bottomMargin">
+                            <number>0</number>
+                           </property>
+                           <item>
+                            <spacer name="simpleOutputABitrateLabelSpacer">
+                             <property name="orientation">
+                              <enum>Qt::Horizontal</enum>
+                             </property>
+                             <property name="sizeHint" stdset="0">
+                              <size>
+                               <width>40</width>
+                               <height>20</height>
+                              </size>
+                             </property>
+                            </spacer>
+                           </item>
+                           <item>
+                            <widget class="QLabel" name="simpleOutputABitrateLabel">
+                             <property name="text">
+                              <string>Basic.Settings.Output.AudioBitrate</string>
+                             </property>
+                             <property name="buddy">
+                              <cstring>simpleOutputABitrate</cstring>
+                             </property>
+                            </widget>
+                           </item>
+                           <item>
+                            <widget class="QToolButton" name="simpleOutputABitrateMode">
+                             <property name="text">
+                              <string>CBR</string>
+                             </property>
+                             <property name="checkable">
+                              <bool>true</bool>
+                             </property>
+                             <property name="checked">
+                              <bool>false</bool>
+                             </property>
+                             <property name="toolButtonStyle">
+                              <enum>Qt::ToolButtonTextOnly</enum>
+                             </property>
+                            </widget>
+                           </item>
+                          </layout>
+                         </widget>
                        </item>
                        <item row="1" column="1">
+                         <widget class="QWidget" name="simpleOutputABitrateFieldWidget" native="false">
+                          <layout class="QHBoxLayout" name="simpleOutputABitrateFieldLayout">
+                           <property name="leftMargin">
+                            <number>0</number>
+                           </property>
+                           <property name="topMargin">
+                            <number>0</number>
+                           </property>
+                           <property name="rightMargin">
+                            <number>0</number>
+                           </property>
+                           <property name="bottomMargin">
+                            <number>0</number>
+                           </property>
+                           <item>
                         <widget class="QComboBox" name="simpleOutputABitrate">
                          <property name="currentIndex">
                           <number>8</number>
@@ -2503,6 +2565,22 @@
                           </property>
                          </item>
                         </widget>
+                           </item>
+                           <item>
+                            <widget class="QSpinBox" name="simpleOutputAQuality">
+                             <property name="minimum">
+                              <number>0</number>
+                             </property>
+                             <property name="maximum">
+                              <number>127</number>
+                             </property>
+                             <property name="value">
+                              <number>127</number>
+                             </property>
+                            </widget>
+                           </item>
+                          </layout>
+                         </widget>
                        </item>
                        <item row="2" column="0">
                         <widget class="QLabel" name="simpleOutStrEncoderLabel">
@@ -3327,16 +3405,16 @@
                              </widget>
                             </widget>
                            </item>
-                           <item row="1" column="0">
-                            <widget class="QLabel" name="advOutAEncLabel">
-                             <property name="text">
-                              <string>Basic.Settings.Output.Encoder.Audio</string>
-                             </property>
-                            </widget>
-                           </item>
-                           <item row="1" column="1">
-                            <widget class="QComboBox" name="advOutAEncoder"/>
-                           </item>
+                         <item row="1" column="0">
+                          <widget class="QLabel" name="advOutAEncLabel">
+                           <property name="text">
+                            <string>Basic.Settings.Output.Encoder.Audio</string>
+                           </property>
+                          </widget>
+                         </item>
+                         <item row="1" column="1">
+                          <widget class="QComboBox" name="advOutAEncoder"/>
+                         </item>
                            <item row="2" column="0">
                             <widget class="QLabel" name="advOutEncLabel">
                              <property name="text">
@@ -4786,6 +4864,21 @@
                                <number>9</number>
                               </property>
                               <item row="0" column="1">
+                               <widget class="QWidget" name="advOutTrack1BitrateFieldWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack1BitrateFieldLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
                                <widget class="QComboBox" name="advOutTrack1Bitrate">
                                 <property name="sizePolicy">
                                  <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
@@ -4852,6 +4945,22 @@
                                  </property>
                                 </item>
                                </widget>
+                                 </item>
+                                 <item>
+                                  <widget class="QSpinBox" name="advOutTrack1Quality">
+                                   <property name="minimum">
+                                    <number>0</number>
+                                   </property>
+                                   <property name="maximum">
+                                    <number>127</number>
+                                   </property>
+                                   <property name="value">
+                                    <number>127</number>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                </layout>
+                               </widget>
                               </item>
                               <item row="1" column="0">
                                <widget class="QLabel" name="label_55">
@@ -4874,6 +4983,37 @@
                                </widget>
                               </item>
                               <item row="0" column="0">
+                               <widget class="QWidget" name="advOutTrack1BitrateModeWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack1BitrateModeLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
+                                  <widget class="QToolButton" name="advOutTrack1BitrateMode">
+                                   <property name="text">
+                                    <string>CBR</string>
+                                   </property>
+                                   <property name="checkable">
+                                    <bool>true</bool>
+                                   </property>
+                                   <property name="checked">
+                                    <bool>false</bool>
+                                   </property>
+                                   <property name="toolButtonStyle">
+                                    <enum>Qt::ToolButtonTextOnly</enum>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                 <item>
                                <widget class="QLabel" name="advOutTrack1BitrateLabel">
                                 <property name="minimumSize">
                                  <size>
@@ -4890,6 +5030,9 @@
                                 <property name="buddy">
                                  <cstring>advOutTrack1Bitrate</cstring>
                                 </property>
+                               </widget>
+                                 </item>
+                                </layout>
                                </widget>
                               </item>
                              </layout>
@@ -4926,6 +5069,37 @@
                                <number>9</number>
                               </property>
                               <item row="0" column="0">
+                               <widget class="QWidget" name="advOutTrack2BitrateModeWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack2BitrateModeLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
+                                  <widget class="QToolButton" name="advOutTrack2BitrateMode">
+                                   <property name="text">
+                                    <string>CBR</string>
+                                   </property>
+                                   <property name="checkable">
+                                    <bool>true</bool>
+                                   </property>
+                                   <property name="checked">
+                                    <bool>false</bool>
+                                   </property>
+                                   <property name="toolButtonStyle">
+                                    <enum>Qt::ToolButtonTextOnly</enum>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                 <item>
                                <widget class="QLabel" name="advOutTrack2BitrateLabel">
                                 <property name="minimumSize">
                                  <size>
@@ -4943,8 +5117,26 @@
                                  <cstring>advOutTrack2Bitrate</cstring>
                                 </property>
                                </widget>
+                                 </item>
+                                </layout>
+                               </widget>
                               </item>
                               <item row="0" column="1">
+                               <widget class="QWidget" name="advOutTrack2BitrateFieldWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack2BitrateFieldLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
                                <widget class="QComboBox" name="advOutTrack2Bitrate">
                                 <property name="sizePolicy">
                                  <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
@@ -5011,6 +5203,22 @@
                                  </property>
                                 </item>
                                </widget>
+                                 </item>
+                                 <item>
+                                  <widget class="QSpinBox" name="advOutTrack2Quality">
+                                   <property name="minimum">
+                                    <number>0</number>
+                                   </property>
+                                   <property name="maximum">
+                                    <number>127</number>
+                                   </property>
+                                   <property name="value">
+                                    <number>127</number>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                </layout>
+                               </widget>
                               </item>
                               <item row="1" column="0">
                                <widget class="QLabel" name="label_50">
@@ -5066,6 +5274,37 @@
                                <number>9</number>
                               </property>
                               <item row="0" column="0">
+                               <widget class="QWidget" name="advOutTrack3BitrateModeWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack3BitrateModeLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
+                                  <widget class="QToolButton" name="advOutTrack3BitrateMode">
+                                   <property name="text">
+                                    <string>CBR</string>
+                                   </property>
+                                   <property name="checkable">
+                                    <bool>true</bool>
+                                   </property>
+                                   <property name="checked">
+                                    <bool>false</bool>
+                                   </property>
+                                   <property name="toolButtonStyle">
+                                    <enum>Qt::ToolButtonTextOnly</enum>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                 <item>
                                <widget class="QLabel" name="advOutTrack3BitrateLabel">
                                 <property name="minimumSize">
                                  <size>
@@ -5083,8 +5322,26 @@
                                  <cstring>advOutTrack3Bitrate</cstring>
                                 </property>
                                </widget>
+                                 </item>
+                                </layout>
+                               </widget>
                               </item>
                               <item row="0" column="1">
+                               <widget class="QWidget" name="advOutTrack3BitrateFieldWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack3BitrateFieldLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
                                <widget class="QComboBox" name="advOutTrack3Bitrate">
                                 <property name="sizePolicy">
                                  <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
@@ -5151,6 +5408,22 @@
                                  </property>
                                 </item>
                                </widget>
+                                 </item>
+                                 <item>
+                                  <widget class="QSpinBox" name="advOutTrack3Quality">
+                                   <property name="minimum">
+                                    <number>0</number>
+                                   </property>
+                                   <property name="maximum">
+                                    <number>127</number>
+                                   </property>
+                                   <property name="value">
+                                    <number>127</number>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                </layout>
+                               </widget>
                               </item>
                               <item row="1" column="0">
                                <widget class="QLabel" name="label_52">
@@ -5206,6 +5479,37 @@
                                <number>9</number>
                               </property>
                               <item row="0" column="0">
+                               <widget class="QWidget" name="advOutTrack4BitrateModeWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack4BitrateModeLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
+                                  <widget class="QToolButton" name="advOutTrack4BitrateMode">
+                                   <property name="text">
+                                    <string>CBR</string>
+                                   </property>
+                                   <property name="checkable">
+                                    <bool>true</bool>
+                                   </property>
+                                   <property name="checked">
+                                    <bool>false</bool>
+                                   </property>
+                                   <property name="toolButtonStyle">
+                                    <enum>Qt::ToolButtonTextOnly</enum>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                 <item>
                                <widget class="QLabel" name="advOutTrack4BitrateLabel">
                                 <property name="minimumSize">
                                  <size>
@@ -5223,8 +5527,26 @@
                                  <cstring>advOutTrack4Bitrate</cstring>
                                 </property>
                                </widget>
+                                 </item>
+                                </layout>
+                               </widget>
                               </item>
                               <item row="0" column="1">
+                               <widget class="QWidget" name="advOutTrack4BitrateFieldWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack4BitrateFieldLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
                                <widget class="QComboBox" name="advOutTrack4Bitrate">
                                 <property name="sizePolicy">
                                  <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
@@ -5291,6 +5613,22 @@
                                  </property>
                                 </item>
                                </widget>
+                                 </item>
+                                 <item>
+                                  <widget class="QSpinBox" name="advOutTrack4Quality">
+                                   <property name="minimum">
+                                    <number>0</number>
+                                   </property>
+                                   <property name="maximum">
+                                    <number>127</number>
+                                   </property>
+                                   <property name="value">
+                                    <number>127</number>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                </layout>
+                               </widget>
                               </item>
                               <item row="1" column="0">
                                <widget class="QLabel" name="label_54">
@@ -5346,6 +5684,37 @@
                                <number>9</number>
                               </property>
                               <item row="0" column="0">
+                               <widget class="QWidget" name="advOutTrack5BitrateModeWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack5BitrateModeLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
+                                  <widget class="QToolButton" name="advOutTrack5BitrateMode">
+                                   <property name="text">
+                                    <string>CBR</string>
+                                   </property>
+                                   <property name="checkable">
+                                    <bool>true</bool>
+                                   </property>
+                                   <property name="checked">
+                                    <bool>false</bool>
+                                   </property>
+                                   <property name="toolButtonStyle">
+                                    <enum>Qt::ToolButtonTextOnly</enum>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                 <item>
                                <widget class="QLabel" name="advOutTrack5BitrateLabel">
                                 <property name="minimumSize">
                                  <size>
@@ -5363,8 +5732,26 @@
                                  <cstring>advOutTrack5Bitrate</cstring>
                                 </property>
                                </widget>
+                                 </item>
+                                </layout>
+                               </widget>
                               </item>
                               <item row="0" column="1">
+                               <widget class="QWidget" name="advOutTrack5BitrateFieldWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack5BitrateFieldLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
                                <widget class="QComboBox" name="advOutTrack5Bitrate">
                                 <property name="sizePolicy">
                                  <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
@@ -5431,6 +5818,22 @@
                                  </property>
                                 </item>
                                </widget>
+                                 </item>
+                                 <item>
+                                  <widget class="QSpinBox" name="advOutTrack5Quality">
+                                   <property name="minimum">
+                                    <number>0</number>
+                                   </property>
+                                   <property name="maximum">
+                                    <number>127</number>
+                                   </property>
+                                   <property name="value">
+                                    <number>127</number>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                </layout>
+                               </widget>
                               </item>
                               <item row="1" column="0">
                                <widget class="QLabel" name="label_60">
@@ -5486,6 +5889,37 @@
                                <number>9</number>
                               </property>
                               <item row="0" column="0">
+                               <widget class="QWidget" name="advOutTrack6BitrateModeWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack6BitrateModeLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
+                                  <widget class="QToolButton" name="advOutTrack6BitrateMode">
+                                   <property name="text">
+                                    <string>CBR</string>
+                                   </property>
+                                   <property name="checkable">
+                                    <bool>true</bool>
+                                   </property>
+                                   <property name="checked">
+                                    <bool>false</bool>
+                                   </property>
+                                   <property name="toolButtonStyle">
+                                    <enum>Qt::ToolButtonTextOnly</enum>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                 <item>
                                <widget class="QLabel" name="advOutTrack6BitrateLabel">
                                 <property name="minimumSize">
                                  <size>
@@ -5503,8 +5937,26 @@
                                  <cstring>advOutTrack6Bitrate</cstring>
                                 </property>
                                </widget>
+                                 </item>
+                                </layout>
+                               </widget>
                               </item>
                               <item row="0" column="1">
+                               <widget class="QWidget" name="advOutTrack6BitrateFieldWidget" native="false">
+                                <layout class="QHBoxLayout" name="advOutTrack6BitrateFieldLayout">
+                                 <property name="leftMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="topMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="rightMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <property name="bottomMargin">
+                                  <number>0</number>
+                                 </property>
+                                 <item>
                                <widget class="QComboBox" name="advOutTrack6Bitrate">
                                 <property name="sizePolicy">
                                  <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
@@ -5570,6 +6022,22 @@
                                   <string>320</string>
                                  </property>
                                 </item>
+                               </widget>
+                                 </item>
+                                 <item>
+                                  <widget class="QSpinBox" name="advOutTrack6Quality">
+                                   <property name="minimum">
+                                    <number>0</number>
+                                   </property>
+                                   <property name="maximum">
+                                    <number>127</number>
+                                   </property>
+                                   <property name="value">
+                                    <number>127</number>
+                                   </property>
+                                  </widget>
+                                 </item>
+                                </layout>
                                </widget>
                               </item>
                               <item row="1" column="0">
@@ -8787,6 +9255,8 @@
   <tabstop>outputMode</tabstop>
   <tabstop>simpleOutputVBitrate</tabstop>
   <tabstop>simpleOutputABitrate</tabstop>
+  <tabstop>simpleOutputABitrateMode</tabstop>
+  <tabstop>simpleOutputAQuality</tabstop>
   <tabstop>simpleOutStrEncoder</tabstop>
   <tabstop>simpleOutPreset</tabstop>
   <tabstop>simpleOutAdvanced</tabstop>
@@ -8842,17 +9312,29 @@
   <tabstop>advOutSplitFileType</tabstop>
   <tabstop>advOutSplitFileTime</tabstop>
   <tabstop>advOutSplitFileSize</tabstop>
+  <tabstop>advOutTrack1BitrateMode</tabstop>
   <tabstop>advOutTrack1Bitrate</tabstop>
+  <tabstop>advOutTrack1Quality</tabstop>
   <tabstop>advOutTrack1Name</tabstop>
+  <tabstop>advOutTrack2BitrateMode</tabstop>
   <tabstop>advOutTrack2Bitrate</tabstop>
+  <tabstop>advOutTrack2Quality</tabstop>
   <tabstop>advOutTrack2Name</tabstop>
+  <tabstop>advOutTrack3BitrateMode</tabstop>
   <tabstop>advOutTrack3Bitrate</tabstop>
+  <tabstop>advOutTrack3Quality</tabstop>
   <tabstop>advOutTrack3Name</tabstop>
+  <tabstop>advOutTrack4BitrateMode</tabstop>
   <tabstop>advOutTrack4Bitrate</tabstop>
+  <tabstop>advOutTrack4Quality</tabstop>
   <tabstop>advOutTrack4Name</tabstop>
+  <tabstop>advOutTrack5BitrateMode</tabstop>
   <tabstop>advOutTrack5Bitrate</tabstop>
+  <tabstop>advOutTrack5Quality</tabstop>
   <tabstop>advOutTrack5Name</tabstop>
+  <tabstop>advOutTrack6BitrateMode</tabstop>
   <tabstop>advOutTrack6Bitrate</tabstop>
+  <tabstop>advOutTrack6Quality</tabstop>
   <tabstop>advOutTrack6Name</tabstop>
   <tabstop>advRBSecMax</tabstop>
   <tabstop>advRBMegsMax</tabstop>

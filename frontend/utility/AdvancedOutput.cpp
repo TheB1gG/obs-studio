@@ -8,6 +8,32 @@
 
 using namespace std;
 
+extern bool EncoderAvailable(const char *encoder);
+
+static bool AdvTrackVBRActive(config_t *config, size_t track)
+{
+	string key = "Track";
+	key += to_string(track + 1);
+	key += "BitrateMode";
+	if (strcmp(config_get_string(config, "AdvOut", key.c_str()), "VBR") != 0)
+		return false;
+
+	return EncoderAvailable("CoreAudio_AAC");
+}
+
+static int AdvTrackQualityTarget(config_t *config, size_t track)
+{
+	string key = "Track";
+	key += to_string(track + 1);
+	key += "QualityTarget";
+	int quality = (int)config_get_int(config, "AdvOut", key.c_str());
+	if (quality < 0)
+		quality = 0;
+	if (quality > 127)
+		quality = 127;
+	return quality;
+}
+
 static OBSData GetDataFromJsonFile(const char *jsonFile)
 {
 	const OBSBasic *basic = OBSBasic::Get();
@@ -494,11 +520,26 @@ inline void AdvancedOutput::UpdateAudioSettings()
 	for (size_t i = 0; i < MAX_AUDIO_MIXES; i++) {
 		int track = (int)(i + 1);
 		settings[i] = obs_data_create();
-		obs_data_set_int(settings[i], "bitrate", GetAudioBitrate(i, recAudioEncoder));
+
+		bool vbr_active = AdvTrackVBRActive(main->Config(), i);
+		int quality_target = vbr_active ? AdvTrackQualityTarget(main->Config(), i) : 0;
+
+		const char *rec_id = useStreamAudioEncoder ? audioEncoder : recAudioEncoder;
+		if (vbr_active && strcmp(rec_id, "CoreAudio_AAC") == 0) {
+			obs_data_set_bool(settings[i], "vbr", true);
+			obs_data_set_int(settings[i], "quality_target", quality_target);
+		} else {
+			obs_data_set_int(settings[i], "bitrate", GetAudioBitrate(i, recAudioEncoder));
+		}
 
 		obs_encoder_update(recordTrack[i], settings[i]);
 
-		obs_data_set_int(settings[i], "bitrate", GetAudioBitrate(i, audioEncoder));
+		if (vbr_active && strcmp(audioEncoder, "CoreAudio_AAC") == 0) {
+			obs_data_set_bool(settings[i], "vbr", true);
+			obs_data_set_int(settings[i], "quality_target", quality_target);
+		} else {
+			obs_data_set_int(settings[i], "bitrate", GetAudioBitrate(i, audioEncoder));
+		}
 
 		if (!is_multitrack_output) {
 			if (track == streamTrackIndex || track == vodTrackIndex) {

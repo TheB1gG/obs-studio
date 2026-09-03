@@ -287,6 +287,7 @@ static inline void HighlightGroupBoxLabel(QGroupBox *gb, QWidget *widget, QStrin
 }
 
 void RestrictResetBitrates(initializer_list<QComboBox *> boxes, int maxbitrate);
+bool EncoderAvailable(const char *encoder);
 
 /* clang-format off */
 #define COMBO_CHANGED   &QComboBox::currentIndexChanged
@@ -294,6 +295,7 @@ void RestrictResetBitrates(initializer_list<QComboBox *> boxes, int maxbitrate);
 #define CBEDIT_CHANGED  &QComboBox::editTextChanged
 #define CHECK_CHANGED   &QCheckBox::toggled
 #define GROUP_CHANGED   &QGroupBox::toggled
+#define TOOLBUTTON_CHANGED &QToolButton::toggled
 #define SCROLL_CHANGED  &QSpinBox::valueChanged
 #define DSCROLL_CHANGED &QDoubleSpinBox::valueChanged
 #define TEXT_CHANGED    &QPlainTextEdit::textChanged
@@ -403,6 +405,8 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->simpleOutStrEncoder,  COMBO_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->simpleOutStrAEncoder, COMBO_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->simpleOutputABitrate, COMBO_CHANGED,  OUTPUTS_CHANGED);
+	HookWidget(ui->simpleOutputABitrateMode, TOOLBUTTON_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->simpleOutputAQuality, SCROLL_CHANGED, OUTPUTS_CHANGED);
 	HookWidget(ui->simpleOutAdvanced,    CHECK_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->simpleOutPreset,      COMBO_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->simpleOutCustom,      EDIT_CHANGED,   OUTPUTS_CHANGED);
@@ -421,6 +425,18 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->simpleRBMegsMax,      SCROLL_CHANGED, OUTPUTS_CHANGED);
 	HookWidget(ui->advOutEncoder,        COMBO_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutAEncoder,       COMBO_CHANGED,  OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack1BitrateMode, TOOLBUTTON_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack2BitrateMode, TOOLBUTTON_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack3BitrateMode, TOOLBUTTON_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack4BitrateMode, TOOLBUTTON_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack5BitrateMode, TOOLBUTTON_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack6BitrateMode, TOOLBUTTON_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack1Quality, SCROLL_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack2Quality, SCROLL_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack3Quality, SCROLL_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack4Quality, SCROLL_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack5Quality, SCROLL_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutTrack6Quality, SCROLL_CHANGED, OUTPUTS_CHANGED);
 	HookWidget(ui->advOutRescale,        CBEDIT_CHANGED, OUTPUTS_CHANGED);
 	HookWidget(ui->advOutRescaleFilter,  COMBO_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutTrack1,         CHECK_CHANGED,  OUTPUTS_CHANGED);
@@ -653,6 +669,8 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	connect(ui->simpleOutputVBitrate, &QSpinBox::valueChanged, this, &OBSBasicSettings::UpdateStreamDelayEstimate);
 	connect(ui->simpleOutputABitrate, &QComboBox::currentIndexChanged, this,
 		&OBSBasicSettings::UpdateStreamDelayEstimate);
+	connect(ui->simpleOutputABitrateMode, &QToolButton::toggled, this,
+		&OBSBasicSettings::SimpleAudioBitrateModeChanged);
 	connect(ui->advOutTrack1Bitrate, &QComboBox::currentIndexChanged, this,
 		&OBSBasicSettings::UpdateStreamDelayEstimate);
 	connect(ui->advOutTrack2Bitrate, &QComboBox::currentIndexChanged, this,
@@ -898,9 +916,17 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	connect(ui->advOutAEncoder, &QComboBox::currentIndexChanged, this, &OBSBasicSettings::AdvAudioEncodersChanged);
 	connect(ui->advOutRecAEncoder, &QComboBox::currentIndexChanged, this,
 		&OBSBasicSettings::AdvAudioEncodersChanged);
+	{
+		QToolButton *track_modes[] = {ui->advOutTrack1BitrateMode, ui->advOutTrack2BitrateMode, ui->advOutTrack3BitrateMode,
+		                              ui->advOutTrack4BitrateMode, ui->advOutTrack5BitrateMode, ui->advOutTrack6BitrateMode};
+		for (auto *mode : track_modes)
+			connect(mode, &QToolButton::toggled, this, &OBSBasicSettings::AdvTrackBitrateModeChanged);
+	}
 
 	UpdateAudioWarnings();
 	UpdateAdvNetworkGroup();
+
+	UpdateSimpleAudioBitrateModeUI();
 
 	ui->audioMsg->setVisible(false);
 	ui->advancedMsg->setVisible(false);
@@ -1783,6 +1809,23 @@ void OBSBasicSettings::LoadSimpleOutputSettings()
 	idx = ui->simpleOutRecAEncoder->findData(QString(recAudioEnc));
 	ui->simpleOutRecAEncoder->setCurrentIndex(idx);
 
+	const char *abitrateMode = config_get_string(main->Config(), "SimpleOutput", "ABitrateMode");
+	bool vbr_mode = strcmp(abitrateMode, "VBR") == 0;
+	int aquality = (int)config_get_int(main->Config(), "SimpleOutput", "AQualityTarget");
+	if (!vbr_mode && aquality <= 0)
+		aquality = 127; // legacy config: keep the default until VBR is first used
+	if (aquality < 0)
+		aquality = 0;
+	if (aquality > 127)
+		aquality = 127;
+	ui->simpleOutputAQuality->setValue(aquality);
+
+	{
+		QSignalBlocker blocker(ui->simpleOutputABitrateMode);
+		ui->simpleOutputABitrateMode->setChecked(vbr_mode);
+	}
+	UpdateSimpleAudioBitrateModeUI();
+
 	ui->simpleOutMuxCustom->setText(muxCustom);
 
 	ui->simpleReplayBuf->setChecked(replayBuf);
@@ -2165,6 +2208,33 @@ void OBSBasicSettings::LoadAdvOutputAudioSettings()
 	ui->advOutTrack4Name->setText(name4);
 	ui->advOutTrack5Name->setText(name5);
 	ui->advOutTrack6Name->setText(name6);
+
+	{
+		QToolButton *track_modes[] = {ui->advOutTrack1BitrateMode, ui->advOutTrack2BitrateMode, ui->advOutTrack3BitrateMode,
+		                              ui->advOutTrack4BitrateMode, ui->advOutTrack5BitrateMode, ui->advOutTrack6BitrateMode};
+		QSpinBox *track_qualities[] = {ui->advOutTrack1Quality, ui->advOutTrack2Quality, ui->advOutTrack3Quality,
+		                               ui->advOutTrack4Quality, ui->advOutTrack5Quality, ui->advOutTrack6Quality};
+		for (size_t i = 0; i < 6; i++) {
+			std::string mode_key = "Track";
+			mode_key += std::to_string(i + 1);
+			mode_key += "BitrateMode";
+			std::string quality_key = "Track";
+			quality_key += std::to_string(i + 1);
+			quality_key += "QualityTarget";
+
+			bool vbr_mode = strcmp(config_get_string(main->Config(), "AdvOut", mode_key.c_str()), "VBR") == 0;
+			int aquality = (int)config_get_int(main->Config(), "AdvOut", quality_key.c_str());
+			if (aquality < 0)
+				aquality = 0;
+			if (aquality > 127)
+				aquality = 127;
+
+			track_qualities[i]->setValue(aquality);
+			QSignalBlocker blocker(track_modes[i]);
+			track_modes[i]->setChecked(vbr_mode);
+		}
+		UpdateAdvTrackBitrateModeUI();
+	}
 }
 
 void OBSBasicSettings::LoadOutputSettings()
@@ -3377,6 +3447,13 @@ void OBSBasicSettings::SaveOutputSettings()
 	SaveComboData(ui->simpleOutStrEncoder, "SimpleOutput", "StreamEncoder");
 	SaveComboData(ui->simpleOutStrAEncoder, "SimpleOutput", "StreamAudioEncoder");
 	SaveCombo(ui->simpleOutputABitrate, "SimpleOutput", "ABitrate");
+	{
+		bool vbr_mode = ui->simpleOutputABitrateMode->isChecked() &&
+				ui->simpleOutStrAEncoder->currentData().toString() == "aac" &&
+				EncoderAvailable("CoreAudio_AAC");
+		config_set_string(main->Config(), "SimpleOutput", "ABitrateMode", vbr_mode ? "VBR" : "CBR");
+		config_set_int(main->Config(), "SimpleOutput", "AQualityTarget", ui->simpleOutputAQuality->value());
+	}
 	SaveEdit(ui->simpleOutputPath, "SimpleOutput", "FilePath");
 	SaveCheckBox(ui->simpleNoSpace, "SimpleOutput", "FileNameWithoutSpace");
 	SaveComboData(ui->simpleOutRecFormat, "SimpleOutput", "RecFormat2");
@@ -3453,6 +3530,27 @@ void OBSBasicSettings::SaveOutputSettings()
 	SaveCombo(ui->advOutTrack4Bitrate, "AdvOut", "Track4Bitrate");
 	SaveCombo(ui->advOutTrack5Bitrate, "AdvOut", "Track5Bitrate");
 	SaveCombo(ui->advOutTrack6Bitrate, "AdvOut", "Track6Bitrate");
+	{
+		bool adv_aac_available = (ui->advOutAEncoder->currentData().toString() == "CoreAudio_AAC" ||
+		                          ui->advOutRecAEncoder->currentData().toString() == "CoreAudio_AAC") &&
+		                         EncoderAvailable("CoreAudio_AAC");
+		QToolButton *track_modes[] = {ui->advOutTrack1BitrateMode, ui->advOutTrack2BitrateMode, ui->advOutTrack3BitrateMode,
+		                              ui->advOutTrack4BitrateMode, ui->advOutTrack5BitrateMode, ui->advOutTrack6BitrateMode};
+		QSpinBox *track_qualities[] = {ui->advOutTrack1Quality, ui->advOutTrack2Quality, ui->advOutTrack3Quality,
+		                               ui->advOutTrack4Quality, ui->advOutTrack5Quality, ui->advOutTrack6Quality};
+		for (size_t i = 0; i < 6; i++) {
+			std::string mode_key = "Track";
+			mode_key += std::to_string(i + 1);
+			mode_key += "BitrateMode";
+			std::string quality_key = "Track";
+			quality_key += std::to_string(i + 1);
+			quality_key += "QualityTarget";
+
+			bool vbr_mode = adv_aac_available && track_modes[i]->isChecked();
+			config_set_string(main->Config(), "AdvOut", mode_key.c_str(), vbr_mode ? "VBR" : "CBR");
+			config_set_int(main->Config(), "AdvOut", quality_key.c_str(), track_qualities[i]->value());
+		}
+	}
 	SaveEdit(ui->advOutTrack1Name, "AdvOut", "Track1Name");
 	SaveEdit(ui->advOutTrack2Name, "AdvOut", "Track2Name");
 	SaveEdit(ui->advOutTrack3Name, "AdvOut", "Track3Name");
@@ -5678,6 +5776,8 @@ void OBSBasicSettings::UpdateMultitrackVideo()
 
 		ui->simpleOutputABitrateLabel->setDisabled(mtv_enabled);
 		ui->simpleOutputABitrate->setDisabled(mtv_enabled);
+		ui->simpleOutputABitrateMode->setDisabled(mtv_enabled);
+		ui->simpleOutputAQuality->setDisabled(mtv_enabled);
 
 		ui->simpleOutStrEncoderLabel->setDisabled(mtv_enabled);
 		ui->simpleOutStrEncoder->setDisabled(mtv_enabled);
@@ -5817,6 +5917,41 @@ void OBSBasicSettings::SimpleStreamAudioEncoderChanged()
 		return;
 
 	RestrictResetBitrates({ui->simpleOutputABitrate}, 320);
+
+	UpdateSimpleAudioBitrateModeUI();
+}
+
+void OBSBasicSettings::SimpleAudioBitrateModeChanged(bool /*vbr*/)
+{
+	UpdateSimpleAudioBitrateModeUI();
+}
+
+void OBSBasicSettings::UpdateSimpleAudioBitrateModeUI()
+{
+	bool available = ui->simpleOutStrAEncoder->currentData().toString() == "aac" && EncoderAvailable("CoreAudio_AAC");
+
+	if (!available) {
+		QSignalBlocker blocker(ui->simpleOutputABitrateMode);
+		ui->simpleOutputABitrateMode->setChecked(false);
+	}
+
+	bool vbr = available && ui->simpleOutputABitrateMode->isChecked();
+
+	ui->simpleOutputABitrateMode->setText(vbr ? "VBR" : "CBR");
+	ui->simpleOutputABitrateMode->setEnabled(available);
+	ui->simpleOutputABitrateMode->setToolTip(
+			QTStr(available ? "Basic.Settings.Output.Simple.ABitrateMode.VBR.Tooltip"
+			     : "Basic.Settings.Output.Simple.ABitrateMode.VBR.Unavailable.Tooltip"));
+	ui->simpleOutputAQuality->setToolTip(QTStr("Basic.Settings.Output.Simple.AQualityTarget.Tooltip"));
+
+	ui->simpleOutputABitrateLabel->setText(vbr ? QTStr("Basic.Settings.Output.AudioQuality")
+	                                         : QTStr("Basic.Settings.Output.AudioBitrate"));
+	if (vbr)
+		ui->simpleOutputABitrateLabel->setBuddy(ui->simpleOutputAQuality);
+	else
+		ui->simpleOutputABitrateLabel->setBuddy(ui->simpleOutputABitrate);
+	ui->simpleOutputABitrate->setVisible(!vbr);
+	ui->simpleOutputAQuality->setVisible(vbr);
 }
 
 void OBSBasicSettings::AdvAudioEncodersChanged()
@@ -5827,6 +5962,7 @@ void OBSBasicSettings::AdvAudioEncodersChanged()
 	if (recEncoder == "none")
 		recEncoder = streamEncoder;
 
+	UpdateAdvTrackBitrateModeUI();
 	PopulateAdvancedBitrates({ui->advOutTrack1Bitrate, ui->advOutTrack2Bitrate, ui->advOutTrack3Bitrate,
 				  ui->advOutTrack4Bitrate, ui->advOutTrack5Bitrate, ui->advOutTrack6Bitrate},
 				 QT_TO_UTF8(streamEncoder), QT_TO_UTF8(recEncoder));
@@ -5837,4 +5973,50 @@ void OBSBasicSettings::AdvAudioEncodersChanged()
 	RestrictResetBitrates({ui->advOutTrack1Bitrate, ui->advOutTrack2Bitrate, ui->advOutTrack3Bitrate,
 			       ui->advOutTrack4Bitrate, ui->advOutTrack5Bitrate, ui->advOutTrack6Bitrate},
 			      320);
+}
+
+void OBSBasicSettings::AdvTrackBitrateModeChanged(bool /*vbr*/)
+{
+	UpdateAdvTrackBitrateModeUI();
+}
+
+void OBSBasicSettings::UpdateAdvTrackBitrateModeUI()
+{
+	bool aac_selected = ui->advOutAEncoder->currentData().toString() == "CoreAudio_AAC" ||
+	                    ui->advOutRecAEncoder->currentData().toString() == "CoreAudio_AAC";
+	bool available = aac_selected && EncoderAvailable("CoreAudio_AAC");
+
+	QToolButton *track_modes[] = {ui->advOutTrack1BitrateMode, ui->advOutTrack2BitrateMode, ui->advOutTrack3BitrateMode,
+	                              ui->advOutTrack4BitrateMode, ui->advOutTrack5BitrateMode, ui->advOutTrack6BitrateMode};
+	QSpinBox *track_qualities[] = {ui->advOutTrack1Quality, ui->advOutTrack2Quality, ui->advOutTrack3Quality,
+	                               ui->advOutTrack4Quality, ui->advOutTrack5Quality, ui->advOutTrack6Quality};
+	QComboBox *track_bitrates[] = {ui->advOutTrack1Bitrate, ui->advOutTrack2Bitrate, ui->advOutTrack3Bitrate,
+	                               ui->advOutTrack4Bitrate, ui->advOutTrack5Bitrate, ui->advOutTrack6Bitrate};
+	QLabel *track_labels[] = {ui->advOutTrack1BitrateLabel, ui->advOutTrack2BitrateLabel, ui->advOutTrack3BitrateLabel,
+	                          ui->advOutTrack4BitrateLabel, ui->advOutTrack5BitrateLabel, ui->advOutTrack6BitrateLabel};
+
+	for (size_t i = 0; i < 6; i++) {
+		if (!available) {
+			QSignalBlocker blocker(track_modes[i]);
+			track_modes[i]->setChecked(false);
+		}
+
+		bool vbr = available && track_modes[i]->isChecked();
+
+		track_modes[i]->setText(vbr ? "VBR" : "CBR");
+		track_modes[i]->setEnabled(available);
+		track_modes[i]->setToolTip(
+				QTStr(available ? "Basic.Settings.Output.Adv.ABitrateMode.VBR.Tooltip"
+				     : "Basic.Settings.Output.Adv.ABitrateMode.VBR.Unavailable.Tooltip"));
+		track_qualities[i]->setToolTip(QTStr("Basic.Settings.Output.Adv.AQualityTarget.Tooltip"));
+		track_qualities[i]->setVisible(vbr);
+		track_bitrates[i]->setVisible(!vbr);
+
+		track_labels[i]->setText(vbr ? QTStr("Basic.Settings.Output.AudioQuality")
+		                            : QTStr("Basic.Settings.Output.AudioBitrate"));
+		if (vbr)
+			track_labels[i]->setBuddy(track_qualities[i]);
+		else
+			track_labels[i]->setBuddy(track_bitrates[i]);
+	}
 }

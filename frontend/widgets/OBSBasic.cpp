@@ -666,6 +666,8 @@ bool OBSBasic::InitBasicConfigDefaults()
 	config_set_default_string(activeConfiguration, "SimpleOutput", "RecFormat2", DEFAULT_CONTAINER);
 	config_set_default_uint(activeConfiguration, "SimpleOutput", "VBitrate", 2500);
 	config_set_default_uint(activeConfiguration, "SimpleOutput", "ABitrate", 160);
+	config_set_default_string(activeConfiguration, "SimpleOutput", "ABitrateMode", "CBR");
+	config_set_default_int(activeConfiguration, "SimpleOutput", "AQualityTarget", 127);
 	config_set_default_bool(activeConfiguration, "SimpleOutput", "UseAdvanced", false);
 	config_set_default_string(activeConfiguration, "SimpleOutput", "Preset", "veryfast");
 	config_set_default_string(activeConfiguration, "SimpleOutput", "NVENCPreset2", "p5");
@@ -709,6 +711,18 @@ bool OBSBasic::InitBasicConfigDefaults()
 	config_set_default_uint(activeConfiguration, "AdvOut", "Track4Bitrate", 160);
 	config_set_default_uint(activeConfiguration, "AdvOut", "Track5Bitrate", 160);
 	config_set_default_uint(activeConfiguration, "AdvOut", "Track6Bitrate", 160);
+	config_set_default_string(activeConfiguration, "AdvOut", "Track1BitrateMode", "CBR");
+	config_set_default_int(activeConfiguration, "AdvOut", "Track1QualityTarget", 127);
+	config_set_default_string(activeConfiguration, "AdvOut", "Track2BitrateMode", "CBR");
+	config_set_default_int(activeConfiguration, "AdvOut", "Track2QualityTarget", 127);
+	config_set_default_string(activeConfiguration, "AdvOut", "Track3BitrateMode", "CBR");
+	config_set_default_int(activeConfiguration, "AdvOut", "Track3QualityTarget", 127);
+	config_set_default_string(activeConfiguration, "AdvOut", "Track4BitrateMode", "CBR");
+	config_set_default_int(activeConfiguration, "AdvOut", "Track4QualityTarget", 127);
+	config_set_default_string(activeConfiguration, "AdvOut", "Track5BitrateMode", "CBR");
+	config_set_default_int(activeConfiguration, "AdvOut", "Track5QualityTarget", 127);
+	config_set_default_string(activeConfiguration, "AdvOut", "Track6BitrateMode", "CBR");
+	config_set_default_int(activeConfiguration, "AdvOut", "Track6QualityTarget", 127);
 
 	config_set_default_uint(activeConfiguration, "AdvOut", "RecSplitFileTime", 15);
 	config_set_default_uint(activeConfiguration, "AdvOut", "RecSplitFileSize", 2048);

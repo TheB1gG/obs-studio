@@ -409,7 +409,8 @@ static bool create_encoder(DStr &log, ca_encoder *ca, AudioStreamBasicDescriptio
 	STATUS_CHECK(AudioConverterSetProperty(ca->converter, kAudioCodecPropertyBitRateControlMode,
 					       sizeof(rate_control), &rate_control));
 
-	if (!bitrate_valid(log, ca, ca->converter, bitrate)) {
+	/* Bitrate validation only applies to constant-rate encoding */
+	if (rate_control == kAudioCodecBitRateControlMode_Constant && !bitrate_valid(log, ca, ca->converter, bitrate)) {
 		log_to_dstr(log, ca,
 			    "Encoder does not support bitrate %u "
 			    "for format %s (0x%x)\n",
@@ -442,10 +443,24 @@ static void *aac_create(obs_data_t *settings, obs_encoder_t *encoder)
 		return nullptr;                              \
 	}
 
-	UInt32 bitrate = (UInt32)obs_data_get_int(settings, "bitrate") * 1000;
-	if (!bitrate) {
-		CA_LOG_ENCODER("AAC", encoder, LOG_ERROR, "Invalid bitrate specified");
-		return NULL;
+	bool vbr = obs_data_get_bool(settings, "vbr");
+	UInt32 quality_target = 0;
+
+	UInt32 bitrate = 0;
+
+	if (vbr) {
+		int quality = (int)obs_data_get_int(settings, "quality_target");
+		if (quality < 0)
+			quality = 0;
+		if (quality > 127)
+			quality = 127;
+		quality_target = (UInt32)quality;
+	} else {
+		bitrate = (UInt32)obs_data_get_int(settings, "bitrate") * 1000;
+		if (!bitrate) {
+			CA_LOG_ENCODER("AAC", encoder, LOG_ERROR, "Invalid bitrate specified");
+			return NULL;
+		}
 	}
 
 	const enum audio_format format = AUDIO_FORMAT_FLOAT;
@@ -490,7 +505,8 @@ static void *aac_create(obs_data_t *settings, obs_encoder_t *encoder)
 
 	AudioStreamBasicDescription out;
 
-	UInt32 rate_control = kAudioCodecBitRateControlMode_Constant;
+	/* Variable rate control is required for VBR quality targeting */
+	UInt32 rate_control = vbr ? kAudioCodecBitRateControlMode_Variable : kAudioCodecBitRateControlMode_Constant;
 
 	if (obs_data_get_bool(settings, "allow he-aac") && ca->channels != 3) {
 		ca->allowed_formats = &aac_formats;
@@ -514,6 +530,26 @@ static void *aac_create(obs_data_t *settings, obs_encoder_t *encoder)
 		break;
 	}
 
+	if (!encoder_created && vbr) {
+		/* Variable rate control is not supported - fall back to constant-rate encoding */
+		vbr = false;
+		rate_control = kAudioCodecBitRateControlMode_Constant;
+		bitrate = 192 * 1000;
+
+		CA_CO_DLOG(LOG_WARNING, "Variable bitrate mode is not supported, falling back to constant bitrate (192 kbps)");
+
+		for (UInt32 format_id : *ca->allowed_formats) {
+			log_to_dstr(log, ca.get(), "Trying format %s (0x%x)\n", format_id_to_str(format_id),
+				    (uint32_t)format_id);
+
+			if (!create_encoder(log, ca.get(), &in, &out, format_id, bitrate, samplerate, rate_control))
+				continue;
+
+			encoder_created = true;
+			break;
+		}
+	}
+
 	if (!encoder_created) {
 		CA_CO_DLOG(LOG_ERROR,
 			   "Could not create encoder for "
@@ -530,7 +566,17 @@ static void *aac_create(obs_data_t *settings, obs_encoder_t *encoder)
 	STATUS_CHECK(AudioConverterSetProperty(ca->converter, kAudioConverterCodecQuality, sizeof(converter_quality),
 					       &converter_quality));
 
-	STATUS_CHECK(AudioConverterSetProperty(ca->converter, kAudioConverterEncodeBitRate, sizeof(bitrate), &bitrate));
+	if (vbr) {
+		code = AudioConverterSetProperty(ca->converter, kAudioCodecPropertySoundQualityForVBR,
+						 sizeof(quality_target), &quality_target);
+		if (code) {
+			log_osstatus(LOG_WARNING, ca.get(), "AudioConverterSetProperty(SoundQualityForVBR)", code);
+			/* The encoder will use its default VBR quality */
+		}
+	} else {
+		STATUS_CHECK(AudioConverterSetProperty(ca->converter, kAudioConverterEncodeBitRate, sizeof(bitrate),
+						       &bitrate));
+	}
 
 	UInt32 size = sizeof(in);
 	STATUS_CHECK(
@@ -612,16 +658,27 @@ static void *aac_create(obs_data_t *settings, obs_encoder_t *encoder)
 	const char *format_name = out.mFormatID == kAudioFormatMPEG4AAC_HE_V2 ? "HE-AAC v2"
 				  : out.mFormatID == kAudioFormatMPEG4AAC_HE  ? "HE-AAC"
 									      : "AAC";
-	CA_BLOG(LOG_INFO,
-		"settings:\n"
-		"\tmode:          %s\n"
-		"\tbitrate:       %u\n"
-		"\tsample rate:   %llu\n"
-		"\tcbr:           %s\n"
-		"\toutput buffer: %lu",
-		format_name, (unsigned int)bitrate / 1000, ca->samples_per_second,
-		rate_control == kAudioCodecBitRateControlMode_Constant ? "on" : "off",
-		(unsigned long)ca->output_buffer_size);
+	if (vbr) {
+		CA_BLOG(LOG_INFO,
+			"settings:\n"
+			"\tmode:           %s\n"
+			"\tquality target: %u\n"
+			"\tsample rate:    %llu\n"
+			"\tcbr:            off\n"
+			"\toutput buffer:  %lu",
+			format_name, (unsigned int)quality_target, ca->samples_per_second,
+			(unsigned long)ca->output_buffer_size);
+	} else {
+		CA_BLOG(LOG_INFO,
+			"settings:\n"
+			"\tmode:          %s\n"
+			"\tbitrate:       %u\n"
+			"\tsample rate:   %llu\n"
+			"\tcbr:           on\n"
+			"\toutput buffer: %lu",
+			format_name, (unsigned int)bitrate / 1000, ca->samples_per_second,
+			(unsigned long)ca->output_buffer_size);
+	}
 
 	return ca.release();
 #undef STATUS_CHECK
