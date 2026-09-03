@@ -283,7 +283,7 @@ static bool write_audio_header(struct flv_output *stream, size_t idx)
 		return false;
 
 	if (obs_encoder_get_extra_data(aencoder, &packet.data, &packet.size)) {
-		if (idx == 0) {
+		if (idx == 0 && stream->audio_codec[idx] == AUDIO_CODEC_AAC) {
 			write_packet(stream, &packet, true);
 		} else {
 			write_audio_packet_ex(stream, &packet, true, idx);
@@ -721,7 +721,7 @@ static void flv_output_data(void *data, struct encoder_packet *packet)
 			stream->got_first_packet = true;
 		}
 
-		if (packet->track_idx != 0) {
+		if (packet->track_idx != 0 || stream->audio_codec[packet->track_idx] != AUDIO_CODEC_AAC) {
 			write_audio_packet_ex(stream, packet, false, packet->track_idx);
 		} else {
 			write_packet(stream, packet, false);
@@ -750,7 +750,7 @@ struct obs_output_info flv_output_info = {
 #else
 	.encoded_video_codecs = "h264;av1",
 #endif
-	.encoded_audio_codecs = "aac",
+	.encoded_audio_codecs = "aac;opus;flac",
 	.get_name = flv_output_getname,
 	.create = flv_output_create,
 	.destroy = flv_output_destroy,

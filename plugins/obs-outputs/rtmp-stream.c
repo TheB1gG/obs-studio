@@ -784,7 +784,8 @@ static void *send_thread(void *data)
 		    (stream->video_codec[packet.track_idx] != CODEC_H264 ||
 		     (stream->video_codec[packet.track_idx] == CODEC_H264 && packet.track_idx != 0))) {
 			sent = send_packet_ex(stream, &packet, false, false, packet.track_idx);
-		} else if (packet.type == OBS_ENCODER_AUDIO && packet.track_idx != 0) {
+		} else if (packet.type == OBS_ENCODER_AUDIO &&
+		    (packet.track_idx != 0 || stream->audio_codec[packet.track_idx] != AUDIO_CODEC_AAC)) {
 			sent = send_audio_packet_ex(stream, &packet, false, packet.track_idx);
 		} else {
 			sent = send_packet(stream, &packet, false);
@@ -903,7 +904,7 @@ static bool send_audio_header(struct rtmp_stream *stream, size_t idx, bool *next
 
 	if (obs_encoder_get_extra_data(aencoder, &header, &packet.size)) {
 		packet.data = bmemdup(header, packet.size);
-		if (idx == 0) {
+		if (idx == 0 && stream->audio_codec[idx] == AUDIO_CODEC_AAC) {
 			return send_packet(stream, &packet, true) >= 0;
 		} else {
 			return send_audio_packet_ex(stream, &packet, true, idx) >= 0;
@@ -1986,7 +1987,7 @@ struct obs_output_info rtmp_output_info = {
 #else
 	.encoded_video_codecs = "h264;av1",
 #endif
-	.encoded_audio_codecs = "aac",
+	.encoded_audio_codecs = "aac;opus;flac",
 	.get_name = rtmp_stream_getname,
 	.create = rtmp_stream_create,
 	.destroy = rtmp_stream_destroy,

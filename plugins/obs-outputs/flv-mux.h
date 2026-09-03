@@ -24,6 +24,8 @@
 enum audio_id_t {
 	AUDIO_CODEC_NONE = 0,
 	AUDIO_CODEC_AAC = 1,
+	AUDIO_CODEC_OPUS = 2,
+	AUDIO_CODEC_FLAC = 3,
 };
 
 enum video_id_t {
@@ -37,6 +39,10 @@ static enum audio_id_t to_audio_type(const char *codec)
 {
 	if (strcmp(codec, "aac") == 0)
 		return AUDIO_CODEC_AAC;
+	if (strcmp(codec, "opus") == 0)
+		return AUDIO_CODEC_OPUS;
+	if (strcmp(codec, "flac") == 0)
+		return AUDIO_CODEC_FLAC;
 	return AUDIO_CODEC_NONE;
 }
 

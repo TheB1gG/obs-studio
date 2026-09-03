@@ -30,6 +30,34 @@ static const char *av1_main = "Main";
 // Maximum reconnect attempts with an invalid key error before giving up (roughly 30 seconds with default start value)
 static constexpr uint8_t MAX_RECONNECT_ATTEMPTS = 5;
 
+extern bool EncoderAvailable(const char *encoder);
+
+// Resolves a codec name from the Go-Live JSON config to an OBS audio encoder ID.
+// Falls back to the provided default (typically CoreAudio_AAC or ffmpeg_aac) if the
+// requested codec's encoder is not available.
+static const char *resolve_audio_encoder_id(const char *codec, const char *default_id)
+{
+	if (!codec || codec[0] == '\0')
+		return default_id;
+
+	if (strcmp(codec, "flac") == 0) {
+		if (EncoderAvailable("ffmpeg_flac"))
+			return "ffmpeg_flac";
+		blog(LOG_WARNING, "MultitrackVideoOutput: FLAC encoder not available, falling back to %s", default_id);
+		return default_id;
+	}
+
+	if (strcmp(codec, "opus") == 0) {
+		if (EncoderAvailable("ffmpeg_opus"))
+			return "ffmpeg_opus";
+		blog(LOG_WARNING, "MultitrackVideoOutput: Opus encoder not available, falling back to %s", default_id);
+		return default_id;
+	}
+
+	// "aac" or any unrecognized codec: use the platform default
+	return default_id;
+}
+
 Qt::ConnectionType BlockingConnectionTypeFor(QObject *object)
 {
 	return object->thread() == QThread::currentThread() ? Qt::DirectConnection : Qt::BlockingQueuedConnection;
@@ -1130,10 +1158,11 @@ static void create_audio_encoders(const GoLiveApi::Config &go_live_config,
 
 		for (size_t i = 0; i < configs.size(); i++) {
 			dstr_printf(encoder_name_buffer, "%s %zu", name_prefix, i);
-			nlohmann::json track_settings = apply_audio_vbr_override(configs[i], audio_encoder_id);
+			const char *track_encoder_id = resolve_audio_encoder_id(configs[i].codec.c_str(), audio_encoder_id);
+			nlohmann::json track_settings = apply_audio_vbr_override(configs[i], track_encoder_id);
 			OBSDataAutoRelease settings = obs_data_create_from_json(track_settings.dump().c_str());
 			OBSEncoderAutoRelease audio_encoder =
-				create_audio_encoder(encoder_name_buffer->array, audio_encoder_id, settings, mixer_idx);
+				create_audio_encoder(encoder_name_buffer->array, track_encoder_id, settings, mixer_idx);
 
 			sanitize_audio_channels(audio_encoder, configs[i].channels);
 

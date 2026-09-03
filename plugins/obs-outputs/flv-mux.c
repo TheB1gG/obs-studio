@@ -85,6 +85,20 @@ static void s_wa4cc(struct serializer *s, enum audio_id_t id)
 		s_w8(s, '4');
 		s_w8(s, 'a');
 		break;
+
+	case AUDIO_CODEC_OPUS:
+		s_w8(s, 'O');
+		s_w8(s, 'p');
+		s_w8(s, 'u');
+		s_w8(s, 's');
+		break;
+
+	case AUDIO_CODEC_FLAC:
+		s_w8(s, 'f');
+		s_w8(s, 'L');
+		s_w8(s, 'a');
+		s_w8(s, 'C');
+		break;
 	}
 }
 
@@ -187,6 +201,23 @@ void write_file_info(FILE *file, int64_t duration_ms, int64_t size)
 	fwrite(buf, 1, enc - buf, file);
 }
 
+static double audio_codec_metadata_value(enum audio_id_t codec)
+{
+	switch (codec) {
+	case AUDIO_CODEC_AAC:
+		return AUDIODATA_AAC;
+	case AUDIO_CODEC_OPUS:
+		/* "Opus" as big-endian FourCC: 0x4F707573 */
+		return 1332770163.0;
+	case AUDIO_CODEC_FLAC:
+		/* "fLaC" as big-endian FourCC: 0x664C6143 */
+		return 1718459395.0;
+	case AUDIO_CODEC_NONE:
+	default:
+		return AUDIODATA_AAC;
+	}
+}
+
 static void build_flv_meta_data(obs_output_t *context, uint8_t **output, size_t *size)
 {
 	obs_encoder_t *vencoder = obs_output_get_video_encoder(context);
@@ -214,7 +245,8 @@ static void build_flv_meta_data(obs_output_t *context, uint8_t **output, size_t 
 	enc_num_val(&enc, end, "videodatarate", encoder_bitrate(vencoder));
 	enc_num_val(&enc, end, "framerate", video_output_get_frame_rate(video));
 
-	enc_num_val(&enc, end, "audiocodecid", AUDIODATA_AAC);
+	enum audio_id_t acodec = to_audio_type(obs_encoder_get_codec(aencoder));
+	enc_num_val(&enc, end, "audiocodecid", audio_codec_metadata_value(acodec));
 	enc_num_val(&enc, end, "audiodatarate", encoder_bitrate(aencoder));
 	enc_num_val(&enc, end, "audiosamplerate", (double)obs_encoder_get_sample_rate(aencoder));
 	enc_num_val(&enc, end, "audiosamplesize", 16.0);
