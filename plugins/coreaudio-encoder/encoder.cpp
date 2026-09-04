@@ -1033,7 +1033,7 @@ static void aac_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "samplerate", 0); //match input
 	obs_data_set_default_int(settings, "bitrate", find_matching_bitrate(128));
-	obs_data_set_default_bool(settings, "allow he-aac", true);
+	obs_data_set_default_bool(settings, "allow he-aac", false); // AAC-LC is the most compatible profile
 }
 
 template<typename Func>
