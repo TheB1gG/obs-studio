@@ -110,6 +110,11 @@ enum video_format {
 	 * as three full-resolution u16 planes with G in the luma slot (x264 ingests it as
 	 * YUV444P | HIGH_DEPTH, same plane values/order as the packed X2BGR10LE path). */
 	VIDEO_FORMAT_R10P,
+
+	/* planar YUV 4:2:0, 12 bpp (u16 samples) */
+	VIDEO_FORMAT_YUV420P12,
+	/* planar YUV 4:2:2, 12 bpp (u16 samples) */
+	VIDEO_FORMAT_YUV422P12,
 };
 
 enum video_trc {
@@ -177,6 +182,8 @@ static inline bool format_is_yuv(enum video_format format)
 	case VIDEO_FORMAT_P416:
 	case VIDEO_FORMAT_V210:
 	case VIDEO_FORMAT_Y410:
+	case VIDEO_FORMAT_YUV420P12:
+	case VIDEO_FORMAT_YUV422P12:
 		return true;
 	case VIDEO_FORMAT_NONE:
 	case VIDEO_FORMAT_RGBA:
@@ -209,6 +216,8 @@ static inline int video_format_bit_depth(enum video_format format)
 	case VIDEO_FORMAT_V210:
 		return 10;
 	case VIDEO_FORMAT_I412:
+	case VIDEO_FORMAT_YUV420P12:
+	case VIDEO_FORMAT_YUV422P12:
 		return 12;
 	default:
 		return 8;
@@ -223,11 +232,13 @@ static inline void video_format_chroma_subsample(enum video_format format, int *
 	case VIDEO_FORMAT_NV12:
 	case VIDEO_FORMAT_I010:
 	case VIDEO_FORMAT_P010:
+	case VIDEO_FORMAT_YUV420P12:
 		*h = 2; *v = 2;
 		break;
 	case VIDEO_FORMAT_I422:
 	case VIDEO_FORMAT_I210:
 	case VIDEO_FORMAT_P216:
+	case VIDEO_FORMAT_YUV422P12:
 	case VIDEO_FORMAT_YVYU:
 	case VIDEO_FORMAT_YUY2:
 	case VIDEO_FORMAT_UYVY:
@@ -316,6 +327,10 @@ static inline const char *get_video_format_name(enum video_format format)
 		return "GBR10";
 	case VIDEO_FORMAT_R10P:
 		return "R10p";
+	case VIDEO_FORMAT_YUV420P12:
+		return "YUV420P12";
+	case VIDEO_FORMAT_YUV422P12:
+		return "YUV422P12";
 	case VIDEO_FORMAT_NONE:;
 	}
 

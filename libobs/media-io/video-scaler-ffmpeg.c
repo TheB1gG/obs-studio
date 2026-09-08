@@ -55,6 +55,10 @@ static inline enum AVPixelFormat get_ffmpeg_video_format(enum video_format forma
 		return AV_PIX_FMT_YUV444P;
 	case VIDEO_FORMAT_I412:
 		return AV_PIX_FMT_YUV444P10LE; // x264 HIGH_DEPTH reads raw 10-bit u16 samples; YUV444P12LE stores them pre-scaled by 4
+	case VIDEO_FORMAT_YUV420P12:
+		return AV_PIX_FMT_YUV420P12LE;
+	case VIDEO_FORMAT_YUV422P12:
+		return AV_PIX_FMT_YUV422P12LE;
 	case VIDEO_FORMAT_BGR3:
 		return AV_PIX_FMT_BGR24;
 	case VIDEO_FORMAT_I422:
