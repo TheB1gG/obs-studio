@@ -905,6 +905,16 @@ static bool obs_x264_update(void *data, obs_data_t *settings)
 		    obs_data_get_string(settings, "color_format"));
 		return false;
 	}
+	/* Keep the stored color settings in sync with what we're about to publish, so
+	 * update_params() computes the VUI from the current values rather than whatever
+	 * create() last saw. A change that keeps the same csp (e.g. 709 -> 2100) would
+	 * otherwise publish a new colr box while the bitstream VUI stays stale:
+	 * x264_encoder_reconfig cannot rewrite the SPS VUI. */
+	bool space_changed = obsx264->color_space != cs || obsx264->color_range != range;
+	obsx264->color_format = format;
+	obsx264->color_space = cs;
+	obsx264->color_range = range;
+
 	publish_preferred_settings(obsx264->encoder, format, cs, range);
 
 	/* Detect if the chosen color format changed since the context was built.
@@ -914,7 +924,7 @@ static bool obs_x264_update(void *data, obs_data_t *settings)
 	 * start pick up the new format — same model as svt-av1. */
 	bool csp_changed = obsx264->active_csp != csp || obsx264->active_bitdepth != bitdepth;
 
-	if (csp_changed) {
+	if (csp_changed || space_changed) {
 		info("color format/space/range changed; the new settings apply when the encoder next starts");
 	} else {
 		bool success = update_settings(obsx264, settings, true);
@@ -927,7 +937,7 @@ static bool obs_x264_update(void *data, obs_data_t *settings)
 		return success && ret == 0;
 	}
 
-	/* csp changed: still update params so the next create() has correct values */
+	/* csp/space/range changed: still update params so the next create() has correct values */
 	update_settings(obsx264, settings, true);
 	return true;
 }
