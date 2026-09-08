@@ -86,6 +86,8 @@ void video_frame_get_linesizes(uint32_t linesize[MAX_AV_PLANES], enum video_form
 		break;
 	case VIDEO_FORMAT_I412: /* three planes: all double width */
 	case VIDEO_FORMAT_R10P: /* three planes: all double width */
+	case VIDEO_FORMAT_YUV444P12:
+	case VIDEO_FORMAT_GBRP12:
 		linesize[0] = width * 2;
 		linesize[1] = width * 2;
 		linesize[2] = width * 2;
@@ -174,6 +176,8 @@ void video_frame_get_plane_heights(uint32_t heights[MAX_AV_PLANES], enum video_f
 	case VIDEO_FORMAT_I412:
 	case VIDEO_FORMAT_R10P:
 	case VIDEO_FORMAT_YUV422P12:
+	case VIDEO_FORMAT_YUV444P12:
+	case VIDEO_FORMAT_GBRP12:
 		heights[0] = height;
 		heights[1] = height;
 		heights[2] = height;

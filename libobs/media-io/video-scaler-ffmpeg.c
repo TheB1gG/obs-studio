@@ -59,6 +59,10 @@ static inline enum AVPixelFormat get_ffmpeg_video_format(enum video_format forma
 		return AV_PIX_FMT_YUV420P12LE;
 	case VIDEO_FORMAT_YUV422P12:
 		return AV_PIX_FMT_YUV422P12LE;
+	case VIDEO_FORMAT_YUV444P12:
+		return AV_PIX_FMT_YUV444P12LE;
+	case VIDEO_FORMAT_GBRP12:
+		return AV_PIX_FMT_GBRP12LE;
 	case VIDEO_FORMAT_BGR3:
 		return AV_PIX_FMT_BGR24;
 	case VIDEO_FORMAT_I422:
