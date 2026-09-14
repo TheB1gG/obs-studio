@@ -61,18 +61,70 @@ static inline void calc_gpu_conversion_sizes(struct obs_core_video_mix *video)
 		video->conversion_techs[1] = "Planar_U_Left";
 		video->conversion_techs[2] = "Planar_V_Left";
 		video->conversion_width_i = 1.f / (float)info->width;
+		video->conversion_height_i = 1.f / (float)info->height;
 		break;
 	case VIDEO_FORMAT_NV12:
 		video->conversion_needed = true;
 		video->conversion_techs[0] = "NV12_Y";
 		video->conversion_techs[1] = "NV12_UV";
 		video->conversion_width_i = 1.f / (float)info->width;
+		video->conversion_height_i = 1.f / (float)info->height;
 		break;
 	case VIDEO_FORMAT_I444:
 		video->conversion_needed = true;
 		video->conversion_techs[0] = "Planar_Y";
 		video->conversion_techs[1] = "Planar_U";
 		video->conversion_techs[2] = "Planar_V";
+		break;
+	case VIDEO_FORMAT_I412:
+		video->conversion_needed = true;
+		video->conversion_techs[0] = "I412_Y";
+		video->conversion_techs[1] = "I412_U";
+		video->conversion_techs[2] = "I412_V";
+		break;
+	case VIDEO_FORMAT_YUV444P12:
+		video->conversion_needed = true;
+		video->conversion_techs[0] = "YUV444P12_Y";
+		video->conversion_techs[1] = "YUV444P12_U";
+		video->conversion_techs[2] = "YUV444P12_V";
+		break;
+	case VIDEO_FORMAT_GBRP12:
+		video->conversion_needed = true;
+		video->conversion_techs[0] = "GBRP12_G";
+		video->conversion_techs[1] = "GBRP12_B";
+		video->conversion_techs[2] = "GBRP12_R";
+		break;
+	case VIDEO_FORMAT_I422:
+		video->conversion_needed = true;
+		video->conversion_width_i = 1.f / (float)info->width;
+		video->conversion_height_i = 1.f / (float)info->height;
+		video->conversion_techs[0] = "I422_Y";
+		video->conversion_techs[1] = "I422_U";
+		video->conversion_techs[2] = "I422_V";
+		break;
+	case VIDEO_FORMAT_I210:
+		video->conversion_needed = true;
+		video->conversion_width_i = 1.f / (float)info->width;
+		video->conversion_height_i = 1.f / (float)info->height;
+		video->conversion_techs[0] = "I210_Y";
+		video->conversion_techs[1] = "I210_U";
+		video->conversion_techs[2] = "I210_V";
+		break;
+	case VIDEO_FORMAT_YUV420P12:
+		video->conversion_needed = true;
+		video->conversion_width_i = 1.f / (float)info->width;
+		video->conversion_height_i = 1.f / (float)info->height;
+		video->conversion_techs[0] = "YUV420P12_Y";
+		video->conversion_techs[1] = "YUV420P12_U";
+		video->conversion_techs[2] = "YUV420P12_V";
+		break;
+	case VIDEO_FORMAT_YUV422P12:
+		video->conversion_needed = true;
+		video->conversion_width_i = 1.f / (float)info->width;
+		video->conversion_height_i = 1.f / (float)info->height;
+		video->conversion_techs[0] = "YUV422P12_Y";
+		video->conversion_techs[1] = "YUV422P12_U";
+		video->conversion_techs[2] = "YUV422P12_V";
 		break;
 	case VIDEO_FORMAT_I010:
 		video->conversion_needed = true;
@@ -136,6 +188,10 @@ static inline void calc_gpu_conversion_sizes(struct obs_core_video_mix *video)
 			video->conversion_techs[0] = "P416_SRGB_Y";
 			video->conversion_techs[1] = "P416_SRGB_UV";
 		}
+		break;
+	case VIDEO_FORMAT_BGRA:
+		video->conversion_needed = true;
+		video->conversion_techs[0] = "BGRA";
 		break;
 	case VIDEO_FORMAT_GBRA:
 		video->conversion_needed = true;
@@ -308,6 +364,16 @@ static bool obs_init_gpu_conversion(struct obs_core_video_mix *video)
 		if (!video->convert_textures[0] || !video->convert_textures[1] || !video->convert_textures[2])
 			success = false;
 		break;
+	case VIDEO_FORMAT_I412:
+		video->convert_textures[0] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[1] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[2] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		if (!video->convert_textures[0] || !video->convert_textures[1] || !video->convert_textures[2])
+			success = false;
+		break;
 	case VIDEO_FORMAT_R10P:
 		video->convert_textures[0] =
 			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
@@ -362,6 +428,72 @@ static bool obs_init_gpu_conversion(struct obs_core_video_mix *video)
 	case VIDEO_FORMAT_GBR10:
 		video->convert_textures[0] =
 			gs_texture_create(info->width, info->height, GS_Y410, 1, NULL, GS_RENDER_TARGET);
+		if (!video->convert_textures[0])
+			success = false;
+		break;
+	case VIDEO_FORMAT_YUV444P12:
+		video->convert_textures[0] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[1] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[2] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		if (!video->convert_textures[0] || !video->convert_textures[1] || !video->convert_textures[2])
+			success = false;
+		break;
+	case VIDEO_FORMAT_GBRP12:
+		video->convert_textures[0] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[1] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[2] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		if (!video->convert_textures[0] || !video->convert_textures[1] || !video->convert_textures[2])
+			success = false;
+		break;
+	case VIDEO_FORMAT_I422:
+		video->convert_textures[0] =
+			gs_texture_create(info->width, info->height, GS_R8, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[1] =
+			gs_texture_create(info->width / 2, info->height, GS_R8, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[2] =
+			gs_texture_create(info->width / 2, info->height, GS_R8, 1, NULL, GS_RENDER_TARGET);
+		if (!video->convert_textures[0] || !video->convert_textures[1] || !video->convert_textures[2])
+			success = false;
+		break;
+	case VIDEO_FORMAT_I210:
+		video->convert_textures[0] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[1] =
+			gs_texture_create(info->width / 2, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[2] =
+			gs_texture_create(info->width / 2, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		if (!video->convert_textures[0] || !video->convert_textures[1] || !video->convert_textures[2])
+			success = false;
+		break;
+	case VIDEO_FORMAT_YUV420P12:
+		video->convert_textures[0] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[1] =
+			gs_texture_create(info->width / 2, info->height / 2, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[2] =
+			gs_texture_create(info->width / 2, info->height / 2, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		if (!video->convert_textures[0] || !video->convert_textures[1] || !video->convert_textures[2])
+			success = false;
+		break;
+	case VIDEO_FORMAT_YUV422P12:
+		video->convert_textures[0] =
+			gs_texture_create(info->width, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[1] =
+			gs_texture_create(info->width / 2, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		video->convert_textures[2] =
+			gs_texture_create(info->width / 2, info->height, GS_R16, 1, NULL, GS_RENDER_TARGET);
+		if (!video->convert_textures[0] || !video->convert_textures[1] || !video->convert_textures[2])
+			success = false;
+		break;
+	case VIDEO_FORMAT_BGRA:
+		video->convert_textures[0] =
+			gs_texture_create(info->width, info->height, GS_BGRA, 1, NULL, GS_RENDER_TARGET);
 		if (!video->convert_textures[0])
 			success = false;
 		break;
@@ -430,6 +562,17 @@ static bool obs_init_gpu_copy_surfaces(struct obs_core_video_mix *video, size_t 
 		if (!video->copy_surfaces[i][2])
 			return false;
 		break;
+	case VIDEO_FORMAT_I412:
+		video->copy_surfaces[i][0] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][0])
+			return false;
+		video->copy_surfaces[i][1] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][1])
+			return false;
+		video->copy_surfaces[i][2] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][2])
+			return false;
+		break;
 	case VIDEO_FORMAT_I010:
 		video->copy_surfaces[i][0] = gs_stagesurface_create(info->width, info->height, GS_R16);
 		if (!video->copy_surfaces[i][0])
@@ -476,6 +619,77 @@ static bool obs_init_gpu_copy_surfaces(struct obs_core_video_mix *video, size_t 
 		if (!video->copy_surfaces[i][0])
 			return false;
 		break;
+	case VIDEO_FORMAT_YUV444P12:
+		video->copy_surfaces[i][0] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][0])
+			return false;
+		video->copy_surfaces[i][1] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][1])
+			return false;
+		video->copy_surfaces[i][2] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][2])
+			return false;
+		break;
+	case VIDEO_FORMAT_GBRP12:
+		video->copy_surfaces[i][0] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][0])
+			return false;
+		video->copy_surfaces[i][1] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][1])
+			return false;
+		video->copy_surfaces[i][2] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][2])
+			return false;
+		break;
+	case VIDEO_FORMAT_I422:
+		video->copy_surfaces[i][0] = gs_stagesurface_create(info->width, info->height, GS_R8);
+		if (!video->copy_surfaces[i][0])
+			return false;
+		video->copy_surfaces[i][1] = gs_stagesurface_create(info->width / 2, info->height, GS_R8);
+		if (!video->copy_surfaces[i][1])
+			return false;
+		video->copy_surfaces[i][2] = gs_stagesurface_create(info->width / 2, info->height, GS_R8);
+		if (!video->copy_surfaces[i][2])
+			return false;
+		break;
+	case VIDEO_FORMAT_I210:
+		video->copy_surfaces[i][0] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][0])
+			return false;
+		video->copy_surfaces[i][1] = gs_stagesurface_create(info->width / 2, info->height, GS_R16);
+		if (!video->copy_surfaces[i][1])
+			return false;
+		video->copy_surfaces[i][2] = gs_stagesurface_create(info->width / 2, info->height, GS_R16);
+		if (!video->copy_surfaces[i][2])
+			return false;
+		break;
+	case VIDEO_FORMAT_YUV420P12:
+		video->copy_surfaces[i][0] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][0])
+			return false;
+		video->copy_surfaces[i][1] = gs_stagesurface_create(info->width / 2, info->height / 2, GS_R16);
+		if (!video->copy_surfaces[i][1])
+			return false;
+		video->copy_surfaces[i][2] = gs_stagesurface_create(info->width / 2, info->height / 2, GS_R16);
+		if (!video->copy_surfaces[i][2])
+			return false;
+		break;
+	case VIDEO_FORMAT_YUV422P12:
+		video->copy_surfaces[i][0] = gs_stagesurface_create(info->width, info->height, GS_R16);
+		if (!video->copy_surfaces[i][0])
+			return false;
+		video->copy_surfaces[i][1] = gs_stagesurface_create(info->width / 2, info->height, GS_R16);
+		if (!video->copy_surfaces[i][1])
+			return false;
+		video->copy_surfaces[i][2] = gs_stagesurface_create(info->width / 2, info->height, GS_R16);
+		if (!video->copy_surfaces[i][2])
+			return false;
+		break;
+	case VIDEO_FORMAT_BGRA:
+		video->copy_surfaces[i][0] = gs_stagesurface_create(info->width, info->height, GS_BGRA);
+		if (!video->copy_surfaces[i][0])
+			return false;
+		break;
 	default:
 		break;
 	}
@@ -502,6 +716,11 @@ static bool obs_init_textures(struct obs_core_video_mix *video)
 	case VIDEO_FORMAT_Y410:
 	case VIDEO_FORMAT_GBR10:
 	case VIDEO_FORMAT_R10P:
+	case VIDEO_FORMAT_YUV420P12:
+	case VIDEO_FORMAT_YUV422P12:
+	case VIDEO_FORMAT_YUV444P12:
+	case VIDEO_FORMAT_GBRP12:
+	case VIDEO_FORMAT_RGBA16F:
 		format = GS_RGBA16F;
 		break;
 	default:
@@ -555,6 +774,11 @@ static bool obs_init_textures(struct obs_core_video_mix *video)
 		case VIDEO_FORMAT_Y410:
 		case VIDEO_FORMAT_GBR10:
 		case VIDEO_FORMAT_R10P:
+		case VIDEO_FORMAT_YUV420P12:
+		case VIDEO_FORMAT_YUV422P12:
+		case VIDEO_FORMAT_YUV444P12:
+		case VIDEO_FORMAT_GBRP12:
+		case VIDEO_FORMAT_RGBA16F:
 			space = GS_CS_SRGB_16F;
 			break;
 		default:

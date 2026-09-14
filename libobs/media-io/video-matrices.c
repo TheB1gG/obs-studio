@@ -244,6 +244,10 @@ bool video_format_get_parameters_for_format(enum video_colorspace color_space, e
 		break;
 	case VIDEO_FORMAT_I412:
 	case VIDEO_FORMAT_YA2L:
+	case VIDEO_FORMAT_YUV420P12:
+	case VIDEO_FORMAT_YUV422P12:
+	case VIDEO_FORMAT_YUV444P12:
+	case VIDEO_FORMAT_GBRP12:
 		bpc = 12;
 		break;
 	case VIDEO_FORMAT_P216:

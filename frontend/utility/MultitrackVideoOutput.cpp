@@ -200,6 +200,23 @@ static void adjust_video_encoder_scaling(const obs_video_info &ovi, obs_encoder_
 		     encoder_index, requested_width, requested_height, ovi.base_width, ovi.base_height);
 	}
 
+	/* Integer-ratio downscale detection: when the requested resolution is an exact integer fraction of
+	 * the base canvas on both axes (e.g. 2160p -> 1080p is a clean 2x), BICUBIC downsampling preserves
+	 * quality well, so the default scaler is ideal. Log it so the user can confirm the ladder uses clean
+	 * integer ratios (avoids moire/aliasing from non-integer scales). */
+	if (requested_width > 0 && requested_height > 0 && ovi.base_width >= requested_width &&
+	    ovi.base_height >= requested_height && ovi.base_width % requested_width == 0 &&
+	    ovi.base_height % requested_height == 0) {
+		uint32_t rw = ovi.base_width / requested_width;
+		uint32_t rh = ovi.base_height / requested_height;
+		if (rw > 1 && rw == rh) {
+			blog(LOG_INFO,
+			     "Encoder %zu: integer-ratio downscale %" PRIu32 "x%" PRIu32 " -> %" PRIu32 "x%" PRIu32
+			     " (%ux), using BICUBIC",
+			     encoder_index, ovi.base_width, ovi.base_height, requested_width, requested_height, rw);
+		}
+	}
+
 	obs_encoder_set_scaled_size(video_encoder, requested_width, requested_height);
 	obs_encoder_set_gpu_scale_type(video_encoder, encoder_config.gpu_scale_type.value_or(OBS_SCALE_BICUBIC));
 	obs_encoder_set_preferred_video_format(video_encoder, encoder_config.format.value_or(VIDEO_FORMAT_NV12));
@@ -245,6 +262,15 @@ static bool encoder_available(const char *type)
 	}
 
 	return false;
+}
+
+/* AV1 (AOM/SVT) can only encode 4:2:0 at 8 or 10 bits. Returns true if the requested format is
+ * representable without a silent chroma/bit-depth downgrade. */
+static bool av1_supports_format(enum video_format fmt)
+{
+	int h = 0, v = 0;
+	video_format_chroma_subsample(fmt, &h, &v);
+	return video_format_bit_depth(fmt) <= 10 && h == 2 && v == 2;
 }
 
 static OBSEncoderAutoRelease create_video_encoder(DStr &name_buffer, size_t encoder_index,
@@ -330,6 +356,20 @@ static OBSEncoderAutoRelease create_video_encoder(DStr &name_buffer, size_t enco
 
 	adjust_video_encoder_scaling(ovi, video_encoder, encoder_config, encoder_index);
 	adjust_encoder_frame_rate_divisor(ovi, video_encoder, encoder_config, encoder_index);
+
+	/* AV1 (AOM/SVT) only encodes 4:2:0 at 8/10-bit. If a higher-fidelity format was requested,
+	 * reject loudly instead of silently downgrading to 4:2:0 (which would produce output that
+	 * over-claims its chroma/bit-depth). */
+	if (encoder_config.format) {
+		const char *codec = obs_get_encoder_codec(encoder_type);
+		if (codec && strcmp(codec, "av1") == 0 && !av1_supports_format(*encoder_config.format)) {
+			blog(LOG_ERROR,
+			     "Encoder %zu: AV1 does not support format %s; only 4:2:0 (NV12/I420/P010/I010) is supported",
+			     encoder_index, get_video_format_name(*encoder_config.format));
+			throw MultitrackVideoError::warning(
+				QTStr("FailedToStartStream.AV1UnsupportedFormat").arg(get_video_format_name(*encoder_config.format)));
+		}
+	}
 
 	return video_encoder;
 }

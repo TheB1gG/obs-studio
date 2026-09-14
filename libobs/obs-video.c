@@ -20,6 +20,7 @@
 
 #include "obs.h"
 #include "obs-internal.h"
+#include "obs-video-reuse.h"
 #include "graphics/vec4.h"
 #include "media-io/format-conversion.h"
 #include "media-io/video-frame.h"
@@ -131,6 +132,8 @@ static inline void unmap_last_surface(struct obs_core_video_mix *video)
 	}
 }
 
+/* Color-space reuse helpers (render_space_fidelity / render_space_reusable) live in "obs-video-reuse.h". */
+
 static inline bool can_reuse_mix_texture(const struct obs_core_video_mix *mix, size_t *idx)
 {
 	for (size_t i = 0, num = obs->video.mixes.num; i < num; i++) {
@@ -139,7 +142,7 @@ static inline bool can_reuse_mix_texture(const struct obs_core_video_mix *mix, s
 			break;
 		if (other->view != mix->view)
 			continue;
-		if (other->render_space != mix->render_space)
+		if (!render_space_reusable(other->render_space, mix->render_space))
 			continue;
 		if (other->ovi.base_width != mix->ovi.base_width || other->ovi.base_height != mix->ovi.base_height)
 			continue;
@@ -194,10 +197,22 @@ static inline void render_main_texture(struct obs_core_video_mix *video)
 
 	/* In some cases we can reuse a previous mix's texture and save re-rendering everything */
 	size_t reuse_idx;
-	if (can_reuse_mix_texture(video, &reuse_idx))
-		draw_mix_texture(reuse_idx);
-	else
+	video->reused_source_texture = NULL;
+	if (can_reuse_mix_texture(video, &reuse_idx)) {
+		const struct obs_core_video_mix *src = obs->video.mixes.array[reuse_idx];
+
+		if (get_mix_reuse_path(src->render_space, video->render_space, video->ovi.output_width,
+		                       video->ovi.output_height, base_width, base_height) == MIX_REUSE_ALIAS) {
+			/* Option B: same color space and no scaling needed - alias the source texture
+			 * directly into the scale/convert pass instead of a redundant same-size copy. */
+			video->reused_source_texture = src->render_texture;
+		} else {
+			/* Option A: convert down from the higher-fidelity source into this mix's texture. */
+			draw_mix_texture(reuse_idx);
+		}
+	} else {
 		obs_view_render(video->view);
+	}
 
 	video->texture_rendered = true;
 
@@ -284,8 +299,11 @@ static inline gs_texture_t *render_output_texture(struct obs_core_video_mix *mix
 	gs_texture_t *target = mix->output_texture;
 	const uint32_t width = gs_texture_get_width(target);
 	const uint32_t height = gs_texture_get_height(target);
-	if ((width == ovi->base_width) && (height == ovi->base_height))
-		return texture;
+	if ((width == ovi->base_width) && (height == ovi->base_height)) {
+		/* Option B: feed the aliased master texture straight into the convert pass, skipping a
+		 * redundant same-size copy. */
+		return mix->reused_source_texture ? mix->reused_source_texture : texture;
+	}
 
 	profile_start(render_output_texture_name);
 
@@ -777,8 +795,115 @@ static void set_gpu_converted_data(struct video_frame *output, const struct vide
 
 		break;
 	}
+	case VIDEO_FORMAT_I412: { /* three planes Y/U/V, all full resolution, double width */
+		const uint32_t width_x2 = info->width * 2;
+		const uint32_t height = info->height;
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[0], output->linesize[0],
+			input->data[0], output->data[0]);
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[1], output->linesize[1],
+			input->data[1], output->data[1]);
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[2], output->linesize[2],
+			input->data[2], output->data[2]);
+
+		break;
+	}
+	case VIDEO_FORMAT_YUV444P12: { /* three planes Y/U/V, all full resolution, double width */
+		const uint32_t width_x2 = info->width * 2;
+		const uint32_t height = info->height;
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[0], output->linesize[0],
+			input->data[0], output->data[0]);
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[1], output->linesize[1],
+			input->data[1], output->data[1]);
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[2], output->linesize[2],
+			input->data[2], output->data[2]);
+
+		break;
+	}
+	case VIDEO_FORMAT_GBRP12: { /* three planes G/B/R, all full resolution, double width */
+		const uint32_t width_x2 = info->width * 2;
+		const uint32_t height = info->height;
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[0], output->linesize[0],
+			input->data[0], output->data[0]);
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[1], output->linesize[1],
+			input->data[1], output->data[1]);
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[2], output->linesize[2],
+			input->data[2], output->data[2]);
+
+		break;
+	}
+	case VIDEO_FORMAT_I422: { /* three planes Y/U/V: Y full-res u8, U/V half-width-pixels u8 */
+		const uint32_t width = info->width;
+		const uint32_t height = info->height;
+
+		set_gpu_converted_plane(width, height, input->linesize[0], output->linesize[0],
+			input->data[0], output->data[0]);
+
+		set_gpu_converted_plane(width / 2, height, input->linesize[1], output->linesize[1],
+			input->data[1], output->data[1]);
+
+		set_gpu_converted_plane(width / 2, height, input->linesize[2], output->linesize[2],
+			input->data[2], output->data[2]);
+
+		break;
+	}
+	case VIDEO_FORMAT_I210: { /* three planes Y/U/V: Y full-res u16, U/V half-width-pixels u16 */
+		const uint32_t width_x2 = info->width * 2;
+		const uint32_t height = info->height;
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[0], output->linesize[0],
+			input->data[0], output->data[0]);
+
+		set_gpu_converted_plane(info->width, height, input->linesize[1], output->linesize[1],
+			input->data[1], output->data[1]);
+
+		set_gpu_converted_plane(info->width, height, input->linesize[2], output->linesize[2],
+			input->data[2], output->data[2]);
+
+		break;
+	}
+	case VIDEO_FORMAT_YUV420P12: { /* three planes Y/U/V: Y full-res u16, U/V quarter-res u16 */
+		const uint32_t width_x2 = info->width * 2;
+		const uint32_t height = info->height;
+		const uint32_t height_d2 = height / 2;
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[0], output->linesize[0],
+			input->data[0], output->data[0]);
+
+		set_gpu_converted_plane(info->width, height_d2, input->linesize[1], output->linesize[1],
+			input->data[1], output->data[1]);
+
+		set_gpu_converted_plane(info->width, height_d2, input->linesize[2], output->linesize[2],
+			input->data[2], output->data[2]);
+
+		break;
+	}
+	case VIDEO_FORMAT_YUV422P12: { /* three planes Y/U/V: Y full-res u16, U/V half-width-pixels u16 */
+		const uint32_t width_x2 = info->width * 2;
+		const uint32_t height = info->height;
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[0], output->linesize[0],
+			input->data[0], output->data[0]);
+
+		set_gpu_converted_plane(info->width, height, input->linesize[1], output->linesize[1],
+			input->data[1], output->data[1]);
+
+		set_gpu_converted_plane(info->width, height, input->linesize[2], output->linesize[2],
+			input->data[2], output->data[2]);
+
+		break;
+	}
 	case VIDEO_FORMAT_R10L:
-	case VIDEO_FORMAT_Y410: {
+	case VIDEO_FORMAT_Y410:
+	case VIDEO_FORMAT_BGRA: {
 		set_gpu_converted_plane(info->width * 4, info->height, input->linesize[0], output->linesize[0],
 					input->data[0], output->data[0]);
 		break;
@@ -788,13 +913,9 @@ static void set_gpu_converted_data(struct video_frame *output, const struct vide
 	case VIDEO_FORMAT_YUY2:
 	case VIDEO_FORMAT_UYVY:
 	case VIDEO_FORMAT_RGBA:
-	case VIDEO_FORMAT_BGRA:
 	case VIDEO_FORMAT_BGRX:
 	case VIDEO_FORMAT_Y800:
 	case VIDEO_FORMAT_BGR3:
-	case VIDEO_FORMAT_I412:
-	case VIDEO_FORMAT_I422:
-	case VIDEO_FORMAT_I210:
 	case VIDEO_FORMAT_I40A:
 	case VIDEO_FORMAT_I42A:
 	case VIDEO_FORMAT_YUVA:
@@ -818,7 +939,11 @@ static inline void copy_rgbx_frame(struct video_frame *output, const struct vide
 	if (input->linesize[0] == output->linesize[0]) {
 		memcpy(out_ptr, in_ptr, (size_t)input->linesize[0] * (size_t)info->height);
 	} else {
-		const size_t copy_size = (size_t)info->width * 4;
+		/* Packed single-plane formats are 4 bytes/pixel, except RGBA16F which is
+		 * 8 bytes/pixel (R/G/B/A as 16-bit float). Copy exactly the pixel data of
+		 * each row; copying a fixed width*4 would drop half of every RGBA16F row. */
+		const size_t bytes_per_pixel = (info->format == VIDEO_FORMAT_RGBA16F) ? 8 : 4;
+		const size_t copy_size = (size_t)info->width * bytes_per_pixel;
 		for (size_t y = 0; y < info->height; y++) {
 			memcpy(out_ptr, in_ptr, copy_size);
 			in_ptr += input->linesize[0];

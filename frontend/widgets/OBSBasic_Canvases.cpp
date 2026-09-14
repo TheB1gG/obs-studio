@@ -25,6 +25,8 @@ void OBSBasic::CanvasRemoved(void *data, calldata_t *params)
 
 const OBS::Canvas &OBSBasic::AddCanvas(const std::string &name, obs_video_info *ovi, int flags)
 {
+	if (ovi)
+		ovi->output_format = VIDEO_FORMAT_RGBA16F; // multitrack master is always high-fidelity
 	OBSCanvas canvas = obs_canvas_create(name.c_str(), ovi, flags);
 	auto &it = canvases.emplace_back(canvas);
 	OnEvent(OBS_FRONTEND_EVENT_CANVAS_ADDED);

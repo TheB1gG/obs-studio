@@ -787,7 +787,7 @@ bool OBSBasic::InitBasicConfigDefaults()
 	config_set_default_uint(activeConfiguration, "Video", "FPSNum", 30);
 	config_set_default_uint(activeConfiguration, "Video", "FPSDen", 1);
 	config_set_default_string(activeConfiguration, "Video", "ScaleType", "bicubic");
-	config_set_default_string(activeConfiguration, "Video", "ColorFormat", "NV12");
+	config_set_default_string(activeConfiguration, "Video", "ColorFormat", "RGBA16F");
 	config_set_default_string(activeConfiguration, "Video", "ColorSpace", "709");
 	config_set_default_string(activeConfiguration, "Video", "ColorRange", "Partial");
 	config_set_default_uint(activeConfiguration, "Video", "SdrWhiteLevel", 300);
@@ -1473,6 +1473,8 @@ static inline enum video_format GetVideoFormatFromName(const char *name)
 		return VIDEO_FORMAT_P216;
 	else if (astrcmpi(name, "P416") == 0)
 		return VIDEO_FORMAT_P416;
+	else if (astrcmpi(name, "RGBA16F") == 0)
+		return VIDEO_FORMAT_RGBA16F;
 #ifdef _WIN32
 	else if (astrcmpi(name, "Y410") == 0)
 		return VIDEO_FORMAT_Y410;

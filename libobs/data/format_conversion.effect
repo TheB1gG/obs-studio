@@ -310,7 +310,7 @@ float PS_I010_PQ_Y_709_2020(FragPos frag_in) : TARGET
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_st2084(rgb);
 	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
-	return y * (1023. / 65535.);
+	return saturate(y) * (1023. / 65535.);
 }
 
 float PS_I010_HLG_Y_709_2020(FragPos frag_in) : TARGET
@@ -319,7 +319,7 @@ float PS_I010_HLG_Y_709_2020(FragPos frag_in) : TARGET
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_hlg(rgb, hdr_lw);
 	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
-	return y * (1023. / 65535.);
+	return saturate(y) * (1023. / 65535.);
 }
 
 float PS_I010_SRGB_Y(FragPos frag_in) : TARGET
@@ -327,14 +327,16 @@ float PS_I010_SRGB_Y(FragPos frag_in) : TARGET
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
 	rgb = srgb_linear_to_nonlinear(rgb);
 	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
-	return y * (1023. / 65535.);
+	return saturate(y) * (1023. / 65535.);
 }
 
-float2 PS_UV_Wide(FragTexWide frag_in) : TARGET
+float2 PS_UV_WideWide(FragTexWideWide frag_in) : TARGET
 {
-	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
-	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
-	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	float3 rgb_topleft = image.Sample(def_sampler, frag_in.uuvv.xz).rgb;
+	float3 rgb_topright = image.Sample(def_sampler, frag_in.uuvv.yz).rgb;
+	float3 rgb_bottomleft = image.Sample(def_sampler, frag_in.uuvv.xw).rgb;
+	float3 rgb_bottomright = image.Sample(def_sampler, frag_in.uuvv.yw).rgb;
+	float3 rgb = (rgb_topleft + rgb_topright + rgb_bottomleft + rgb_bottomright) * 0.25;
 	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
 	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
 	return float2(u, v);
@@ -372,11 +374,13 @@ float2 PS_P010_HLG_UV_709_2020_WideWide(FragTexWideWide frag_in) : TARGET
 	return uv;
 }
 
-float2 PS_P010_SRGB_UV_Wide(FragTexWide frag_in) : TARGET
+float2 PS_P010_SRGB_UV_WideWide(FragTexWideWide frag_in) : TARGET
 {
-	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
-	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
-	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	float3 rgb_topleft = image.Sample(def_sampler, frag_in.uuvv.xz).rgb;
+	float3 rgb_topright = image.Sample(def_sampler, frag_in.uuvv.yz).rgb;
+	float3 rgb_bottomleft = image.Sample(def_sampler, frag_in.uuvv.xw).rgb;
+	float3 rgb_bottomright = image.Sample(def_sampler, frag_in.uuvv.yw).rgb;
+	float3 rgb = (rgb_topleft + rgb_topright + rgb_bottomleft + rgb_bottomright) * 0.25;
 	rgb = srgb_linear_to_nonlinear(rgb);
 	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
 	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
@@ -455,6 +459,207 @@ float2 PS_P416_SRGB_UV(FragPos frag_in) : TARGET
 	return uv;
 }
 
+/* YUV 4:4:4 10-bit (I412 / YUV444P10LE): three full-resolution planes. The input canvas is
+ * linear-light, so it is converted to display-encoded sRGB before the RGB->YUV matrix (matching
+ * PS_I010_SRGB_*); the result is pre-scaled to the low 10 bits of the R16 texture. */
+float PS_I412_Y(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
+	return saturate(y) * (1023. / 65535.);
+}
+
+float PS_I412_U(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
+	return saturate(u) * (1023. / 65535.);
+}
+
+float PS_I412_V(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
+	return saturate(v) * (1023. / 65535.);
+}
+
+/* YUV 4:2:2 10-bit (I210): full-resolution Y plus half-width U/V. Same sampling as PS_I010_SRGB_* but
+ * the chroma render target is full-height (4:2:2) instead of half-height (4:2:0). */
+float PS_I210_Y(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
+	return saturate(y) * (1023. / 65535.);
+}
+
+float PS_I210_U(FragTexWide frag_in) : TARGET
+{
+	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
+	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
+	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
+	return saturate(u) * (1023. / 65535.);
+}
+
+float PS_I210_V(FragTexWide frag_in) : TARGET
+{
+	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
+	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
+	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
+	return saturate(v) * (1023. / 65535.);
+}
+
+/* YUV 4:2:0 12-bit (YUV420P12): full-resolution Y plus quarter-resolution U/V. Same sampling as
+ * PS_I010_SRGB_* but pre-scaled to the low 12 bits of the R16 texture. */
+float PS_YUV420P12_Y(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
+	return saturate(y) * (4095. / 65535.);
+}
+
+float PS_YUV420P12_U_WideWide(FragTexWideWide frag_in) : TARGET
+{
+	float3 rgb_topleft = image.Sample(def_sampler, frag_in.uuvv.xz).rgb;
+	float3 rgb_topright = image.Sample(def_sampler, frag_in.uuvv.yz).rgb;
+	float3 rgb_bottomleft = image.Sample(def_sampler, frag_in.uuvv.xw).rgb;
+	float3 rgb_bottomright = image.Sample(def_sampler, frag_in.uuvv.yw).rgb;
+	float3 rgb = (rgb_topleft + rgb_topright + rgb_bottomleft + rgb_bottomright) * 0.25;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
+	return saturate(u) * (4095. / 65535.);
+}
+
+float PS_YUV420P12_V_WideWide(FragTexWideWide frag_in) : TARGET
+{
+	float3 rgb_topleft = image.Sample(def_sampler, frag_in.uuvv.xz).rgb;
+	float3 rgb_topright = image.Sample(def_sampler, frag_in.uuvv.yz).rgb;
+	float3 rgb_bottomleft = image.Sample(def_sampler, frag_in.uuvv.xw).rgb;
+	float3 rgb_bottomright = image.Sample(def_sampler, frag_in.uuvv.yw).rgb;
+	float3 rgb = (rgb_topleft + rgb_topright + rgb_bottomleft + rgb_bottomright) * 0.25;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
+	return saturate(v) * (4095. / 65535.);
+}
+
+/* YUV 4:2:2 12-bit (YUV422P12): full-resolution Y plus half-width U/V. Same sampling as PS_I210_* but
+ * pre-scaled to the low 12 bits of the R16 texture. */
+float PS_YUV422P12_Y(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
+	return saturate(y) * (4095. / 65535.);
+}
+
+float PS_YUV422P12_U(FragTexWide frag_in) : TARGET
+{
+	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
+	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
+	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
+	return saturate(u) * (4095. / 65535.);
+}
+
+float PS_YUV422P12_V(FragTexWide frag_in) : TARGET
+{
+	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
+	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
+	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
+	return saturate(v) * (4095. / 65535.);
+}
+
+/* YUV 4:4:4 12-bit (YUV444P12): three full-resolution u16 planes. Same as PS_I412_* but pre-scaled
+ * to the low 12 bits of the R16 texture. The input canvas is linear-light, so it is converted to
+ * display-encoded sRGB before the RGB->YUV matrix. */
+float PS_YUV444P12_Y(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
+	return saturate(y) * (4095. / 65535.);
+}
+
+float PS_YUV444P12_U(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
+	return saturate(u) * (4095. / 65535.);
+}
+
+float PS_YUV444P12_V(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
+	return saturate(v) * (4095. / 65535.);
+}
+
+/* Planar RGB 4:4:4 12-bit (GBRP12): one channel per pass into an R16 target. Like PSR10P_*_SRGB but
+ * pre-scaled to the low 12 bits of the R16 texture. */
+float4 PSGBRP12_G(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	return float4(saturate(rgb.g) * (4095. / 65535.), 0., 0., 1.);
+}
+
+float4 PSGBRP12_B(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	return float4(saturate(rgb.b) * (4095. / 65535.), 0., 0., 1.);
+}
+
+float4 PSGBRP12_R(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	return float4(saturate(rgb.r) * (4095. / 65535.), 0., 0., 1.);
+}
+
+/* YUV 4:2:2 8-bit (I422): full-resolution Y plus half-width U/V. The input canvas is a display-encoded
+ * (gamma) SRGB surface - the same encoding the standard I420/NV12 paths (PS_Y / PS_U_Wide / PS_V_Wide)
+ * read - so it is fed straight into the RGB->YUV matrix with no srgb_linear_to_nonlinear() step. R8
+ * targets quantize [0,1]. (The 10/12-bit I210/YUV42xP12 paths DO apply that step because their SRGB_16F
+ * canvases are linear-light.) */
+float PS_I422_Y(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
+	return y;
+}
+
+float PS_I422_U(FragTexWide frag_in) : TARGET
+{
+	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
+	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
+	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
+	return u;
+}
+
+float PS_I422_V(FragTexWide frag_in) : TARGET
+{
+	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
+	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
+	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
+	return v;
+}
+
 float PS_U(FragPos frag_in) : TARGET
 {
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
@@ -469,20 +674,24 @@ float PS_V(FragPos frag_in) : TARGET
 	return v;
 }
 
-float PS_U_Wide(FragTexWide frag_in) : TARGET
+float PS_U_WideWide(FragTexWideWide frag_in) : TARGET
 {
-	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
-	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
-	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	float3 rgb_topleft = image.Sample(def_sampler, frag_in.uuvv.xz).rgb;
+	float3 rgb_topright = image.Sample(def_sampler, frag_in.uuvv.yz).rgb;
+	float3 rgb_bottomleft = image.Sample(def_sampler, frag_in.uuvv.xw).rgb;
+	float3 rgb_bottomright = image.Sample(def_sampler, frag_in.uuvv.yw).rgb;
+	float3 rgb = (rgb_topleft + rgb_topright + rgb_bottomleft + rgb_bottomright) * 0.25;
 	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
 	return u;
 }
 
-float PS_V_Wide(FragTexWide frag_in) : TARGET
+float PS_V_WideWide(FragTexWideWide frag_in) : TARGET
 {
-	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
-	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
-	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	float3 rgb_topleft = image.Sample(def_sampler, frag_in.uuvv.xz).rgb;
+	float3 rgb_topright = image.Sample(def_sampler, frag_in.uuvv.yz).rgb;
+	float3 rgb_bottomleft = image.Sample(def_sampler, frag_in.uuvv.xw).rgb;
+	float3 rgb_bottomright = image.Sample(def_sampler, frag_in.uuvv.yw).rgb;
+	float3 rgb = (rgb_topleft + rgb_topright + rgb_bottomleft + rgb_bottomright) * 0.25;
 	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
 	return v;
 }
@@ -497,7 +706,7 @@ float PS_I010_PQ_U_709_2020_WideWide(FragTexWideWide frag_in) : TARGET
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_st2084(rgb);
 	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
-	return u * (1023. / 65535.);
+	return saturate(u) * (1023. / 65535.);
 }
 
 float PS_I010_HLG_U_709_2020_WideWide(FragTexWideWide frag_in) : TARGET
@@ -510,17 +719,19 @@ float PS_I010_HLG_U_709_2020_WideWide(FragTexWideWide frag_in) : TARGET
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_hlg(rgb, hdr_lw);
 	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
-	return u * (1023. / 65535.);
+	return saturate(u) * (1023. / 65535.);
 }
 
-float PS_I010_SRGB_U_Wide(FragTexWide frag_in) : TARGET
+float PS_I010_SRGB_U_WideWide(FragTexWideWide frag_in) : TARGET
 {
-	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
-	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
-	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	float3 rgb_topleft = image.Sample(def_sampler, frag_in.uuvv.xz).rgb;
+	float3 rgb_topright = image.Sample(def_sampler, frag_in.uuvv.yz).rgb;
+	float3 rgb_bottomleft = image.Sample(def_sampler, frag_in.uuvv.xw).rgb;
+	float3 rgb_bottomright = image.Sample(def_sampler, frag_in.uuvv.yw).rgb;
+	float3 rgb = (rgb_topleft + rgb_topright + rgb_bottomleft + rgb_bottomright) * 0.25;
 	rgb = srgb_linear_to_nonlinear(rgb);
 	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
-	return u * (1023. / 65535.);
+	return saturate(u) * (1023. / 65535.);
 }
 
 float PS_I010_PQ_V_709_2020_WideWide(FragTexWideWide frag_in) : TARGET
@@ -533,7 +744,7 @@ float PS_I010_PQ_V_709_2020_WideWide(FragTexWideWide frag_in) : TARGET
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_st2084(rgb);
 	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
-	return v * (1023. / 65535.);
+	return saturate(v) * (1023. / 65535.);
 }
 
 float PS_I010_HLG_V_709_2020_WideWide(FragTexWideWide frag_in) : TARGET
@@ -546,17 +757,19 @@ float PS_I010_HLG_V_709_2020_WideWide(FragTexWideWide frag_in) : TARGET
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_hlg(rgb, hdr_lw);
 	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
-	return v * (1023. / 65535.);
+	return saturate(v) * (1023. / 65535.);
 }
 
-float PS_I010_SRGB_V_Wide(FragTexWide frag_in) : TARGET
+float PS_I010_SRGB_V_WideWide(FragTexWideWide frag_in) : TARGET
 {
-	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
-	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
-	float3 rgb = (rgb_left + rgb_right) * 0.5;
+	float3 rgb_topleft = image.Sample(def_sampler, frag_in.uuvv.xz).rgb;
+	float3 rgb_topright = image.Sample(def_sampler, frag_in.uuvv.yz).rgb;
+	float3 rgb_bottomleft = image.Sample(def_sampler, frag_in.uuvv.xw).rgb;
+	float3 rgb_bottomright = image.Sample(def_sampler, frag_in.uuvv.yw).rgb;
+	float3 rgb = (rgb_topleft + rgb_topright + rgb_bottomleft + rgb_bottomright) * 0.25;
 	rgb = srgb_linear_to_nonlinear(rgb);
 	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
-	return v * (1023. / 65535.);
+	return saturate(v) * (1023. / 65535.);
 }
 
 float3 YUV_to_RGB(float3 yuv)
@@ -1136,6 +1349,16 @@ float4 PSGBRA(FragPos frag_in) : TARGET
 	return float4(rgba.r, rgba.b, rgba.g, rgba.a);
 }
 
+/* Packed BGRA (8-bit, display-encoded): single full-resolution plane. The input canvas for the
+ * 8-bit path is a display-encoded (gamma) SRGB surface - the same encoding the standard I420/NV12
+ * and I422 paths read - so it needs no srgb_linear_to_nonlinear() step; just repack R/G/B/A into
+ * B/G/R/A. Replaces the per-frame CPU swscale RGBA16F->BGRA pass for CPU (x264) encoders. */
+float4 PSBGRA(FragPos frag_in) : TARGET
+{
+	float4 rgba = image.Load(int3(frag_in.pos.xy, 0));
+	return float4(rgba.b, rgba.g, rgba.r, rgba.a);
+}
+
 float4 PSR10L_SRGB(FragPos frag_in) : TARGET
 {
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
@@ -1225,21 +1448,21 @@ float4 PSR10P_G_SRGB(FragPos frag_in) : TARGET
 {
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
 	rgb = srgb_linear_to_nonlinear(rgb);
-	return float4(rgb.g * (1023. / 65535.), 0., 0., 1.);
+	return float4(saturate(rgb.g) * (1023. / 65535.), 0., 0., 1.);
 }
 
 float4 PSR10P_B_SRGB(FragPos frag_in) : TARGET
 {
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
 	rgb = srgb_linear_to_nonlinear(rgb);
-	return float4(rgb.b * (1023. / 65535.), 0., 0., 1.);
+	return float4(saturate(rgb.b) * (1023. / 65535.), 0., 0., 1.);
 }
 
 float4 PSR10P_R_SRGB(FragPos frag_in) : TARGET
 {
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
 	rgb = srgb_linear_to_nonlinear(rgb);
-	return float4(rgb.r * (1023. / 65535.), 0., 0., 1.);
+	return float4(saturate(rgb.r) * (1023. / 65535.), 0., 0., 1.);
 }
 
 float4 PSR10P_G_PQ(FragPos frag_in) : TARGET
@@ -1247,7 +1470,7 @@ float4 PSR10P_G_PQ(FragPos frag_in) : TARGET
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_st2084(rgb);
-	return float4(rgb.g * (1023. / 65535.), 0., 0., 1.);
+	return float4(saturate(rgb.g) * (1023. / 65535.), 0., 0., 1.);
 }
 
 float4 PSR10P_B_PQ(FragPos frag_in) : TARGET
@@ -1255,7 +1478,7 @@ float4 PSR10P_B_PQ(FragPos frag_in) : TARGET
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_st2084(rgb);
-	return float4(rgb.b * (1023. / 65535.), 0., 0., 1.);
+	return float4(saturate(rgb.b) * (1023. / 65535.), 0., 0., 1.);
 }
 
 float4 PSR10P_R_PQ(FragPos frag_in) : TARGET
@@ -1263,7 +1486,7 @@ float4 PSR10P_R_PQ(FragPos frag_in) : TARGET
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_st2084(rgb);
-	return float4(rgb.r * (1023. / 65535.), 0., 0., 1.);
+	return float4(saturate(rgb.r) * (1023. / 65535.), 0., 0., 1.);
 }
 
 float4 PSR10P_G_HLG(FragPos frag_in) : TARGET
@@ -1271,7 +1494,7 @@ float4 PSR10P_G_HLG(FragPos frag_in) : TARGET
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_hlg(rgb, hdr_lw);
-	return float4(rgb.g * (1023. / 65535.), 0., 0., 1.);
+	return float4(saturate(rgb.g) * (1023. / 65535.), 0., 0., 1.);
 }
 
 float4 PSR10P_B_HLG(FragPos frag_in) : TARGET
@@ -1279,7 +1502,7 @@ float4 PSR10P_B_HLG(FragPos frag_in) : TARGET
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_hlg(rgb, hdr_lw);
-	return float4(rgb.b * (1023. / 65535.), 0., 0., 1.);
+	return float4(saturate(rgb.b) * (1023. / 65535.), 0., 0., 1.);
 }
 
 float4 PSR10P_R_HLG(FragPos frag_in) : TARGET
@@ -1287,7 +1510,7 @@ float4 PSR10P_R_HLG(FragPos frag_in) : TARGET
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
 	rgb = rec709_to_rec2020(rgb);
 	rgb = linear_to_hlg(rgb, hdr_lw);
-	return float4(rgb.r * (1023. / 65535.), 0., 0., 1.);
+	return float4(saturate(rgb.r) * (1023. / 65535.), 0., 0., 1.);
 }
 
 technique Planar_Y
@@ -1321,8 +1544,8 @@ technique Planar_U_Left
 {
 	pass
 	{
-		vertex_shader = VSTexPos_Left(id);
-		pixel_shader  = PS_U_Wide(frag_in);
+		vertex_shader = VSTexPos_TopLeft(id);
+		pixel_shader  = PS_U_WideWide(frag_in);
 	}
 }
 
@@ -1330,8 +1553,8 @@ technique Planar_V_Left
 {
 	pass
 	{
-		vertex_shader = VSTexPos_Left(id);
-		pixel_shader  = PS_V_Wide(frag_in);
+		vertex_shader = VSTexPos_TopLeft(id);
+		pixel_shader  = PS_V_WideWide(frag_in);
 	}
 }
 
@@ -1348,8 +1571,8 @@ technique NV12_UV
 {
 	pass
 	{
-		vertex_shader = VSTexPos_Left(id);
-		pixel_shader  = PS_UV_Wide(frag_in);
+		vertex_shader = VSTexPos_TopLeft(id);
+		pixel_shader  = PS_UV_WideWide(frag_in);
 	}
 }
 
@@ -1402,8 +1625,8 @@ technique I010_SRGB_U
 {
 	pass
 	{
-		vertex_shader = VSTexPos_Left(id);
-		pixel_shader  = PS_I010_SRGB_U_Wide(frag_in);
+		vertex_shader = VSTexPos_TopLeft(id);
+		pixel_shader  = PS_I010_SRGB_U_WideWide(frag_in);
 	}
 }
 
@@ -1429,8 +1652,197 @@ technique I010_SRGB_V
 {
 	pass
 	{
+		vertex_shader = VSTexPos_TopLeft(id);
+		pixel_shader  = PS_I010_SRGB_V_WideWide(frag_in);
+	}
+}
+
+technique I412_Y
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_I412_Y(frag_in);
+	}
+}
+
+technique I412_U
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_I412_U(frag_in);
+	}
+}
+
+technique I412_V
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_I412_V(frag_in);
+	}
+}
+
+technique YUV444P12_Y
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_YUV444P12_Y(frag_in);
+	}
+}
+
+technique YUV444P12_U
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_YUV444P12_U(frag_in);
+	}
+}
+
+technique YUV444P12_V
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_YUV444P12_V(frag_in);
+	}
+}
+
+technique GBRP12_G
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSGBRP12_G(frag_in);
+	}
+}
+
+technique GBRP12_B
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSGBRP12_B(frag_in);
+	}
+}
+
+technique GBRP12_R
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSGBRP12_R(frag_in);
+	}
+}
+
+technique I422_Y
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_I422_Y(frag_in);
+	}
+}
+
+technique I422_U
+{
+	pass
+	{
 		vertex_shader = VSTexPos_Left(id);
-		pixel_shader  = PS_I010_SRGB_V_Wide(frag_in);
+		pixel_shader  = PS_I422_U(frag_in);
+	}
+}
+
+technique I422_V
+{
+	pass
+	{
+		vertex_shader = VSTexPos_Left(id);
+		pixel_shader  = PS_I422_V(frag_in);
+	}
+}
+
+technique I210_Y
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_I210_Y(frag_in);
+	}
+}
+
+technique I210_U
+{
+	pass
+	{
+		vertex_shader = VSTexPos_Left(id);
+		pixel_shader  = PS_I210_U(frag_in);
+	}
+}
+
+technique I210_V
+{
+	pass
+	{
+		vertex_shader = VSTexPos_Left(id);
+		pixel_shader  = PS_I210_V(frag_in);
+	}
+}
+
+technique YUV420P12_Y
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_YUV420P12_Y(frag_in);
+	}
+}
+
+technique YUV420P12_U
+{
+	pass
+	{
+		vertex_shader = VSTexPos_TopLeft(id);
+		pixel_shader  = PS_YUV420P12_U_WideWide(frag_in);
+	}
+}
+
+technique YUV420P12_V
+{
+	pass
+	{
+		vertex_shader = VSTexPos_TopLeft(id);
+		pixel_shader  = PS_YUV420P12_V_WideWide(frag_in);
+	}
+}
+
+technique YUV422P12_Y
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_YUV422P12_Y(frag_in);
+	}
+}
+
+technique YUV422P12_U
+{
+	pass
+	{
+		vertex_shader = VSTexPos_Left(id);
+		pixel_shader  = PS_YUV422P12_U(frag_in);
+	}
+}
+
+technique YUV422P12_V
+{
+	pass
+	{
+		vertex_shader = VSTexPos_Left(id);
+		pixel_shader  = PS_YUV422P12_V(frag_in);
 	}
 }
 
@@ -1483,8 +1895,8 @@ technique P010_SRGB_UV
 {
 	pass
 	{
-		vertex_shader = VSTexPos_Left(id);
-		pixel_shader  = PS_P010_SRGB_UV_Wide(frag_in);
+		vertex_shader = VSTexPos_TopLeft(id);
+		pixel_shader  = PS_P010_SRGB_UV_WideWide(frag_in);
 	}
 }
 
@@ -2007,6 +2419,15 @@ technique GBRA
 	{
 		vertex_shader = VSPos(id);
 		pixel_shader  = PSGBRA(frag_in);
+	}
+}
+
+technique BGRA
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSBGRA(frag_in);
 	}
 }
 

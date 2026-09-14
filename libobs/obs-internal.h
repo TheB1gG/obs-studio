@@ -287,6 +287,9 @@ struct obs_core_video_mix {
 #endif
 	gs_texture_t *render_texture;
 	gs_texture_t *output_texture;
+	/* When reusing another mix's composite and no scaling is required, the source texture that
+	 * render_output_texture() aliases directly into the convert pass (Option B). NULL otherwise. */
+	gs_texture_t *reused_source_texture;
 	enum gs_color_space render_space;
 	bool texture_rendered;
 	bool textures_copied[NUM_TEXTURES];
@@ -1033,6 +1036,7 @@ static inline enum gs_color_format convert_video_format(enum video_format format
 		case VIDEO_FORMAT_Y410:
 		case VIDEO_FORMAT_GBR10:
 		case VIDEO_FORMAT_R10P:
+		case VIDEO_FORMAT_RGBA16F:
 			return GS_RGBA16F;
 		default:
 			return GS_BGRX;

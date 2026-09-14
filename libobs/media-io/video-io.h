@@ -119,6 +119,10 @@ enum video_format {
 	VIDEO_FORMAT_YUV444P12,
 	/* planar RGB (G/B/R) 4:4:4, 12 bpp (u16 samples) */
 	VIDEO_FORMAT_GBRP12,
+
+	/* packed RGBA, 16-bit float per channel (4 channels). Used as the high-fidelity
+	 * master canvas for multitrack output; down-converts losslessly to any YUV/RGB target. */
+	VIDEO_FORMAT_RGBA16F,
 };
 
 enum video_trc {
@@ -227,6 +231,8 @@ static inline int video_format_bit_depth(enum video_format format)
 	case VIDEO_FORMAT_YUV444P12:
 	case VIDEO_FORMAT_GBRP12:
 		return 12;
+	case VIDEO_FORMAT_RGBA16F:
+		return 16;
 	default:
 		return 8;
 	}
@@ -272,6 +278,21 @@ static inline bool format_conversion_is_lossless(enum video_format from, enum vi
 	video_format_chroma_subsample(from, &fh, &fv);
 	video_format_chroma_subsample(to, &th, &tv);
 	return fh == th && fv == tv;
+}
+
+/* Returns true if 'target' requires MORE fidelity than 'base' can actually provide, i.e. the
+ * conversion would only be a fake up-conversion (padded bit depth and/or interpolated chroma).
+ * A target that is equal to or lower in fidelity than the base is fine (down-conversion). */
+static inline bool format_needs_higher_fidelity(enum video_format base, enum video_format target)
+{
+	if (video_format_bit_depth(target) > video_format_bit_depth(base))
+		return true;
+
+	int bh, bv, th, tv;
+	video_format_chroma_subsample(base, &bh, &bv);
+	video_format_chroma_subsample(target, &th, &tv);
+	/* smaller factor = finer (more samples); target finer than base => interpolated chroma */
+	return th < bh || tv < bv;
 }
 
 static inline const char *get_video_format_name(enum video_format format)
@@ -343,6 +364,8 @@ static inline const char *get_video_format_name(enum video_format format)
 		return "YUV444P12";
 	case VIDEO_FORMAT_GBRP12:
 		return "GBRP12";
+	case VIDEO_FORMAT_RGBA16F:
+		return "RGBA16F";
 	case VIDEO_FORMAT_NONE:;
 	}
 
