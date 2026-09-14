@@ -163,6 +163,9 @@ struct game_capture {
 	gs_texrender_t *extra_texrender;
 	bool is_10a2_2100pq;
 	bool linear_sample;
+	enum gs_color_format logged_fmt;
+	enum gs_color_space logged_space;
+	bool fmt_logged;
 	struct hook_info *global_hook_info;
 	HANDLE keepalive_mutex;
 	HANDLE hook_init;
@@ -1880,6 +1883,36 @@ static void game_capture_render(void *data, gs_effect_t *unused)
 		source_space = gc->is_10a2_2100pq ? GS_CS_709_EXTENDED : GS_CS_SRGB_16F;
 	} else if (gs_texture_get_color_format(texture) == GS_RGBA16F) {
 		source_space = GS_CS_709_SCRGB;
+	}
+
+	{
+		enum gs_color_format fmt = gs_texture_get_color_format(texture);
+		if (!gc->fmt_logged || fmt != gc->logged_fmt || source_space != gc->logged_space) {
+			const char *fmt_name;
+			switch (fmt) {
+			case GS_BGRA:
+			case GS_BGRX:
+			case GS_BGRA_UNORM:
+			case GS_BGRX_UNORM:
+				fmt_name = "BGRA/BGRX (8-bit)"; break;
+			case GS_RGBA:
+			case GS_RGBA_UNORM:
+				fmt_name = "RGBA (8-bit)"; break;
+			case GS_R10G10B10A2:
+				fmt_name = "R10G10B10A2 (10-bit)"; break;
+			case GS_RGBA16:
+				fmt_name = "RGBA16 (16-bit int)"; break;
+			case GS_RGBA16F:
+				fmt_name = "RGBA16F (16-bit float)"; break;
+			default:
+				fmt_name = "other"; break;
+			}
+			blog(LOG_INFO, "game_capture '%s': capture surface format=%s (raw fmt=%d), color space=%d",
+			     obs_source_get_name(gc->source), fmt_name, (int)fmt, (int)source_space);
+			gc->logged_fmt = fmt;
+			gc->logged_space = source_space;
+			gc->fmt_logged = true;
+		}
 	}
 
 	bool linear_sample = gc->linear_sample;
