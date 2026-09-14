@@ -587,7 +587,15 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 
 	NV_ENC_CONFIG *config = &enc->config;
 
-	initialize_params(enc, &nv_preset, nv_tuning, voi->width, voi->height, voi->fps_num, voi->fps_den);
+	/* Configure the session from the encoder's actual output size (enc->cx/cy, which
+	 * come from obs_encoder_get_width/height), NOT from voi->width/height. At create()
+	 * time the delivery mix may not yet be bound to encoder->media - maybe_set_up_gpu_rescale()
+	 * in obs-encoder.c runs after create() so CPU/raw encoders can publish their preferred
+	 * YUV format via get_video_info(). Until that rebind, voi (obs_encoder_video()) still
+	 * reports the full base-canvas size, which would make NVENC emit an SPS at the canvas
+	 * resolution while the container/input use the scaled size. enc->cx/cy already hold the
+	 * scaled dimensions NVENC will actually encode. */
+	initialize_params(enc, &nv_preset, nv_tuning, enc->cx, enc->cy, voi->fps_num, voi->fps_den);
 
 #ifdef NVENC_12_2_OR_LATER
 	/* Force at least 4 b-frames when using the UHQ tune */
@@ -1772,6 +1780,33 @@ static bool nvenc_sei_data(void *data, uint8_t **sei, size_t *size)
 	return true;
 }
 
+/* NVENC AV1 hardware encode only supports YUV 4:2:0 (8-bit NV12 / 10-bit P010); it cannot take
+ * 4:2:2, 4:4:4 or RGB inputs. Declare this so the shared libobs injection offers only those two
+ * formats for AV1 instead of probing every texture-encodable format. */
+static bool nvenc_av1_is_color_format_supported(void *type_data, enum video_format format)
+{
+	UNUSED_PARAMETER(type_data);
+	return format == VIDEO_FORMAT_NV12 || format == VIDEO_FORMAT_P010;
+}
+
+/* NVENC H.264 hardware encode is 8-bit only; it cannot perform a 10/16-bit encode, so never offer
+ * those formats. The texture probe would otherwise list P010 (get_preferred_format(P010) == P010 is
+ * an identity "lossless" repack), which then fails at start time with "Cannot perform 10-bit encode".
+ * Offer the same 8-bit set the probe reports. */
+static bool nvenc_h264_is_color_format_supported(void *type_data, enum video_format format)
+{
+	UNUSED_PARAMETER(type_data);
+	switch (format) {
+	case VIDEO_FORMAT_I420:
+	case VIDEO_FORMAT_I444:
+	case VIDEO_FORMAT_NV12:
+	case VIDEO_FORMAT_BGRA:
+		return true;
+	default:
+		return false;
+	}
+}
+
 struct obs_encoder_info h264_nvenc_info = {
 	.id = "obs_nvenc_h264_tex",
 	.codec = "h264",
@@ -1791,6 +1826,7 @@ struct obs_encoder_info h264_nvenc_info = {
 	.get_extra_data = nvenc_extra_data,
 	.get_sei_data = nvenc_sei_data,
 	.get_video_info = nvenc_tex_video_info,
+	.is_color_format_supported = nvenc_h264_is_color_format_supported,
 };
 
 #ifdef ENABLE_HEVC
@@ -1834,6 +1870,7 @@ struct obs_encoder_info av1_nvenc_info = {
 	.get_properties = av1_nvenc_properties,
 	.get_extra_data = nvenc_extra_data,
 	.get_video_info = nvenc_tex_video_info,
+	.is_color_format_supported = nvenc_av1_is_color_format_supported,
 };
 
 struct obs_encoder_info h264_nvenc_soft_info = {
@@ -1886,6 +1923,7 @@ struct obs_encoder_info av1_nvenc_soft_info = {
 	.get_properties = av1_nvenc_properties,
 	.get_extra_data = nvenc_extra_data,
 	.get_video_info = nvenc_soft_video_info,
+	.is_color_format_supported = nvenc_av1_is_color_format_supported,
 };
 
 void register_encoders(void)

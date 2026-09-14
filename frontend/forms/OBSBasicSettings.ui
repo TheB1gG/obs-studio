@@ -8405,76 +8405,6 @@
                     </widget>
                    </item>
                    <item row="2" column="0">
-                    <widget class="QLabel" name="label_30">
-                     <property name="minimumSize">
-                      <size>
-                       <width>0</width>
-                       <height>0</height>
-                      </size>
-                     </property>
-                     <property name="text">
-                      <string>Basic.Settings.Advanced.Video.ColorFormat</string>
-                     </property>
-                     <property name="alignment">
-                      <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
-                     </property>
-                     <property name="buddy">
-                      <cstring>colorFormat</cstring>
-                     </property>
-                    </widget>
-                   </item>
-                   <item row="2" column="1">
-                    <widget class="QComboBox" name="colorFormat"/>
-                   </item>
-                   <item row="3" column="0">
-                    <widget class="QLabel" name="label_33">
-                     <property name="text">
-                      <string>Basic.Settings.Advanced.Video.ColorSpace</string>
-                     </property>
-                     <property name="buddy">
-                      <cstring>colorSpace</cstring>
-                     </property>
-                    </widget>
-                   </item>
-                   <item row="3" column="1">
-                    <layout class="QHBoxLayout" name="horizontalLayout_20">
-                     <property name="leftMargin">
-                      <number>0</number>
-                     </property>
-                     <property name="topMargin">
-                      <number>0</number>
-                     </property>
-                     <property name="rightMargin">
-                      <number>0</number>
-                     </property>
-                     <property name="bottomMargin">
-                      <number>0</number>
-                     </property>
-                     <item>
-                      <widget class="QComboBox" name="colorSpace"/>
-                     </item>
-                     <item>
-                      <widget class="QLabel" name="label_34">
-                       <property name="sizePolicy">
-                        <sizepolicy hsizetype="Maximum" vsizetype="Preferred">
-                         <horstretch>0</horstretch>
-                         <verstretch>0</verstretch>
-                        </sizepolicy>
-                       </property>
-                       <property name="text">
-                        <string>Basic.Settings.Advanced.Video.ColorRange</string>
-                       </property>
-                       <property name="buddy">
-                        <cstring>colorRange</cstring>
-                       </property>
-                      </widget>
-                     </item>
-                     <item>
-                      <widget class="QComboBox" name="colorRange"/>
-                     </item>
-                    </layout>
-                   </item>
-                   <item row="4" column="0">
                     <widget class="QLabel" name="label_sdrWhiteLevel">
                      <property name="text">
                       <string>Basic.Settings.Advanced.Video.SdrWhiteLevel</string>
@@ -8484,7 +8414,7 @@
                      </property>
                     </widget>
                    </item>
-                   <item row="4" column="1">
+                   <item row="2" column="1">
                     <layout class="QHBoxLayout" name="horizontalLayout_sdrPaperWhite">
                      <property name="leftMargin">
                       <number>0</number>
@@ -9365,9 +9295,6 @@
   <tabstop>confirmOnExit</tabstop>
   <tabstop>renderer</tabstop>
   <tabstop>adapter</tabstop>
-  <tabstop>colorFormat</tabstop>
-  <tabstop>colorSpace</tabstop>
-  <tabstop>colorRange</tabstop>
   <tabstop>sdrWhiteLevel</tabstop>
   <tabstop>hdrNominalPeakLevel</tabstop>
   <tabstop>disableOSXVSync</tabstop>

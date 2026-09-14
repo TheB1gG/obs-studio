@@ -175,13 +175,8 @@ private:
 	bool QueryAllowedToClose();
 
 	void ResetEncoders(bool streamOnly = false);
-	void LoadColorRanges();
-	void LoadColorSpaces();
-	void LoadColorFormats();
 	void LoadFormats();
 	void ReloadCodecs(const FFmpegFormat &format);
-
-	void UpdateColorFormatSpaceWarning();
 
 	void LoadGeneralSettings();
 	void LoadStream1Settings();
@@ -365,9 +360,6 @@ private slots:
 	void on_advOutFFAEncoder_currentIndexChanged(int idx);
 	void on_advOutFFVEncoder_currentIndexChanged(int idx);
 	void on_advOutFFType_currentIndexChanged(int idx);
-
-	void on_colorFormat_currentIndexChanged(int idx);
-	void on_colorSpace_currentIndexChanged(int idx);
 
 	void on_filenameFormatting_textEdited(const QString &text);
 	void on_outputResolution_editTextChanged(const QString &text);

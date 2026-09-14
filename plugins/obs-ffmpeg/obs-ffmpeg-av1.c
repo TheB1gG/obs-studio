@@ -76,8 +76,10 @@ static bool av1_update(struct av1_encoder *enc, obs_data_t *settings)
 	const struct video_output_info *voi = video_output_get_info(video);
 	struct video_scale_info info;
 
+	enum video_colorspace cs_val = (enum video_colorspace)obs_data_get_int(settings, "color_space");
+
 	info.format = voi->format;
-	info.colorspace = voi->colorspace;
+	info.colorspace = (cs_val == VIDEO_CS_DEFAULT) ? voi->colorspace : cs_val;
 	info.range = voi->range;
 
 	enc->ffve.context->thread_count = 0;
@@ -231,9 +233,12 @@ void av1_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "bitrate", 2500);
 	obs_data_set_default_int(settings, "keyint_sec", 0);
-	obs_data_set_default_int(settings, "cqp", 50);
-	obs_data_set_default_string(settings, "rate_control", "CBR");
+	obs_data_set_default_int(settings, "cqp", 20);
+	obs_data_set_default_string(settings, "rate_control", "CQP");
 	obs_data_set_default_int(settings, "preset", 8);
+	obs_data_set_default_string(settings, "color_format", "NV12");
+	obs_data_set_default_int(settings, "color_space", VIDEO_CS_709);
+	obs_data_set_default_int(settings, "color_range", VIDEO_RANGE_PARTIAL);
 }
 
 static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings)

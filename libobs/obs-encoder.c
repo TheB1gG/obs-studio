@@ -17,7 +17,10 @@
 
 #include "obs.h"
 #include "obs-internal.h"
+#include "obs-video-reuse.h"
 #include "util/util_uint64.h"
+
+#include <stdio.h>
 
 #define encoder_active(encoder) os_atomic_load_bool(&encoder->active)
 #define set_encoder_active(encoder, val) os_atomic_set_bool(&encoder->active, val)
@@ -168,7 +171,9 @@ static inline void get_video_info(struct obs_encoder *encoder, struct video_scal
 	info->width = obs_encoder_get_width(encoder);
 	info->height = obs_encoder_get_height(encoder);
 
-	if (encoder->info.get_video_info)
+	/* The encoder's get_video_info callback requires a live context; before create() has
+	 * run (context.data == NULL) we only use the base-canvas fields filled above. */
+	if (encoder->context.data && encoder->info.get_video_info)
 		encoder->info.get_video_info(encoder->context.data, info);
 
 	/**
@@ -203,6 +208,37 @@ enum encoder_mix_acquire {
 	MIX_ACQUIRE_FAILED,
 };
 
+/* CPU/raw encoders can be handed already-converted YUV through GPU readback when their
+ * requested delivery format has a GPU conversion path (convert_textures allocated in
+ * obs_init_gpu_conversion) plus matching raw staging surfaces. This removes the per-frame
+ * CPU swscale color-matrix pass: the GPU converts base->YUV and the encoder reads back the
+ * smaller YUV buffer instead of full BGRA. Only planar/semi-planar YUV formats with a GPU
+ * conversion are eligible; packed-RGB and alpha formats fall back to CPU swscale. */
+static bool raw_gpu_conversion_supported(enum video_format format)
+{
+	switch (format) {
+	case VIDEO_FORMAT_BGRA:
+	case VIDEO_FORMAT_I420:
+	case VIDEO_FORMAT_NV12:
+	case VIDEO_FORMAT_I444:
+	case VIDEO_FORMAT_I412:
+	case VIDEO_FORMAT_R10P:
+	case VIDEO_FORMAT_I010:
+	case VIDEO_FORMAT_P010:
+	case VIDEO_FORMAT_P216:
+	case VIDEO_FORMAT_P416:
+	case VIDEO_FORMAT_I422:
+	case VIDEO_FORMAT_I210:
+	case VIDEO_FORMAT_YUV420P12:
+	case VIDEO_FORMAT_YUV422P12:
+	case VIDEO_FORMAT_YUV444P12:
+	case VIDEO_FORMAT_GBRP12:
+		return true;
+	default:
+		return false;
+	}
+}
+
 /**
  * Find or create an encoder-only mix matching this encoder's current scaled size,
  * scale type and output format/colorspace/range for the view of its media.
@@ -227,7 +263,12 @@ static enum encoder_mix_acquire acquire_encoder_only_mix(struct obs_encoder *enc
 	if (!encoder->media)
 		return MIX_ACQUIRE_FAILED;
 
-	const struct video_output_info *info = video_output_get_info(encoder->media);
+	/* Base the delivery decision on the original source canvas, not whatever mix this encoder is
+	 * currently bound to. On a live rescale the media may already be a converted encoder-only mix
+	 * (e.g. P010); using its format/size as the "base" would hide that the real base (e.g. RGBA16F)
+	 * still needs conversion and would report the old mix's size instead of the canvas size. */
+	video_t *base_video = encoder->source_video ? encoder->source_video : encoder->media;
+	const struct video_output_info *info = video_output_get_info(base_video);
 
 	if (is_tex_encoder) {
 		format = encoder->preferred_format;
@@ -254,7 +295,10 @@ static enum encoder_mix_acquire acquire_encoder_only_mix(struct obs_encoder *enc
 			encoder_info.width = obs_encoder_get_width(encoder);
 			encoder_info.height = obs_encoder_get_height(encoder);
 
-			if (encoder->info.get_video_info)
+			/* Ask the encoder to remap our format to its texture equivalent (e.g. I444->AYUV).
+			 * This needs a live context; before create() we keep the requested format as-is,
+			 * which is already a texture-encodable layout for the explicit-preference path. */
+			if (encoder->context.data && encoder->info.get_video_info)
 				encoder->info.get_video_info(encoder->context.data, &encoder_info);
 
 			/* The encoder callback may have remapped our format to its texture equivalent. */
@@ -288,9 +332,51 @@ static enum encoder_mix_acquire acquire_encoder_only_mix(struct obs_encoder *enc
 
 		conversion_requested = format != info->format || space != info->colorspace || range != info->range;
 	} else {
+		/* CPU/raw encoder. Default to the base canvas format, but if the encoder's delivery
+		 * callback requests a GPU-convertible YUV format that differs from the base, honor it:
+		 * we then deliver already-converted YUV via GPU readback instead of doing a per-frame CPU
+		 * swscale conversion. The format is taken from get_video_info (the exact value
+		 * start_raw_video requests) so the mix output always matches the raw connection and no
+		 * CPU scaler is created for it. Guarded on context.data: before the encoder's create() has
+		 * run, the callback may not be safe to invoke, so we fall back to base-format delivery. */
 		format = info->format;
 		space = info->colorspace;
 		range = info->range;
+
+		if (encoder->context.data != NULL) {
+			struct video_scale_info encoder_info = {0};
+			get_video_info(encoder, &encoder_info);
+
+			if (encoder_info.format != VIDEO_FORMAT_NONE && raw_gpu_conversion_supported(encoder_info.format) &&
+			    encoder_info.format != info->format) {
+				format = encoder_info.format;
+				space = (encoder_info.colorspace != VIDEO_CS_DEFAULT) ? encoder_info.colorspace : info->colorspace;
+				range = (encoder_info.range != VIDEO_RANGE_DEFAULT) ? encoder_info.range : info->range;
+
+				blog(LOG_INFO,
+				     "Encoder '%s': delivering %s via GPU conversion (base %s) to avoid per-frame CPU swscale",
+				     obs_encoder_get_name(encoder), get_video_format_name(format), get_video_format_name(info->format));
+			}
+		}
+
+		conversion_requested = format != info->format || space != info->colorspace || range != info->range;
+	}
+
+	/* No-fake-high-fidelity guard: refuse to create a mix whose target format needs MORE
+	 * fidelity than the base canvas actually holds (higher bit depth or finer chroma). Such a
+	 * conversion would only pad/interpolate, producing output that over-claims its fidelity.
+	 * Surface this as a hard error so the bad selection blocks start instead of silently
+	 * mis-encoding at the base canvas's lower fidelity. */
+	if (format_needs_higher_fidelity(info->format, format)) {
+		char err[256];
+		snprintf(err, sizeof(err),
+		         "Encoder '%s' cannot deliver %s from the current video output format (%s): that would be a "
+		         "fake high-fidelity stream (padded bit depth and/or interpolated chroma). Change the video "
+		         "output format (Settings -> Video) to a matching or higher-fidelity format such as RGBA16F.",
+		         obs_encoder_get_name(encoder), get_video_format_name(format), get_video_format_name(info->format));
+		blog(LOG_ERROR, "%s", err);
+		obs_encoder_set_last_error(encoder, err);
+		return MIX_ACQUIRE_FAILED;
 	}
 
 	width = encoder->scaled_width ? encoder->scaled_width : info->width;
@@ -381,6 +467,16 @@ static enum encoder_mix_acquire acquire_encoder_only_mix(struct obs_encoder *enc
 		return MIX_ACQUIRE_FAILED;
 	}
 
+	/* For CPU/raw encoders, make sure GPU conversion was actually set up for the requested format
+	 * (i.e. convert_textures were allocated). If not (e.g. software/no-GPU mode), drop this mix and
+	 * let the encoder fall back to base-format delivery + CPU swscale. */
+	if (!is_tex_encoder && format != info->format && !created->convert_textures[0]) {
+		blog(LOG_WARNING, "Encoder '%s': GPU conversion unavailable for %s, falling back to CPU conversion",
+		     obs_encoder_get_name(encoder), get_video_format_name(format));
+		obs_free_video_mix(created);
+		return MIX_ACQUIRE_NOT_NEEDED;
+	}
+
 	created->encoder_only_mix = true;
 	created->encoder_refs = 1;
 	created->view = current_mix->view;
@@ -411,17 +507,6 @@ static enum encoder_mix_acquire acquire_encoder_only_mix(struct obs_encoder *enc
 	if (!mix) {
 		da_push_back(obs->video.mixes, &created);
 		mix = created;
-
-		blog(LOG_INFO,
-		     "Created encoder-only mix for \"%s\"\n"
-		     "\tresolution: %dx%d\n"
-		     "\tscaling:    %s\n"
-		     "\tformat:     %s\n"
-		     "\tspace:      %s\n"
-		     "\trange:      %s\n",
-		     obs_encoder_get_name(encoder), width, height, get_scale_type_name(mix_scale_type),
-		     get_video_format_name(format), get_video_colorspace_name(space),
-		     get_video_range_name(format, range));
 	} else {
 		obs_free_video_mix(created);
 	}
@@ -432,18 +517,97 @@ static enum encoder_mix_acquire acquire_encoder_only_mix(struct obs_encoder *enc
 	return MIX_ACQUIRE_SUCCESS;
 }
 
+/* Log the texture-reuse path (Option A/B) an encoder-only mix will take relative to its source
+ * composite. Whether the same-view composite is aliased (B) or blit-down (A) depends on color
+ * space and output size vs base size - computed with the same inputs render_main_texture() uses. */
+static void log_encoder_only_mix_reuse(const char *action, const char *name,
+                                       const struct obs_core_video_mix *src_mix,
+                                       const struct obs_core_video_mix *mix)
+{
+	if (!mix || !src_mix)
+		return;
+
+	const struct video_output_info *voi = video_output_get_info(mix->video);
+	const bool can_reuse = render_space_reusable(src_mix->render_space, mix->render_space);
+	const enum mix_reuse_path reuse_path =
+		can_reuse ? get_mix_reuse_path(src_mix->render_space, mix->render_space,
+		                              mix->ovi.output_width, mix->ovi.output_height,
+		                              mix->ovi.base_width, mix->ovi.base_height)
+		             : MIX_REUSE_BLIT_DOWN;
+
+	blog(LOG_INFO,
+	     "%s \"%s\"\n"
+	     "\tresolution: %dx%d\n"
+	     "\tscaling:    %s\n"
+	     "\tformat:     %s\n"
+	     "\tspace:      %s\n"
+	     "\trange:      %s\n"
+	     "\treuse:      %s (%s -> %s)\n",
+	     action, name, voi->width, voi->height, get_scale_type_name(mix->ovi.scale_type),
+	     get_video_format_name(voi->format), get_video_colorspace_name(voi->colorspace),
+	     get_video_range_name(voi->format, voi->range),
+	     can_reuse ? mix_reuse_path_name(reuse_path) : "none (full re-render)",
+	     mix_reuse_space_name(src_mix->render_space), mix_reuse_space_name(mix->render_space));
+}
+
 /**
  * Set up GPU based rescaling for this encoder (init-time path). Binds the
  * encoder to an existing or newly created encoder-only mix.
  */
-static void maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
+static bool maybe_set_up_gpu_rescale(struct obs_encoder *encoder)
 {
 	struct obs_core_video_mix *mix = NULL;
+	enum encoder_mix_acquire result = acquire_encoder_only_mix(encoder, &mix);
+
+	if (result == MIX_ACQUIRE_FAILED)
+		return false;
+
+	if (result == MIX_ACQUIRE_SUCCESS) {
+		/* Use the internal setter so source_video keeps pointing at the original canvas. */
+		encoder_set_video(encoder, mix->video);
+		log_encoder_only_mix_reuse("Bound encoder-only mix for", obs_encoder_get_name(encoder),
+		                            get_mix_for_video(encoder->source_video), mix);
+	}
+	/* MIX_ACQUIRE_NOT_NEEDED: no scaling/conversion required, consume the source as-is. */
+	return true;
+}
+
+/**
+ * Pre-create/bind the encoder-only texture mix BEFORE the encoder's create() runs.
+ *
+ * Texture encoders (e.g. nvenc) decide at create() time whether to use the GPU
+ * shared-texture path by querying obs_encoder_video_tex_active(), which only
+ * returns true if a mix exposing that format is already bound to the encoder.
+ * When the base canvas is a high-fidelity non-texture format (e.g. RGBA16F, used
+ * as the multitrack master), no such mix exists yet: it would normally be created
+ * by maybe_set_up_gpu_rescale() *after* create(), which is too late - the encoder
+ * has already committed to its CPU/soft path.
+ *
+ * For a texture encoder with an explicit preferred format we can determine the
+ * target mix without context.data, so we bind it here (pre-create). The encoder's
+ * create() then sees an active shared-texture path and takes the GPU fast path,
+ * while the high-fidelity master keeps its full fidelity. This works for every
+ * texture-encodable format (P010/NV12/Y410/GBR10/GBRA/AYUV/R10L), so each
+ * multitrack track can pick its own output format and still encode on the GPU.
+ */
+static bool maybe_pre_bind_texture_mix(struct obs_encoder *encoder)
+{
+	if (encoder->orig_info.type != OBS_ENCODER_VIDEO)
+		return false;
+	if ((encoder->info.caps & OBS_ENCODER_CAP_PASS_TEXTURE) == 0)
+		return false;
+	if (encoder->preferred_format == VIDEO_FORMAT_NONE)
+		return false;
+
+	struct obs_core_video_mix *mix = NULL;
 	if (acquire_encoder_only_mix(encoder, &mix) != MIX_ACQUIRE_SUCCESS)
-		return;
+		return false;
 
 	/* Use the internal setter so source_video keeps pointing at the original canvas. */
 	encoder_set_video(encoder, mix->video);
+	log_encoder_only_mix_reuse("Pre-bound encoder-only mix for", obs_encoder_get_name(encoder),
+	                            get_mix_for_video(encoder->source_video), mix);
+	return true;
 }
 
 static void add_connection(struct obs_encoder *encoder)
@@ -597,6 +761,188 @@ obs_data_t *obs_encoder_get_defaults(const obs_encoder_t *encoder)
 	return get_defaults(&encoder->info);
 }
 
+/* Maps a user-facing Color Format name (the string values stored in the "color_format" list
+ * property) to a video_format. Returns VIDEO_FORMAT_NONE for unknown or empty names. */
+static enum video_format color_format_name_to_enum(const char *name)
+{
+	if (!name || !*name)
+		return VIDEO_FORMAT_NONE;
+
+	if (astrcmpi(name, "NV12") == 0)
+		return VIDEO_FORMAT_NV12;
+	if (astrcmpi(name, "P010") == 0)
+		return VIDEO_FORMAT_P010;
+	if (astrcmpi(name, "I422") == 0)
+		return VIDEO_FORMAT_I422;
+	if (astrcmpi(name, "P216") == 0)
+		return VIDEO_FORMAT_P216;
+	if (astrcmpi(name, "I444") == 0)
+		return VIDEO_FORMAT_I444;
+	if (astrcmpi(name, "I412") == 0)
+		return VIDEO_FORMAT_I412;
+	if (astrcmpi(name, "Y410") == 0)
+		return VIDEO_FORMAT_Y410;
+	if (astrcmpi(name, "BGRA") == 0)
+		return VIDEO_FORMAT_BGRA;
+	if (astrcmpi(name, "GBR10") == 0)
+		return VIDEO_FORMAT_GBR10;
+	if (astrcmpi(name, "R10L") == 0)
+		return VIDEO_FORMAT_R10L;
+	if (astrcmpi(name, "R10P") == 0)
+		return VIDEO_FORMAT_R10P;
+	if (astrcmpi(name, "YUV420P12") == 0)
+		return VIDEO_FORMAT_YUV420P12;
+	if (astrcmpi(name, "YUV422P12") == 0)
+		return VIDEO_FORMAT_YUV422P12;
+	if (astrcmpi(name, "YUV444P12") == 0)
+		return VIDEO_FORMAT_YUV444P12;
+	if (astrcmpi(name, "GBRP12") == 0)
+		return VIDEO_FORMAT_GBRP12;
+
+	return VIDEO_FORMAT_NONE;
+}
+
+/* User-facing entries for the generic Color Format dropdown. `value` is the string stored in the
+ * encoder settings (parsed back by color_format_name_to_enum); `label` is what the user sees. */
+struct color_format_entry {
+	enum video_format fmt;
+	const char *label;
+	const char *value;
+};
+
+static const struct color_format_entry color_format_entries[] = {
+	{ VIDEO_FORMAT_NV12, "YUV 4:2:0 (8-bit)", "NV12" },
+	{ VIDEO_FORMAT_P010, "YUV 4:2:0 (10-bit)", "P010" },
+	{ VIDEO_FORMAT_YUV420P12, "YUV 4:2:0 (12-bit)", "YUV420P12" },
+	{ VIDEO_FORMAT_I422, "YUV 4:2:2 (8-bit)", "I422" },
+	{ VIDEO_FORMAT_P216, "YUV 4:2:2 (10-bit)", "P216" },
+	{ VIDEO_FORMAT_YUV422P12, "YUV 4:2:2 (12-bit)", "YUV422P12" },
+	{ VIDEO_FORMAT_I444, "YUV 4:4:4 (8-bit)", "I444" },
+	{ VIDEO_FORMAT_I412, "YUV 4:4:4 (10-bit)", "I412" },
+	{ VIDEO_FORMAT_Y410, "YUV 4:4:4 (10-bit, packed)", "Y410" },
+	{ VIDEO_FORMAT_YUV444P12, "YUV 4:4:4 (12-bit)", "YUV444P12" },
+	{ VIDEO_FORMAT_BGRA, "RGB (8-bit)", "BGRA" },
+	{ VIDEO_FORMAT_GBR10, "RGB (10-bit)", "GBR10" },
+	{ VIDEO_FORMAT_R10P, "RGB (10-bit, planar)", "R10P" },
+	{ VIDEO_FORMAT_GBRP12, "RGB (12-bit)", "GBRP12" },
+};
+
+#define COLOR_FORMAT_ENTRY_COUNT (sizeof(color_format_entries) / sizeof(color_format_entries[0]))
+
+/* Asks the encoder's get_video_info callback whether it can accept `candidate` as its input format,
+ * using the same lossless-equivalence rule the delivery path uses (acquire_encoder_only_mix): a format
+ * is accepted if the callback keeps it or remaps it to a lossless equivalent (e.g. I444 -> AYUV). Only
+ * called for texture encoders whose get_video_info tolerates a NULL context (true for NVENC/QSV). */
+static bool encoder_accepts_format(const struct obs_encoder_info *ei, enum video_format candidate)
+{
+	struct video_scale_info info = {0};
+
+	if (!ei->get_video_info)
+		return false;
+
+	info.format = candidate;
+	ei->get_video_info(NULL, &info);
+
+	if (info.format == VIDEO_FORMAT_NONE)
+		return false;
+
+	return format_conversion_is_lossless(candidate, info.format);
+}
+
+/* Adds the generic Color Format / Color Space / Color Range dropdowns to a video encoder's property
+ * tree so they are available for every video encoder in Advanced Output Mode. Encoders that already
+ * expose their own controls (e.g. x264/x265) keep theirs: each control is only added when the
+ * matching property name is not already present. The Color Format list offers every format the
+ * encoder actually accepts (probed via get_video_info for texture encoders). Because the video output
+ * format defaults to RGBA16F, all of these are legitimate down-conversions; if a user lowers the base
+ * canvas below a selected target's fidelity, delivery is refused at start time with an error. */
+static void add_encoder_color_properties(obs_properties_t *props, const struct obs_encoder_info *ei)
+{
+	obs_property_t *p;
+	const bool is_texture = ei && (ei->caps & OBS_ENCODER_CAP_PASS_TEXTURE) != 0;
+
+	if (!props || !ei)
+		return;
+
+	if (!obs_properties_get(props, "color_format")) {
+		size_t i;
+		p = obs_properties_add_list(props, "color_format", "Color Format", OBS_COMBO_TYPE_LIST,
+					    OBS_COMBO_FORMAT_STRING);
+		for (i = 0; i < COLOR_FORMAT_ENTRY_COUNT; i++) {
+			enum video_format fmt = color_format_entries[i].fmt;
+			bool supported;
+
+			if (ei->is_color_format_supported)
+				supported = ei->is_color_format_supported(ei->type_data, fmt);
+			else if (is_texture)
+				supported = encoder_accepts_format(ei, fmt);
+			else {
+				/* Non-texture encoders always accept NV12; 10-bit codecs additionally
+				 * accept P010 so HEVC/AV1 can default to YUV 4:2:0 (10-bit). */
+				bool ten_bit = ei->codec && (astrcmpi(ei->codec, "hevc") == 0 ||
+							     astrcmpi(ei->codec, "av1") == 0);
+				supported = (fmt == VIDEO_FORMAT_NV12) || (ten_bit && fmt == VIDEO_FORMAT_P010);
+			}
+
+			if (supported)
+				obs_property_list_add_string(p, color_format_entries[i].label,
+							     color_format_entries[i].value);
+		}
+	}
+
+	if (!obs_properties_get(props, "color_space")) {
+		p = obs_properties_add_list(props, "color_space", "Color Space", OBS_COMBO_TYPE_LIST,
+					    OBS_COMBO_FORMAT_INT);
+		obs_property_list_add_int(p, "Rec. 709", (long long)VIDEO_CS_709);
+		obs_property_list_add_int(p, "Rec. 601", (long long)VIDEO_CS_601);
+		obs_property_list_add_int(p, "sRGB", (long long)VIDEO_CS_SRGB);
+		obs_property_list_add_int(p, "Rec. 2100 PQ (HDR)", (long long)VIDEO_CS_2100_PQ);
+		obs_property_list_add_int(p, "Rec. 2100 HLG (HDR)", (long long)VIDEO_CS_2100_HLG);
+	}
+
+	if (!obs_properties_get(props, "color_range")) {
+		p = obs_properties_add_list(props, "color_range", "Color Range", OBS_COMBO_TYPE_LIST,
+					    OBS_COMBO_FORMAT_INT);
+		obs_property_list_add_int(p, "Partial (Limited)", (long long)VIDEO_RANGE_PARTIAL);
+		obs_property_list_add_int(p, "Full", (long long)VIDEO_RANGE_FULL);
+	}
+}
+
+/* Applies the user's per-encoder Color Format / Space / Range choices to the encoder's preferred
+ * delivery settings. Only non-default picks override the base (Advanced -> Video) values; leaving a
+ * control on "(Default)" keeps the normal base-format delivery path unchanged. Encoders that manage
+ * these settings themselves (e.g. x264/x265) re-publish their own resolved values from create()/
+ * update(), so this is effectively a no-op for them. */
+static void apply_encoder_color_settings(obs_encoder_t *encoder)
+{
+	obs_data_t *settings;
+	const char *fmt_name;
+	long long cs;
+	long long rg;
+
+	if (!encoder || encoder->info.type != OBS_ENCODER_VIDEO)
+		return;
+
+	settings = encoder->context.settings;
+	if (!settings)
+		return;
+
+	fmt_name = obs_data_get_string(settings, "color_format");
+	if (fmt_name && strcmp(fmt_name, "Default") != 0) {
+		enum video_format fmt = color_format_name_to_enum(fmt_name);
+		if (fmt != VIDEO_FORMAT_NONE)
+			obs_encoder_set_preferred_video_format(encoder, fmt);
+	}
+
+	cs = obs_data_get_int(settings, "color_space");
+	if (cs != (long long)VIDEO_CS_DEFAULT)
+		obs_encoder_set_preferred_color_space(encoder, (enum video_colorspace)cs);
+
+	rg = obs_data_get_int(settings, "color_range");
+	if (rg != (long long)VIDEO_RANGE_DEFAULT)
+		obs_encoder_set_preferred_range(encoder, (enum video_range_type)rg);
+}
+
 obs_properties_t *obs_get_encoder_properties(const char *id)
 {
 	const struct obs_encoder_info *ei = find_encoder(id);
@@ -611,6 +957,8 @@ obs_properties_t *obs_get_encoder_properties(const char *id)
 		}
 
 		obs_properties_apply_settings(properties, defaults);
+		if (ei->type == OBS_ENCODER_VIDEO)
+			add_encoder_color_properties(properties, ei);
 		obs_data_release(defaults);
 		return properties;
 	}
@@ -619,23 +967,24 @@ obs_properties_t *obs_get_encoder_properties(const char *id)
 
 obs_properties_t *obs_encoder_properties(const obs_encoder_t *encoder)
 {
+	obs_properties_t *props = NULL;
+
 	if (!obs_encoder_valid(encoder, "obs_encoder_properties"))
 		return NULL;
 
 	if (encoder->orig_info.get_properties2) {
-		obs_properties_t *props;
 		props = encoder->orig_info.get_properties2(encoder->context.data, encoder->orig_info.type_data);
-		obs_properties_apply_settings(props, encoder->context.settings);
-		return props;
-
 	} else if (encoder->orig_info.get_properties) {
-		obs_properties_t *props;
 		props = encoder->orig_info.get_properties(encoder->context.data);
-		obs_properties_apply_settings(props, encoder->context.settings);
-		return props;
 	}
 
-	return NULL;
+	if (!props)
+		return NULL;
+
+	obs_properties_apply_settings(props, encoder->context.settings);
+	if (encoder->orig_info.type == OBS_ENCODER_VIDEO)
+		add_encoder_color_properties(props, &encoder->orig_info);
+	return props;
 }
 
 void obs_encoder_update(obs_encoder_t *encoder, obs_data_t *settings)
@@ -644,6 +993,11 @@ void obs_encoder_update(obs_encoder_t *encoder, obs_data_t *settings)
 		return;
 
 	obs_data_apply(encoder->context.settings, settings);
+
+	/* Keep the preferred delivery format/space/range in sync with this encoder's Color Format /
+	 * Space / Range choices (see apply_encoder_color_settings). Encoders that manage these
+	 * themselves re-publish their own values from update() below. */
+	apply_encoder_color_settings(encoder);
 
 	// Encoder isn't initialized yet, only apply changes to settings
 	if (!encoder->context.data)
@@ -723,17 +1077,34 @@ static inline bool obs_encoder_initialize_internal(obs_encoder_t *encoder)
 
 	obs_encoder_shutdown(encoder);
 
-	if (encoder->orig_info.type == OBS_ENCODER_VIDEO)
-		maybe_set_up_gpu_rescale(encoder);
+	bool pre_bound = false;
 
 	if (encoder->orig_info.create) {
 		can_reroute = true;
 		encoder->info = encoder->orig_info;
+		apply_encoder_color_settings(encoder);
+		/* Bind the texture delivery mix before create() so a texture encoder sees an active
+		 * shared-texture path at its create() time and takes the GPU fast path, even when the
+		 * base canvas is a high-fidelity non-texture format (e.g. RGBA16F multitrack master). */
+		pre_bound = maybe_pre_bind_texture_mix(encoder);
 		encoder->context.data = encoder->orig_info.create(encoder->context.settings, encoder);
 		can_reroute = false;
 	}
 	if (!encoder->context.data)
 		return false;
+
+	/* Bind the delivery mix only after create() so context.data is valid. CPU/raw encoders
+	 * (x264/x265/openh264/AV1) publish their preferred YUV delivery format via get_video_info,
+	 * which we can only query once the encoder context exists - this lets us bind an optimized
+	 * GPU-conversion mix (e.g. NV12/I010) instead of falling back to base-format + CPU swscale.
+	 * Texture encoders already pre-bound above are skipped here to avoid a double refcount. */
+	if (encoder->orig_info.type == OBS_ENCODER_VIDEO && !pre_bound && !maybe_set_up_gpu_rescale(encoder)) {
+		blog(LOG_ERROR, "Encoder '%s': failed to establish video delivery, encoder cannot start",
+		     obs_encoder_get_name(encoder));
+		encoder->info.destroy(encoder->context.data);
+		encoder->context.data = NULL;
+		return false;
+	}
 
 	if (encoder->orig_info.type == OBS_ENCODER_AUDIO)
 		intitialize_audio_encoder(encoder);
@@ -1017,6 +1388,12 @@ static bool live_rebind_encoder_mix(struct obs_encoder *encoder)
 	} else {
 		start_raw_video(target, &info, encoder->frame_rate_divisor, receive_video, encoder);
 	}
+
+	/* Re-report the texture-reuse path for the mix now bound to this encoder: the reuse state can
+	 * change across a live rescale (e.g. an SDR down-convert becomes Option A), so surface it again. */
+	if (result == MIX_ACQUIRE_SUCCESS)
+		log_encoder_only_mix_reuse("Live-rescaled encoder mix for", obs_encoder_get_name(encoder),
+		                            get_mix_for_video(encoder->source_video), new_mix);
 
 	/* Retire the previous encoder-only mix if we orphaned it. A NULL view marks the mix for
 	 * reclamation by the graphics thread on its next tick. */
@@ -2397,5 +2774,10 @@ void obs_encoder_group_destroy(obs_encoder_group_t *group)
 bool obs_encoder_video_tex_active(const obs_encoder_t *encoder, enum video_format format)
 {
 	struct obs_core_video_mix *mix = get_mix_for_video(encoder->media);
+	/* The encoder's current media may not be backed by a core mix yet (e.g. a multitrack
+	 * canvas queried during encoder create() before any GPU mix is bound). In that case no
+	 * shared-texture delivery exists, so report the format as inactive rather than deref NULL. */
+	if (!mix)
+		return false;
 	return mix->encoder_texture_format == format;
 }

@@ -306,6 +306,11 @@ static void GetDShowVideoInfo(void *data, struct video_scale_info *info)
 static void GetDShowEncoderDefauts(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "bitrate", 1000);
+
+	/* Per-encoder color defaults: NV12 / Rec. 709 / Limited (shared injection). */
+	obs_data_set_default_string(settings, "color_format", "NV12");
+	obs_data_set_default_int(settings, "color_space", VIDEO_CS_709);
+	obs_data_set_default_int(settings, "color_range", VIDEO_RANGE_PARTIAL);
 }
 
 static obs_properties_t *GetDShowEncoderProperties(void *data)

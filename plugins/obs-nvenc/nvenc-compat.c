@@ -107,8 +107,8 @@ static void nvenc_defaults_base(enum codec_type codec, obs_data_t *settings)
 	obs_data_set_default_int(settings, "max_bitrate", 5000);
 	obs_data_set_default_int(settings, "keyint_sec", 0);
 	obs_data_set_default_int(settings, "cqp", 20);
-	obs_data_set_default_string(settings, "rate_control", "CBR");
-	obs_data_set_default_string(settings, "preset2", "p5");
+	obs_data_set_default_string(settings, "rate_control", "CQP");
+	obs_data_set_default_string(settings, "preset2", "p2");
 	obs_data_set_default_string(settings, "multipass", "qres");
 	obs_data_set_default_string(settings, "tune", "hq");
 	obs_data_set_default_string(settings, "profile", codec != CODEC_H264 ? "main" : "high");
@@ -116,6 +116,11 @@ static void nvenc_defaults_base(enum codec_type codec, obs_data_t *settings)
 	obs_data_set_default_int(settings, "gpu", 0);
 	obs_data_set_default_int(settings, "bf", 2);
 	obs_data_set_default_bool(settings, "repeat_headers", false);
+
+	/* Per-encoder color defaults: H.264 = 8-bit NV12; HEVC/AV1 = 10-bit P010 (Rec. 709 / Limited). */
+	obs_data_set_default_string(settings, "color_format", codec == CODEC_H264 ? "NV12" : "P010");
+	obs_data_set_default_int(settings, "color_space", VIDEO_CS_709);
+	obs_data_set_default_int(settings, "color_range", VIDEO_RANGE_PARTIAL);
 }
 
 static void h264_nvenc_defaults(obs_data_t *settings)
@@ -295,6 +300,15 @@ static bool fake_encode_tex2(void *data, struct encoder_texture *texture, int64_
 	return true;
 }
 
+/* NVENC AV1 hardware encode only supports YUV 4:2:0 (8-bit NV12 / 10-bit P010); it cannot take
+ * 4:2:2, 4:4:4 or RGB inputs. Declare this so the shared libobs injection offers only those two
+ * formats for AV1 instead of probing every texture-encodable format. */
+static bool nvenc_av1_is_color_format_supported(void *type_data, enum video_format format)
+{
+	UNUSED_PARAMETER(type_data);
+	return format == VIDEO_FORMAT_NV12 || format == VIDEO_FORMAT_P010;
+}
+
 struct obs_encoder_info compat_h264_nvenc_info = {
 	.id = "jim_nvenc",
 	.codec = "h264",
@@ -337,6 +351,7 @@ struct obs_encoder_info compat_av1_nvenc_info = {
 	.encode_texture2 = fake_encode_tex2,
 	.get_defaults = av1_nvenc_defaults,
 	.get_properties = av1_nvenc_properties,
+	.is_color_format_supported = nvenc_av1_is_color_format_supported,
 };
 
 struct obs_encoder_info compat_h264_nvenc_soft_info = {
@@ -378,6 +393,7 @@ struct obs_encoder_info compat_av1_nvenc_soft_info = {
 	.encode = fake_encode,
 	.get_defaults = av1_nvenc_defaults,
 	.get_properties = av1_nvenc_properties,
+	.is_color_format_supported = nvenc_av1_is_color_format_supported,
 };
 
 void register_compat_encoders(void)

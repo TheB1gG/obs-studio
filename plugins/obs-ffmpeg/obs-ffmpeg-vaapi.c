@@ -867,6 +867,11 @@ static void vaapi_defaults_internal(obs_data_t *settings, enum codec_type codec)
 	obs_data_set_default_int(settings, "qp", 20);
 	obs_data_set_default_int(settings, "maxrate", 0);
 
+	/* Per-encoder color defaults: NV12 / Rec. 709 / Limited (shared injection). */
+	obs_data_set_default_string(settings, "color_format", "NV12");
+	obs_data_set_default_int(settings, "color_space", VIDEO_CS_709);
+	obs_data_set_default_int(settings, "color_range", VIDEO_RANGE_PARTIAL);
+
 	int drm_fd = -1;
 	VADisplay va_dpy = vaapi_open_device(&drm_fd, device, "vaapi_defaults");
 	if (!va_dpy)

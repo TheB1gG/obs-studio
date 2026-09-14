@@ -195,6 +195,11 @@ void openh264_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "bitrate", 2500);
 	obs_data_set_default_string(settings, "profile", "main");
+
+	/* Per-encoder color defaults: NV12 / Rec. 709 / Limited (shared injection). */
+	obs_data_set_default_string(settings, "color_format", "NV12");
+	obs_data_set_default_int(settings, "color_space", VIDEO_CS_709);
+	obs_data_set_default_int(settings, "color_range", VIDEO_RANGE_PARTIAL);
 }
 
 obs_properties_t *h264_properties(enum openh264_encoder_type type)

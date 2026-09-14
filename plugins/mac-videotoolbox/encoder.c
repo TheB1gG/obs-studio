@@ -1387,6 +1387,13 @@ static void vt_defaults(obs_data_t *settings, void *data)
 	obs_data_set_default_int(settings, "codec_type", kCMVideoCodecType_AppleProRes422);
 	obs_data_set_default_bool(settings, "bframes", true);
 	obs_data_set_default_int(settings, "spatial_aq_mode", AQ_AUTO);
+
+	/* Color defaults: H.264/ProRes use 8-bit NV12; HEVC uses 10-bit P010 where the platform
+	 * supports it. Rec. 709 + Partial (Limited) match the OBS delivery default. */
+	obs_data_set_default_string(settings, "color_format",
+				    type_data->codec_type == kCMVideoCodecType_HEVC ? "P010" : "NV12");
+	obs_data_set_default_int(settings, "color_space", (int)VIDEO_CS_709);
+	obs_data_set_default_int(settings, "color_range", (int)VIDEO_RANGE_PARTIAL);
 }
 
 static void vt_free_type_data(void *data)

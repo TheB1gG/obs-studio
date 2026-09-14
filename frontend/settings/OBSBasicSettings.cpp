@@ -535,9 +535,6 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->colorPreset,          COMBO_CHANGED,  A11Y_CHANGED);
 	HookWidget(ui->renderer,             COMBO_CHANGED,  ADV_RESTART);
 	HookWidget(ui->adapter,              COMBO_CHANGED,  ADV_RESTART);
-	HookWidget(ui->colorFormat,          COMBO_CHANGED,  ADV_CHANGED);
-	HookWidget(ui->colorSpace,           COMBO_CHANGED,  ADV_CHANGED);
-	HookWidget(ui->colorRange,           COMBO_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->sdrWhiteLevel,        SCROLL_CHANGED, ADV_CHANGED);
 	HookWidget(ui->hdrNominalPeakLevel,  SCROLL_CHANGED, ADV_CHANGED);
 	HookWidget(ui->disableOSXVSync,      CHECK_CHANGED,  ADV_CHANGED);
@@ -689,9 +686,6 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 
 	installEventFilter(new SettingsEventFilter());
 
-	LoadColorRanges();
-	LoadColorSpaces();
-	LoadColorFormats();
 	LoadFormats();
 
 	auto ReloadAudioSources = [](void *data, calldata_t *param) {
@@ -1003,61 +997,6 @@ void OBSBasicSettings::SaveGroupBox(QGroupBox *widget, const char *section, cons
 {
 	if (WidgetChanged(widget))
 		config_set_bool(main->Config(), section, value, widget->isChecked());
-}
-
-#define CS_PARTIAL_STR QTStr("Basic.Settings.Advanced.Video.ColorRange.Partial")
-#define CS_FULL_STR QTStr("Basic.Settings.Advanced.Video.ColorRange.Full")
-
-void OBSBasicSettings::LoadColorRanges()
-{
-	ui->colorRange->addItem(CS_PARTIAL_STR, "Partial");
-	ui->colorRange->addItem(CS_FULL_STR, "Full");
-}
-
-#define CS_SRGB_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.sRGB")
-#define CS_709_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.709")
-#define CS_601_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.601")
-#define CS_2100PQ_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.2100PQ")
-#define CS_2100HLG_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.2100HLG")
-
-void OBSBasicSettings::LoadColorSpaces()
-{
-	ui->colorSpace->addItem(CS_SRGB_STR, "sRGB");
-	ui->colorSpace->addItem(CS_709_STR, "709");
-	ui->colorSpace->addItem(CS_601_STR, "601");
-	ui->colorSpace->addItem(CS_2100PQ_STR, "2100PQ");
-	ui->colorSpace->addItem(CS_2100HLG_STR, "2100HLG");
-}
-
-#define CF_NV12_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.NV12")
-#define CF_I420_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.I420")
-#define CF_I444_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.I444")
-#define CF_P010_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.P010")
-#define CF_I010_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.I010")
-#define CF_Y410_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.Y410")
-#define CF_P216_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.P216")
-#define CF_P416_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.P416")
-#define CF_R10l_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.R10l")
-#define CF_R10p_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.R10p")
-#define CF_BGRA_STR QTStr("Basic.Settings.Advanced.Video.ColorFormat.BGRA")
-
-void OBSBasicSettings::LoadColorFormats()
-{
-	ui->colorFormat->addItem(CF_NV12_STR, "NV12");
-	ui->colorFormat->addItem(CF_I420_STR, "I420");
-	ui->colorFormat->addItem(CF_I444_STR, "I444");
-	ui->colorFormat->addItem(CF_P010_STR, "P010");
-	ui->colorFormat->addItem(CF_I010_STR, "I010");
-#ifdef _WIN32
-	ui->colorFormat->addItem(CF_Y410_STR, "Y410");
-#endif
-	ui->colorFormat->addItem(CF_P216_STR, "P216");
-	ui->colorFormat->addItem(CF_P416_STR, "P416");
-#ifdef _WIN32
-	ui->colorFormat->addItem(CF_R10l_STR, "R10l");
-	ui->colorFormat->addItem(CF_R10p_STR, "R10p"); // Planar G/B/R 10-bit (x264 R10I fast path)
-#endif
-	ui->colorFormat->addItem(CF_BGRA_STR, "RGB"); // Avoid config break
 }
 
 #define AV_FORMAT_DEFAULT_STR QTStr("Basic.Settings.Output.Adv.FFmpeg.FormatDefault")
@@ -2558,44 +2497,8 @@ void OBSBasicSettings::LoadAudioSettings()
 	loading = false;
 }
 
-void OBSBasicSettings::UpdateColorFormatSpaceWarning()
-{
-	const QString format = ui->colorFormat->currentData().toString();
-	switch (ui->colorSpace->currentIndex()) {
-	case 3: /* Rec.2100 (PQ) */
-	case 4: /* Rec.2100 (HLG) */
-		if (format == "P010" || format == "Y410" || format == "P216" || format == "P416" || format == "R10l" ||
-		    format == "R10p") {
-			ui->advancedMsg2->clear();
-			ui->advancedMsg2->setVisible(false);
-		} else if (format == "I010") {
-			ui->advancedMsg2->setText(QTStr("Basic.Settings.Advanced.FormatWarning"));
-			ui->advancedMsg2->setVisible(true);
-		} else {
-			ui->advancedMsg2->setText(QTStr("Basic.Settings.Advanced.FormatWarning2100"));
-			ui->advancedMsg2->setVisible(true);
-		}
-		break;
-	default:
-		if (format == "NV12") {
-			ui->advancedMsg2->clear();
-			ui->advancedMsg2->setVisible(false);
-		} else if (format == "I010" || format == "P010" || format == "Y410" || format == "P216" ||
-			   format == "P416" || format == "R10l" || format == "R10p") {
-			ui->advancedMsg2->setText(QTStr("Basic.Settings.Advanced.FormatWarningPreciseSdr"));
-			ui->advancedMsg2->setVisible(true);
-		} else {
-			ui->advancedMsg2->setText(QTStr("Basic.Settings.Advanced.FormatWarning"));
-			ui->advancedMsg2->setVisible(true);
-		}
-	}
-}
-
 void OBSBasicSettings::LoadAdvancedSettings()
 {
-	const char *videoColorFormat = config_get_string(main->Config(), "Video", "ColorFormat");
-	const char *videoColorSpace = config_get_string(main->Config(), "Video", "ColorSpace");
-	const char *videoColorRange = config_get_string(main->Config(), "Video", "ColorRange");
 	uint32_t sdrWhiteLevel = (uint32_t)config_get_uint(main->Config(), "Video", "SdrWhiteLevel");
 	uint32_t hdrNominalPeakLevel = (uint32_t)config_get_uint(main->Config(), "Video", "HdrNominalPeakLevel");
 
@@ -2653,9 +2556,6 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	ui->autoRemux->setChecked(autoRemux);
 	ui->dynBitrate->setChecked(dynBitrate);
 
-	SetComboByValue(ui->colorFormat, videoColorFormat);
-	SetComboByValue(ui->colorSpace, videoColorSpace);
-	SetComboByValue(ui->colorRange, videoColorRange);
 	ui->sdrWhiteLevel->setValue(sdrWhiteLevel);
 	ui->hdrNominalPeakLevel->setValue(hdrNominalPeakLevel);
 
@@ -3257,9 +3157,6 @@ void OBSBasicSettings::SaveAdvancedSettings()
 		config_set_bool(App()->GetAppConfig(), "Video", "ResetOSXVSyncOnExit", ui->resetOSXVSync->isChecked());
 #endif
 
-	SaveComboData(ui->colorFormat, "Video", "ColorFormat");
-	SaveComboData(ui->colorSpace, "Video", "ColorSpace");
-	SaveComboData(ui->colorRange, "Video", "ColorRange");
 	SaveSpinBox(ui->sdrWhiteLevel, "Video", "SdrWhiteLevel");
 	SaveSpinBox(ui->hdrNominalPeakLevel, "Video", "HdrNominalPeakLevel");
 	if (obs_audio_monitoring_available()) {
@@ -4085,16 +3982,6 @@ void OBSBasicSettings::on_advOutFFVEncoder_currentIndexChanged(int idx)
 void OBSBasicSettings::on_advOutFFType_currentIndexChanged(int idx)
 {
 	ui->advOutFFNoSpace->setHidden(idx != 0);
-}
-
-void OBSBasicSettings::on_colorFormat_currentIndexChanged(int)
-{
-	UpdateColorFormatSpaceWarning();
-}
-
-void OBSBasicSettings::on_colorSpace_currentIndexChanged(int)
-{
-	UpdateColorFormatSpaceWarning();
 }
 
 #define INVALID_RES_STR "Basic.Settings.Video.InvalidResolution"

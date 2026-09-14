@@ -344,6 +344,18 @@ struct obs_encoder_info {
 
 	bool (*encode_texture2)(void *data, struct encoder_texture *texture, int64_t pts, uint64_t lock_key,
 				uint64_t *next_key, struct encoder_packet *packet, bool *received_packet);
+
+	/**
+	 * Optional: reports whether this encoder supports a given Color Format for its "Color
+	 * Format" dropdown. When set, libobs uses this to decide which formats to offer instead
+	 * of its default logic (texture probing for texture encoders, or the NV12 / NV12+P010
+	 * fallback otherwise). Leave NULL to use the default logic.
+	 *
+	 * @param  type_data  The type_data variable of this structure
+	 * @param  format     The candidate video format
+	 * @return            true if the format should be offered, false otherwise
+	 */
+	bool (*is_color_format_supported)(void *type_data, enum video_format format);
 };
 
 EXPORT void obs_register_encoder_s(const struct obs_encoder_info *info, size_t size);

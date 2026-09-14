@@ -166,7 +166,7 @@ static void obs_qsv_defaults(obs_data_t *settings, int ver, enum qsv_codec codec
 	obs_data_set_default_int(settings, "bitrate", 2500);
 	obs_data_set_default_int(settings, "max_bitrate", 3000);
 	obs_data_set_default_string(settings, "profile", codec == QSV_CODEC_AVC ? "high" : "main");
-	obs_data_set_default_string(settings, "rate_control", "CBR");
+	obs_data_set_default_string(settings, "rate_control", "ICQ");
 
 	obs_data_set_default_int(settings, "__ver", ver);
 
@@ -174,12 +174,17 @@ static void obs_qsv_defaults(obs_data_t *settings, int ver, enum qsv_codec codec
 	obs_data_set_default_int(settings, "qpi", 23);
 	obs_data_set_default_int(settings, "qpp", 23);
 	obs_data_set_default_int(settings, "qpb", 23);
-	obs_data_set_default_int(settings, "icq_quality", 23);
+	obs_data_set_default_int(settings, "icq_quality", 17);
 
 	obs_data_set_default_int(settings, "keyint_sec", 0);
 	obs_data_set_default_string(settings, "latency", "normal");
 	obs_data_set_default_int(settings, "bframes", 3);
 	obs_data_set_default_bool(settings, "repeat_headers", false);
+
+	/* Per-encoder color defaults: H.264 is 8-bit (NV12), HEVC/AV1 default to 10-bit (P010). */
+	obs_data_set_default_string(settings, "color_format", codec == QSV_CODEC_AVC ? "NV12" : "P010");
+	obs_data_set_default_int(settings, "color_space", VIDEO_CS_709);
+	obs_data_set_default_int(settings, "color_range", VIDEO_RANGE_PARTIAL);
 }
 
 static void obs_qsv_defaults_h264_v1(obs_data_t *settings)

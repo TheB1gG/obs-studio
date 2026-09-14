@@ -46,8 +46,8 @@ static void nvenc_defaults_base(enum codec_type codec, obs_data_t *settings)
 	obs_data_set_default_int(settings, "device", -1);
 	obs_data_set_default_int(settings, "bf", caps->bframes > 0 ? 2 : 0);
 
-	obs_data_set_default_string(settings, "rate_control", "cbr");
-	obs_data_set_default_string(settings, "preset", "p5");
+	obs_data_set_default_string(settings, "rate_control", "CQP");
+	obs_data_set_default_string(settings, "preset", "p2");
 	obs_data_set_default_string(settings, "multipass", "qres");
 	obs_data_set_default_string(settings, "tune", "hq");
 	obs_data_set_default_string(settings, "profile", codec != CODEC_H264 ? "main" : "high");
@@ -59,6 +59,11 @@ static void nvenc_defaults_base(enum codec_type codec, obs_data_t *settings)
 	obs_data_set_default_bool(settings, "repeat_headers", false);
 	obs_data_set_default_bool(settings, "force_cuda_tex", false);
 	obs_data_set_default_bool(settings, "disable_scenecut", false);
+
+	/* Per-encoder color defaults: H.264 = 8-bit NV12; HEVC/AV1 = 10-bit P010 (Rec. 709 / Limited). */
+	obs_data_set_default_string(settings, "color_format", codec == CODEC_H264 ? "NV12" : "P010");
+	obs_data_set_default_int(settings, "color_space", VIDEO_CS_709);
+	obs_data_set_default_int(settings, "color_range", VIDEO_RANGE_PARTIAL);
 }
 
 void h264_nvenc_defaults(obs_data_t *settings)
