@@ -840,6 +840,36 @@ static void set_gpu_converted_data(struct video_frame *output, const struct vide
 
 		break;
 	}
+	case VIDEO_FORMAT_GBRP: { /* three planes G/B/R, all full resolution, 8-bit */
+		const uint32_t width = info->width;
+		const uint32_t height = info->height;
+
+		set_gpu_converted_plane(width, height, input->linesize[0], output->linesize[0],
+			input->data[0], output->data[0]);
+
+		set_gpu_converted_plane(width, height, input->linesize[1], output->linesize[1],
+			input->data[1], output->data[1]);
+
+		set_gpu_converted_plane(width, height, input->linesize[2], output->linesize[2],
+			input->data[2], output->data[2]);
+
+		break;
+	}
+	case VIDEO_FORMAT_YUV444P10: { /* three planes Y/U/V, all full resolution, double width */
+		const uint32_t width_x2 = info->width * 2;
+		const uint32_t height = info->height;
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[0], output->linesize[0],
+			input->data[0], output->data[0]);
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[1], output->linesize[1],
+			input->data[1], output->data[1]);
+
+		set_gpu_converted_plane(width_x2, height, input->linesize[2], output->linesize[2],
+			input->data[2], output->data[2]);
+
+		break;
+	}
 	case VIDEO_FORMAT_I422: { /* three planes Y/U/V: Y full-res u8, U/V half-width-pixels u8 */
 		const uint32_t width = info->width;
 		const uint32_t height = info->height;

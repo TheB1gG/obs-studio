@@ -630,6 +630,52 @@ float4 PSGBRP12_R(FragPos frag_in) : TARGET
 	return float4(saturate(rgb.r) * (4095. / 65535.), 0., 0., 1.);
 }
 
+/* Planar RGB 4:4:4 8-bit (GBRP): one channel per pass into an R8 target. The input canvas is a
+ * display-encoded (gamma) SRGB surface, so no srgb_linear_to_nonlinear step is needed. */
+float4 PSGBRP_G(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	return float4(saturate(rgb.g), 0., 0., 1.);
+}
+
+float4 PSGBRP_B(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	return float4(saturate(rgb.b), 0., 0., 1.);
+}
+
+float4 PSGBRP_R(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	return float4(saturate(rgb.r), 0., 0., 1.);
+}
+
+/* YUV 4:4:4 10-bit (YUV444P10): full-resolution Y/U/V into R16 targets with 10-bit values.
+ * The input canvas is a linear-light SRGB_16F surface, so srgb_linear_to_nonlinear is applied. */
+float PS_YUV444P10_Y(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
+	return saturate(y) * (1023. / 65535.);
+}
+
+float PS_YUV444P10_U(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
+	return saturate(u) * (1023. / 65535.);
+}
+
+float PS_YUV444P10_V(FragPos frag_in) : TARGET
+{
+	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
+	rgb = srgb_linear_to_nonlinear(rgb);
+	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
+	return saturate(v) * (1023. / 65535.);
+}
+
 /* YUV 4:2:2 8-bit (I422): full-resolution Y plus half-width U/V. The input canvas is a display-encoded
  * (gamma) SRGB surface - the same encoding the standard I420/NV12 paths (PS_Y / PS_U_Wide / PS_V_Wide)
  * read - so it is fed straight into the RGB->YUV matrix with no srgb_linear_to_nonlinear() step. R8
@@ -2590,5 +2636,59 @@ technique R10P_R_HLG
 	{
 		vertex_shader = VSPos(id);
 		pixel_shader  = PSR10P_R_HLG(frag_in);
+	}
+}
+
+technique GBRP_G
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSGBRP_G(frag_in);
+	}
+}
+
+technique GBRP_B
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSGBRP_B(frag_in);
+	}
+}
+
+technique GBRP_R
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSGBRP_R(frag_in);
+	}
+}
+
+technique YUV444P10_Y
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_YUV444P10_Y(frag_in);
+	}
+}
+
+technique YUV444P10_U
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_YUV444P10_U(frag_in);
+	}
+}
+
+technique YUV444P10_V
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PS_YUV444P10_V(frag_in);
 	}
 }

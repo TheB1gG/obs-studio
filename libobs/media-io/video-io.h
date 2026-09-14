@@ -120,6 +120,12 @@ enum video_format {
 	/* planar RGB (G/B/R) 4:4:4, 12 bpp (u16 samples) */
 	VIDEO_FORMAT_GBRP12,
 
+	/* planar RGB (G/B/R) 4:4:4, 8 bpp */
+	VIDEO_FORMAT_GBRP,
+
+	/* planar YUV 4:4:4, 10 bpp (u16 samples) */
+	VIDEO_FORMAT_YUV444P10,
+
 	/* packed RGBA, 16-bit float per channel (4 channels). Used as the high-fidelity
 	 * master canvas for multitrack output; down-converts losslessly to any YUV/RGB target. */
 	VIDEO_FORMAT_RGBA16F,
@@ -193,6 +199,7 @@ static inline bool format_is_yuv(enum video_format format)
 	case VIDEO_FORMAT_YUV420P12:
 	case VIDEO_FORMAT_YUV422P12:
 	case VIDEO_FORMAT_YUV444P12:
+	case VIDEO_FORMAT_YUV444P10:
 		return true;
 	case VIDEO_FORMAT_NONE:
 	case VIDEO_FORMAT_RGBA:
@@ -205,6 +212,7 @@ static inline bool format_is_yuv(enum video_format format)
 	case VIDEO_FORMAT_GBR10:
 	case VIDEO_FORMAT_R10P:
 	case VIDEO_FORMAT_GBRP12:
+	case VIDEO_FORMAT_GBRP:
 		return false;
 	}
 
@@ -220,10 +228,12 @@ static inline int video_format_bit_depth(enum video_format format)
 	case VIDEO_FORMAT_P216:
 	case VIDEO_FORMAT_P416:
 	case VIDEO_FORMAT_R10L:
+	case VIDEO_FORMAT_R10P:
 	case VIDEO_FORMAT_GBR10:
 	case VIDEO_FORMAT_Y410:
 	case VIDEO_FORMAT_I210:
 	case VIDEO_FORMAT_V210:
+	case VIDEO_FORMAT_YUV444P10:
 		return 10;
 	case VIDEO_FORMAT_I412:
 	case VIDEO_FORMAT_YUV420P12:
@@ -364,6 +374,10 @@ static inline const char *get_video_format_name(enum video_format format)
 		return "YUV444P12";
 	case VIDEO_FORMAT_GBRP12:
 		return "GBRP12";
+	case VIDEO_FORMAT_GBRP:
+		return "GBRP";
+	case VIDEO_FORMAT_YUV444P10:
+		return "YUV444P10";
 	case VIDEO_FORMAT_RGBA16F:
 		return "RGBA16F";
 	case VIDEO_FORMAT_NONE:;

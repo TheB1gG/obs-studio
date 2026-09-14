@@ -51,13 +51,66 @@ static const char *svt_av1_getname(void *unused)
 
 static void av1_video_info(void *data, struct video_scale_info *info)
 {
-	UNUSED_PARAMETER(data);
+	struct av1_encoder *enc = data;
+	enum video_format pref_format = VIDEO_FORMAT_NONE;
+
+	if (enc)
+		pref_format = obs_encoder_get_preferred_video_format(enc->ffve.encoder);
+
+	/* If the user explicitly selected a color format, use it as the source for
+	 * normalization below. The switch maps semi-planar/interleaved formats to
+	 * the planar equivalents that libaom actually accepts (e.g. NV12 → I420). */
+	if (pref_format != VIDEO_FORMAT_NONE)
+		info->format = pref_format;
 
 	switch (info->format) {
+	/* 8-bit planar YUV */
+	case VIDEO_FORMAT_I420:
+	case VIDEO_FORMAT_NV12:
+		info->format = VIDEO_FORMAT_I420;
+		break;
+	case VIDEO_FORMAT_I422:
+		info->format = VIDEO_FORMAT_I422;
+		break;
+	case VIDEO_FORMAT_I444:
+		info->format = VIDEO_FORMAT_I444;
+		break;
+
+	/* 10-bit planar YUV */
 	case VIDEO_FORMAT_I010:
 	case VIDEO_FORMAT_P010:
 		info->format = VIDEO_FORMAT_I010;
 		break;
+	case VIDEO_FORMAT_I210:
+		info->format = VIDEO_FORMAT_I210;
+		break;
+	case VIDEO_FORMAT_YUV444P10:
+		info->format = VIDEO_FORMAT_YUV444P10;
+		break;
+
+	/* 12-bit planar YUV */
+	case VIDEO_FORMAT_YUV420P12:
+		info->format = VIDEO_FORMAT_YUV420P12;
+		break;
+	case VIDEO_FORMAT_YUV422P12:
+		info->format = VIDEO_FORMAT_YUV422P12;
+		break;
+	case VIDEO_FORMAT_I412:
+	case VIDEO_FORMAT_YUV444P12:
+		info->format = VIDEO_FORMAT_YUV444P12;
+		break;
+
+	/* Planar RGB */
+	case VIDEO_FORMAT_GBRP:
+		info->format = VIDEO_FORMAT_GBRP;
+		break;
+	case VIDEO_FORMAT_R10P:
+		info->format = VIDEO_FORMAT_R10P;
+		break;
+	case VIDEO_FORMAT_GBRP12:
+		info->format = VIDEO_FORMAT_GBRP12;
+		break;
+
 	default:
 		info->format = VIDEO_FORMAT_I420;
 	}
@@ -322,6 +375,30 @@ static bool av1_extra_data(void *data, uint8_t **extra_data, size_t *size)
 	return true;
 }
 
+/* Declares the set of color formats the AOM AV1 encoder supports so the shared libobs
+ * injection (add_encoder_color_properties) offers exactly those in the Color Format dropdown. */
+static bool aom_av1_is_color_format_supported(void *type_data, enum video_format format)
+{
+	UNUSED_PARAMETER(type_data);
+	switch (format) {
+	case VIDEO_FORMAT_NV12:      /* yuv420p */
+	case VIDEO_FORMAT_P010:      /* yuv420p10le */
+	case VIDEO_FORMAT_YUV420P12: /* yuv420p12le */
+	case VIDEO_FORMAT_I422:      /* yuv422p */
+	case VIDEO_FORMAT_I210:      /* yuv422p10le */
+	case VIDEO_FORMAT_YUV422P12: /* yuv422p12le */
+	case VIDEO_FORMAT_I444:      /* yuv444p */
+	case VIDEO_FORMAT_YUV444P10: /* yuv444p10le */
+	case VIDEO_FORMAT_YUV444P12: /* yuv444p12le */
+	case VIDEO_FORMAT_GBRP:      /* gbrp */
+	case VIDEO_FORMAT_R10P:      /* gbrp10le */
+	case VIDEO_FORMAT_GBRP12:    /* gbrp12le */
+		return true;
+	default:
+		return false;
+	}
+}
+
 struct obs_encoder_info svt_av1_encoder_info = {
 	.id = "ffmpeg_svt_av1",
 	.type = OBS_ENCODER_VIDEO,
@@ -348,4 +425,5 @@ struct obs_encoder_info aom_av1_encoder_info = {
 	.get_properties = aom_av1_properties,
 	.get_extra_data = av1_extra_data,
 	.get_video_info = av1_video_info,
+	.is_color_format_supported = aom_av1_is_color_format_supported,
 };

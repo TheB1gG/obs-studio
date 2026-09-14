@@ -55,6 +55,20 @@ static inline enum AVPixelFormat obs_to_ffmpeg_video_format(enum video_format fo
 		return AV_PIX_FMT_P216LE;
 	case VIDEO_FORMAT_P416:
 		return AV_PIX_FMT_P416LE;
+	case VIDEO_FORMAT_YUV420P12:
+		return AV_PIX_FMT_YUV420P12LE;
+	case VIDEO_FORMAT_YUV422P12:
+		return AV_PIX_FMT_YUV422P12LE;
+	case VIDEO_FORMAT_YUV444P12:
+		return AV_PIX_FMT_YUV444P12LE;
+	case VIDEO_FORMAT_GBRP12:
+		return AV_PIX_FMT_GBRP12LE;
+	case VIDEO_FORMAT_R10P:
+		return AV_PIX_FMT_GBRP10LE;
+	case VIDEO_FORMAT_GBRP:
+		return AV_PIX_FMT_GBRP;
+	case VIDEO_FORMAT_YUV444P10:
+		return AV_PIX_FMT_YUV444P10LE;
 	case VIDEO_FORMAT_NONE:
 	case VIDEO_FORMAT_AYUV:
 	default:

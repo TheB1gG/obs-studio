@@ -233,6 +233,8 @@ static bool raw_gpu_conversion_supported(enum video_format format)
 	case VIDEO_FORMAT_YUV422P12:
 	case VIDEO_FORMAT_YUV444P12:
 	case VIDEO_FORMAT_GBRP12:
+	case VIDEO_FORMAT_GBRP:
+	case VIDEO_FORMAT_YUV444P10:
 		return true;
 	default:
 		return false;
@@ -776,6 +778,8 @@ static enum video_format color_format_name_to_enum(const char *name)
 		return VIDEO_FORMAT_I422;
 	if (astrcmpi(name, "P216") == 0)
 		return VIDEO_FORMAT_P216;
+	if (astrcmpi(name, "I210") == 0)
+		return VIDEO_FORMAT_I210;
 	if (astrcmpi(name, "I444") == 0)
 		return VIDEO_FORMAT_I444;
 	if (astrcmpi(name, "I412") == 0)
@@ -798,6 +802,10 @@ static enum video_format color_format_name_to_enum(const char *name)
 		return VIDEO_FORMAT_YUV444P12;
 	if (astrcmpi(name, "GBRP12") == 0)
 		return VIDEO_FORMAT_GBRP12;
+	if (astrcmpi(name, "GBRP") == 0)
+		return VIDEO_FORMAT_GBRP;
+	if (astrcmpi(name, "YUV444P10") == 0)
+		return VIDEO_FORMAT_YUV444P10;
 
 	return VIDEO_FORMAT_NONE;
 }
@@ -816,12 +824,15 @@ static const struct color_format_entry color_format_entries[] = {
 	{ VIDEO_FORMAT_YUV420P12, "YUV 4:2:0 (12-bit)", "YUV420P12" },
 	{ VIDEO_FORMAT_I422, "YUV 4:2:2 (8-bit)", "I422" },
 	{ VIDEO_FORMAT_P216, "YUV 4:2:2 (10-bit)", "P216" },
+	{ VIDEO_FORMAT_I210, "YUV 4:2:2 (10-bit, planar)", "I210" },
 	{ VIDEO_FORMAT_YUV422P12, "YUV 4:2:2 (12-bit)", "YUV422P12" },
 	{ VIDEO_FORMAT_I444, "YUV 4:4:4 (8-bit)", "I444" },
-	{ VIDEO_FORMAT_I412, "YUV 4:4:4 (10-bit)", "I412" },
+	{ VIDEO_FORMAT_YUV444P10, "YUV 4:4:4 (10-bit)", "YUV444P10" },
+	{ VIDEO_FORMAT_I412, "YUV 4:4:4 (12-bit)", "I412" },
 	{ VIDEO_FORMAT_Y410, "YUV 4:4:4 (10-bit, packed)", "Y410" },
-	{ VIDEO_FORMAT_YUV444P12, "YUV 4:4:4 (12-bit)", "YUV444P12" },
+	{ VIDEO_FORMAT_YUV444P12, "YUV 4:4:4 (12-bit, planar u16)", "YUV444P12" },
 	{ VIDEO_FORMAT_BGRA, "RGB (8-bit)", "BGRA" },
+	{ VIDEO_FORMAT_GBRP, "RGB (8-bit, planar)", "GBRP" },
 	{ VIDEO_FORMAT_GBR10, "RGB (10-bit)", "GBR10" },
 	{ VIDEO_FORMAT_R10P, "RGB (10-bit, planar)", "R10P" },
 	{ VIDEO_FORMAT_GBRP12, "RGB (12-bit)", "GBRP12" },

@@ -91,6 +91,10 @@ static inline enum AVPixelFormat get_ffmpeg_video_format(enum video_format forma
 		return AV_PIX_FMT_X2BGR10LE;
 	case VIDEO_FORMAT_R10P:
 		return AV_PIX_FMT_GBRP10LE; // planar G/B/R 4:4:4 u16 (raw [0..1023]); x264 HIGH_DEPTH reads it as YUV444P with G/Cb/Cr slots
+	case VIDEO_FORMAT_GBRP:
+		return AV_PIX_FMT_GBRP;
+	case VIDEO_FORMAT_YUV444P10:
+		return AV_PIX_FMT_YUV444P10LE;
 	case VIDEO_FORMAT_Y410:
 		return AV_PIX_FMT_XV30LE;
 	case VIDEO_FORMAT_RGBA16F:
