@@ -80,6 +80,12 @@ struct obs_x264 {
 	/* R10I (RGB 10-bit): libobs delivers three planar u16 textures [G][B][R]
 	 * (VIDEO_FORMAT_R10P), which x264 ingests directly as YUV444P | HIGH_DEPTH -
 	 * no per-frame scratch/unpack is needed on this side. */
+
+	/* 8-bit RGB (BGRA): libobs delivers packed GBRA; we de-interleave it into planar
+	 * [G][B][R] u8 in the encode path and feed x264 as YUV 4:4:4 with an identity (GBR)
+	 * matrix. The scratch is cached across frames, reallocated only on resolution change. */
+	uint8_t *gbr_deinter;
+	size_t gbr_deinter_size;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -90,6 +96,8 @@ static enum video_format color_format_from_name(const char *name)
 		return VIDEO_FORMAT_NV12;
 	else if (strcmp(name, "P010") == 0)
 		return VIDEO_FORMAT_P010;
+	else if (strcmp(name, "I422") == 0)
+		return VIDEO_FORMAT_I422;
 	else if (strcmp(name, "I444") == 0)
 		return VIDEO_FORMAT_I444;
 	else if (strcmp(name, "P216") == 0)
@@ -110,37 +118,6 @@ static enum video_format color_format_from_name(const char *name)
 	return VIDEO_FORMAT_NONE; /* unrecognized value: create/update rejects it loudly instead of silently downgrading to NV12 */
 }
 
-/* Maps an arbitrary base (Advanced -> Video) format onto one x264 can actually encode,
- * so that a "Default" color-format choice still produces a valid encoder context. */
-static enum video_format map_base_format_for_x264(enum video_format fmt)
-{
-	switch (fmt) {
-	case VIDEO_FORMAT_NV12:
-		return VIDEO_FORMAT_NV12;
-	case VIDEO_FORMAT_P010:
-	case VIDEO_FORMAT_I010:
-	case VIDEO_FORMAT_Y410: /* packed YUV 4:2:0 10-bit -> lossless as planar I010 (x264 I420 | HIGH_DEPTH) */
-		return VIDEO_FORMAT_P010;
-	case VIDEO_FORMAT_I444:
-		return VIDEO_FORMAT_I444;
-	case VIDEO_FORMAT_I412:
-		return VIDEO_FORMAT_I412; /* planar 4:4:4 u16, x264 encodes it as I444 + HIGH_DEPTH */
-	case VIDEO_FORMAT_P216:
-	case VIDEO_FORMAT_P416: /* packed YUV 4:2:2 10-bit -> lossless as planar I210 (x264 I422 | HIGH_DEPTH) */
-		return VIDEO_FORMAT_P216;
-	case VIDEO_FORMAT_R10L:
-	case VIDEO_FORMAT_R10P: /* RGB 10-bit -> lossless as planar [G][B][R] u16 (x264 I444 | HIGH_DEPTH) */
-		return VIDEO_FORMAT_R10P;
-	case VIDEO_FORMAT_RGBA:
-	case VIDEO_FORMAT_BGRA:
-	case VIDEO_FORMAT_BGRX:
-	case VIDEO_FORMAT_AYUV:
-		return VIDEO_FORMAT_BGRA; /* RGB-family content is stored as raw GBR components by x264 */
-	default:
-		return VIDEO_FORMAT_NV12; /* planar 8-bit (I420/I422, etc.) collapses to NV12 */
-	}
-}
-
 /* Publishes the effective color settings on the encoder so consumers that inspect
  * the encoder (e.g. the mp4 muxer writing its nclx box) see exactly what x264
  * encodes instead of only the base video info. */
@@ -153,42 +130,37 @@ static void publish_preferred_settings(obs_encoder_t *encoder, enum video_format
 }
 
 /* Reads the user's per-output color settings and resolves them into a concrete
- * format/space/range. "Default" entries fall back to the base video info (Advanced -> Video).
- * If any one of the three is explicitly chosen, all three are resolved (explicit value
- * or base) forming a complete override that wins over the global video settings. */
+ * format/space/range. Unset values (or legacy "(Default)" entries) fall back to
+ * sensible defaults: NV12 for the format, Rec. 709 for the space, Partial (Limited)
+ * for the range. */
 static void read_color_settings(obs_data_t *settings, enum video_format *format, enum video_colorspace *cs,
 				enum video_range_type *range)
 {
-	struct obs_video_info ovi;
-	bool have_base = obs_get_video_info(&ovi);
-
 	const char *fmt_name = obs_data_get_string(settings, "color_format");
-	bool fmt_explicit = !obs_data_has_user_value(settings, "color_format") || strcmp(fmt_name, "Default") != 0;
 	enum video_colorspace cs_val = (enum video_colorspace)obs_data_get_int(settings, "color_space");
 	enum video_range_type rg_val = (enum video_range_type)obs_data_get_int(settings, "color_range");
 
-	if (!have_base) {
-		/* Base info unavailable: honor explicit picks, otherwise plain defaults */
-		*format = fmt_explicit ? color_format_from_name(fmt_name) : VIDEO_FORMAT_NV12;
-		*cs = cs_val == VIDEO_CS_DEFAULT ? VIDEO_CS_709 : cs_val;
-		*range = rg_val == VIDEO_RANGE_DEFAULT ? VIDEO_RANGE_PARTIAL : rg_val;
-		return;
+	/* Color format: fall back to NV12 when unset / legacy "(Default)" / unrecognized. */
+	if (!fmt_name || !*fmt_name || strcmp(fmt_name, "Default") == 0) {
+		*format = VIDEO_FORMAT_NV12;
+	} else {
+		enum video_format f = color_format_from_name(fmt_name);
+		*format = (f != VIDEO_FORMAT_NONE) ? f : VIDEO_FORMAT_NV12;
 	}
 
-	enum video_format fmt = map_base_format_for_x264(ovi.output_format);
-	enum video_colorspace spc = ovi.colorspace;
-	enum video_range_type rg = ovi.range;
+	/* Color space: fall back to Rec. 709 when unset / legacy "(Default)". */
+	*cs = (cs_val == VIDEO_CS_DEFAULT) ? VIDEO_CS_709 : cs_val;
 
-	if (fmt_explicit)
-		fmt = color_format_from_name(fmt_name);
-	if (cs_val != VIDEO_CS_DEFAULT)
-		spc = cs_val;
-	if (rg_val != VIDEO_RANGE_DEFAULT)
-		rg = rg_val;
+	/* Range: fall back to Partial (Limited) when unset / legacy "(Default)". */
+	*range = (rg_val == VIDEO_RANGE_DEFAULT) ? VIDEO_RANGE_PARTIAL : rg_val;
 
-	*format = fmt;
-	*cs = spc;
-	*range = rg;
+	/* Identity-RGB (BGRA): RGB screen content is full-range sRGB. A YUV colorspace or a
+	 * limited range would be wrong for it, so force sRGB + full range regardless of the
+	 * user's picks - matching NVENC/QSV's BGRA->GBRA override. */
+	if (*format == VIDEO_FORMAT_BGRA) {
+		*cs = VIDEO_CS_SRGB;
+		*range = VIDEO_RANGE_FULL;
+	}
 }
 
 static const char *obs_x264_getname(void *unused)
@@ -209,6 +181,10 @@ static void clear_data(struct obs_x264 *obsx264)
 		obsx264->sei = NULL;
 		obsx264->extra_data = NULL;
 	}
+
+	bfree(obsx264->gbr_deinter);
+	obsx264->gbr_deinter = NULL;
+	obsx264->gbr_deinter_size = 0;
 }
 
 static void obs_x264_destroy(void *data)
@@ -229,11 +205,11 @@ static void obs_x264_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "use_bufsize", false);
 	obs_data_set_default_int(settings, "buffer_size", 2500);
 	obs_data_set_default_int(settings, "keyint_sec", 0);
-	obs_data_set_default_int(settings, "crf", 23);
+	obs_data_set_default_int(settings, "crf", 17);
 #ifdef ENABLE_VFR
 	obs_data_set_default_bool(settings, "vfr", false);
 #endif
-	obs_data_set_default_string(settings, "rate_control", "CBR");
+	obs_data_set_default_string(settings, "rate_control", "CRF");
 
 	obs_data_set_default_string(settings, "preset", "veryfast");
 	obs_data_set_default_string(settings, "profile", "");
@@ -243,8 +219,8 @@ static void obs_x264_defaults(obs_data_t *settings)
 
 	/* Color settings (Option 1): per-output color format/space/range */
 	obs_data_set_default_string(settings, "color_format", "NV12");
-	obs_data_set_default_int(settings, "color_space", VIDEO_CS_DEFAULT);
-	obs_data_set_default_int(settings, "color_range", VIDEO_RANGE_DEFAULT);
+	obs_data_set_default_int(settings, "color_space", VIDEO_CS_709);
+	obs_data_set_default_int(settings, "color_range", VIDEO_RANGE_PARTIAL);
 }
 
 static inline void add_strings(obs_property_t *list, const char *const *strings)
@@ -301,27 +277,27 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs
 	return true;
 }
 
-static bool color_format_modified(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings)
+/* Declares which Color Format options x264 offers. H.264 is delivered as 8-bit YUV 4:2:0
+ * (NV12); the shared libobs injection builds the dropdown from this. */
+/* The formats x264 can encode (see obs_x264_format_to_csp / obs_x264_delivery_csp): YUV 4:2:0,
+ * 4:2:2 and 4:4:4 in 8-bit and 10-bit, plus RGB. Offer exactly those; the shared injection builds
+ * the dropdown from this set. */
+static bool x264_is_color_format_supported(void *type_data, enum video_format format)
 {
-	UNUSED_PARAMETER(p);
-	const char *format = obs_data_get_string(settings, "color_format");
-	bool bgra = strcmp(format, "BGRA") == 0;
-
-	/* x264 stores BGRA as raw RGB components (G/B/R in the Y/Cb/Cr slots), no
-	 * YUV conversion: only GBR/identity matrix + full range is valid for it.
-	 * Disable the two dropdowns when BGRA is selected so an invalid combo
-	 * cannot be chosen; update_params() forces the same values regardless. */
-	p = obs_properties_get(ppts, "color_space");
-	obs_property_set_enabled(p, !bgra);
-
-	p = obs_properties_get(ppts, "color_range");
-	obs_property_set_enabled(p, !bgra);
-	return true;
-}
-
-static void add_cs_entry(obs_property_t *list, const char *name, int value)
-{
-	obs_property_list_add_int(list, name, (long long)value);
+	UNUSED_PARAMETER(type_data);
+	switch (format) {
+	case VIDEO_FORMAT_NV12: /* YUV 4:2:0 8-bit */
+	case VIDEO_FORMAT_P010: /* YUV 4:2:0 10-bit */
+	case VIDEO_FORMAT_I422: /* YUV 4:2:2 8-bit */
+	case VIDEO_FORMAT_P216: /* YUV 4:2:2 10-bit */
+	case VIDEO_FORMAT_I444: /* YUV 4:4:4 8-bit */
+	case VIDEO_FORMAT_I412: /* YUV 4:4:4 10-bit */
+	case VIDEO_FORMAT_BGRA: /* RGB 8-bit */
+	case VIDEO_FORMAT_R10P: /* RGB 10-bit (planar) */
+		return true;
+	default:
+		return false;
+	}
 }
 
 static obs_properties_t *obs_x264_props(void *unused)
@@ -371,35 +347,9 @@ static obs_properties_t *obs_x264_props(void *unused)
 	obs_properties_add_bool(props, "vfr", TEXT_VFR);
 #endif
 
-	/* Color format / color space / color range (Option 1) */
-	list = obs_properties_add_list(props, "color_format", TEXT_COLOR_FORMAT, OBS_COMBO_TYPE_LIST,
-				       OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(list, "(Default - Advanced -> Video)", "Default");
-	obs_property_list_add_string(list, "NV12 (8-bit)", "NV12");
-	obs_property_list_add_string(list, "P010 (10-bit)", "P010");
-	obs_property_list_add_string(list, "I444 (8-bit)", "I444");
-	obs_property_list_add_string(list, "I412 (YUV 4:4:4, 10-bit planar)", "I412");
-	obs_property_list_add_string(list, "P216 (10-bit)", "P216");
-	obs_property_list_add_string(list, "BGRA (RGB 8-bit)", "BGRA");
-	/* Planar RGB 10-bit replaces the removed packed R10l ("R10I") option; that name still maps to a
-	 * working planar path here so profiles saved before it was dropped keep encoding. */
-	obs_property_list_add_string(list, "R10p (planar RGB 10-bit)", "R10P");
-
-	list = obs_properties_add_list(props, "color_space", TEXT_COLOR_SPACE, OBS_COMBO_TYPE_LIST,
-				       OBS_COMBO_FORMAT_INT);
-	add_cs_entry(list, "(Default)", VIDEO_CS_DEFAULT);
-	add_cs_entry(list, "Rec. 709", VIDEO_CS_709);
-	add_cs_entry(list, "Rec. 601", VIDEO_CS_601);
-	add_cs_entry(list, "sRGB", VIDEO_CS_SRGB);
-
-	list = obs_properties_add_list(props, "color_range", TEXT_COLOR_RANGE, OBS_COMBO_TYPE_LIST,
-				       OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(list, "(Default)", (long long)VIDEO_RANGE_DEFAULT);
-	obs_property_list_add_int(list, "Partial (Limited)", (long long)VIDEO_RANGE_PARTIAL);
-	obs_property_list_add_int(list, "Full", (long long)VIDEO_RANGE_FULL);
-
-	/* BGRA locks the color space / range dropdowns to their only valid combo */
-	obs_property_set_modified_callback(obs_properties_get(props, "color_format"), color_format_modified);
+	/* Color format / space / range are provided by the shared libobs injection (see
+	 * add_encoder_color_properties in obs-encoder.c); x264 declares its allowed formats via
+	 * is_color_format_supported. */
 
 	obs_properties_add_text(props, "x264opts", TEXT_X264_OPTS, OBS_TEXT_DEFAULT);
 
@@ -545,6 +495,10 @@ static bool obs_x264_format_to_csp(enum video_format format, int *csp, uint32_t 
 		*csp = X264_CSP_NV12; /* x264 uses NV12 csp with i_bitdepth=10 for P010 */
 		*bitdepth = 10;
 		break;
+	case VIDEO_FORMAT_I422:
+		*csp = X264_CSP_I422; /* planar Y/U/V 8-bit 4:2:2, delivered as I422 */
+		*bitdepth = 8;
+		break;
 	case VIDEO_FORMAT_I444:
 		*csp = X264_CSP_I444;
 		*bitdepth = 8;
@@ -610,6 +564,15 @@ static bool obs_x264_delivery_csp(enum video_format fmt, enum video_format *deli
 		*delivery = VIDEO_FORMAT_R10P;
 		*csp = X264_CSP_I444;
 		*bitdepth = 10;
+		return true;
+	case VIDEO_FORMAT_BGRA:
+		/* 8-bit RGB: libobs delivers packed BGRA on the CPU path (GBRA is only produced on
+		 * the GPU-texture path used by NVENC/QSV, not for software encoders). We de-interleave
+		 * it to planar G/B/R in the encode path (init_pic_data), fed as YUV 4:4:4 with an
+		 * identity (GBR) matrix - the OBS-documented identity-RGB path. */
+		*delivery = VIDEO_FORMAT_BGRA;
+		*csp = X264_CSP_I444;
+		*bitdepth = 8;
 		return true;
 	default:
 		if (!obs_x264_format_to_csp(fmt, csp, bitdepth))
@@ -735,7 +698,7 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 	 * alpha discarded for BGRA) with no YUV conversion. The only valid VUI for that data
 	 * is identity (GBR) colormatrix + full range: a bt.709 matrix or limited
 	 * range would be wrong for it. Force both regardless of the user's picks. */
-	if (info.format == VIDEO_FORMAT_BGRA || info.format == VIDEO_FORMAT_R10L ||
+	if (obsx264->color_format == VIDEO_FORMAT_BGRA || info.format == VIDEO_FORMAT_R10L ||
 	    info.format == VIDEO_FORMAT_R10P) {
 		colmatrix =
 			"GBR"; /* SPS col_matrix_coef 0, identity matrix (x264_colmatrix_names[0]): R=plane[2], G=plane[0](luma slot), B=plane[1] */
@@ -743,14 +706,14 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 
 	obsx264->params.vui.i_sar_height = 1;
 	obsx264->params.vui.i_sar_width = 1;
-	bool is_rgb_family = (info.format == VIDEO_FORMAT_BGRA) || (info.format == VIDEO_FORMAT_R10L) ||
+	bool is_rgb_family = (obsx264->color_format == VIDEO_FORMAT_BGRA) || (info.format == VIDEO_FORMAT_R10L) ||
 		              (info.format == VIDEO_FORMAT_R10P);
 	obsx264->params.vui.b_fullrange = is_rgb_family || info.range == VIDEO_RANGE_FULL;
 	if (is_rgb_family) {
-		/* Raw RGB components: no YUV transform, so primaries/transfer are unspecified
-		 * (all-zero VUI fields) - the same signalling a standalone x264 RGB encode produces. */
-		obsx264->params.vui.i_colorprim = 0;
-		obsx264->params.vui.i_transfer = 0;
+		/* Identity-RGB: leave primaries/transfer unspecified and use the identity matrix, so
+		 * the stream reads as raw RGB with no YUV transform and no BT.709/sRGB tags. */
+		obsx264->params.vui.i_colorprim = 2; /* unspecified */
+		obsx264->params.vui.i_transfer = 2;  /* unspecified */
 	} else {
 		obsx264->params.vui.i_colorprim = get_x264_cs_val(colorprim, x264_colorprim_names);
 		obsx264->params.vui.i_transfer = get_x264_cs_val(transfer, x264_transfer_names);
@@ -1050,6 +1013,41 @@ static void parse_packet(struct obs_x264 *obsx264, struct encoder_packet *packet
 	packet->keyframe = pic_out->b_keyframe != 0;
 }
 
+/* De-interleaves a packed BGRA frame (B,G,R,A per pixel) into three planar u8 buffers
+ * [G][B][R] so it can be fed to x264 as YUV 4:4:4 with an identity (GBR) matrix. The
+ * scratch is cached on the encoder and only reallocated when the resolution changes, so
+ * steady-state frames cost one pass and no allocation. */
+static uint8_t *deinterleave_gbra(struct obs_x264 *obsx264, struct encoder_frame *frame, int *stride_out)
+{
+	const uint32_t width = obs_encoder_get_width(obsx264->encoder);
+	const uint32_t height = obs_encoder_get_height(obsx264->encoder);
+	const size_t plane_size = (size_t)width * height;
+
+	if (!obsx264->gbr_deinter || obsx264->gbr_deinter_size < 3 * plane_size) {
+		bfree(obsx264->gbr_deinter);
+		obsx264->gbr_deinter = bzalloc(3 * plane_size);
+		obsx264->gbr_deinter_size = 3 * plane_size;
+	}
+
+	const uint8_t *src = frame->data[0];
+	const int src_stride = (int)frame->linesize[0];
+	uint8_t *dG = obsx264->gbr_deinter; /* plane0 = G */
+	uint8_t *dR = dG + plane_size;      /* plane1 = R */
+	uint8_t *dB = dR + plane_size;      /* plane2 = B */
+
+	for (uint32_t y = 0; y < height; y++) {
+		const uint8_t *srow = src + (size_t)y * src_stride;
+		for (uint32_t x = 0; x < width; x++) {
+			dG[(size_t)y * width + x] = srow[x * 4 + 1]; /* G (BGRA byte 1) */
+			dR[(size_t)y * width + x] = srow[x * 4 + 2]; /* R (BGRA byte 2) */
+			dB[(size_t)y * width + x] = srow[x * 4 + 0]; /* B (BGRA byte 0) */
+		}
+	}
+
+	*stride_out = (int)width;
+	return obsx264->gbr_deinter;
+}
+
 static inline void init_pic_data(struct obs_x264 *obsx264, x264_picture_t *pic, struct encoder_frame *frame)
 {
 	x264_picture_init(pic);
@@ -1064,6 +1062,25 @@ static inline void init_pic_data(struct obs_x264 *obsx264, x264_picture_t *pic, 
      * correctly. 8-bit formats use the unflagged 8-bit flavor and must NOT be flagged. */
 	if (obsx264->active_bitdepth == 10)
 		pic->img.i_csp |= X264_CSP_HIGH_DEPTH;
+
+	if (obsx264->color_format == VIDEO_FORMAT_BGRA) {
+		/* 8-bit RGB: OBS delivers packed BGRA. De-interleave to planar G/R/B and feed as
+		 * YUV 4:4:4 with an identity matrix (see deinterleave_gbra). */
+		const uint32_t width = obs_encoder_get_width(obsx264->encoder);
+		const uint32_t height = obs_encoder_get_height(obsx264->encoder);
+		const size_t plane_size = (size_t)width * height;
+		int stride;
+		uint8_t *base = deinterleave_gbra(obsx264, frame, &stride);
+
+		pic->img.i_plane = 3;
+		pic->img.plane[0] = base;                  /* G */
+		pic->img.i_stride[0] = stride;
+		pic->img.plane[1] = base + plane_size;     /* R */
+		pic->img.i_stride[1] = stride;
+		pic->img.plane[2] = base + 2 * plane_size; /* B */
+		pic->img.i_stride[2] = stride;
+		return;
+	}
 
 	if (obsx264->active_csp == X264_CSP_NV12)
 		pic->img.i_plane = 2; /* NV12: Y + interleaved UV */
@@ -1233,5 +1250,6 @@ struct obs_encoder_info obs_x264_encoder = {
 	.get_extra_data = obs_x264_extra_data,
 	.get_sei_data = obs_x264_sei,
 	.get_video_info = obs_x264_video_info,
+	.is_color_format_supported = x264_is_color_format_supported,
 	.caps = OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_ROI,
 };
