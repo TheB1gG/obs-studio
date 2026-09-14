@@ -279,13 +279,15 @@ static inline void preferred_colour_values(enum video_colorspace cs, bool is_rgb
 					    uint16_t *spc)
 {
 	if (is_rgb_family) {
-		/* x264 stores RGB-family input (BGRA 8-bit and R10I/R10L 10-bit) as raw RGB
+		/* RGB-family input (BGRA 8-bit, R10L/R10P 10-bit) is stored as raw RGB
 		 * components with an identity matrix and full range. There is no YUV transform
-		 * for that data, so primaries/transfer are unspecified (0/0); only spc=0 +
-		 * full_range are meaningful nclx fields. */
-		*pri = 0; // OBSCOL_PRI_UNSPECIFIED
-		*trc = 0; // OBSCOL_TRC_UNSPECIFIED
-		*spc = 0; // identity matrix (GBR), matching the SPS col_matrix_coef=0
+		 * for that data, so only spc=0 + full_range are meaningful nclx fields.
+		 * primaries/transfer must be "unspecified" = 2: value 0 is a reserved code point
+		 * in HEVC/nclx (rejected by strict parsers and shown as "reserved"), and it also
+		 * matches the VUI x265 writes for RGB (colour_primaries=2, transfer_characteristics=2). */
+		*pri = 2; // OBSCOL_PRI_UNSPECIFIED
+		*trc = 2; // OBSCOL_TRC_UNSPECIFIED
+		*spc = 0; // identity matrix, matching the SPS col_matrix_coef=0 written for RGB
 		return;
 	}
 
@@ -340,7 +342,8 @@ static inline void get_colour_information(obs_encoder_t *enc, uint16_t *pri, uin
 	if (fmt != VIDEO_FORMAT_NONE || cs != VIDEO_CS_DEFAULT) {
 		/* Raw RGB components (identity matrix) - same nclx signalling as the BGRA fix. */
 		bool is_rgb_family =
-			(fmt == VIDEO_FORMAT_BGRA) || (fmt == VIDEO_FORMAT_R10L) || (fmt == VIDEO_FORMAT_R10P);
+			(fmt == VIDEO_FORMAT_BGRA) || (fmt == VIDEO_FORMAT_R10L) || (fmt == VIDEO_FORMAT_R10P) ||
+			(fmt == VIDEO_FORMAT_GBRP12);
 		preferred_colour_values(cs, is_rgb_family, pri, trc, spc);
 		bool full = is_rgb_family || rg == VIDEO_RANGE_FULL;
 		*full_range = full ? 1 : 0;
