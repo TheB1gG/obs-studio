@@ -954,6 +954,7 @@ static void set_gpu_converted_data(struct video_frame *output, const struct vide
 	case VIDEO_FORMAT_V210:
 	case VIDEO_FORMAT_GBRA:
 	case VIDEO_FORMAT_GBR10:
+	case VIDEO_FORMAT_RGBA16F:
 		/* unimplemented */
 		;
 	}

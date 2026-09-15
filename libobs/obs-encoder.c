@@ -370,7 +370,7 @@ static enum encoder_mix_acquire acquire_encoder_only_mix(struct obs_encoder *enc
 	 * Surface this as a hard error so the bad selection blocks start instead of silently
 	 * mis-encoding at the base canvas's lower fidelity. */
 	if (format_needs_higher_fidelity(info->format, format)) {
-		char err[256];
+		char err[512];
 		snprintf(err, sizeof(err),
 		         "Encoder '%s' cannot deliver %s from the current video output format (%s): that would be a "
 		         "fake high-fidelity stream (padded bit depth and/or interpolated chroma). Change the video "

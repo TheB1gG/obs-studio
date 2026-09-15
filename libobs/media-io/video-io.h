@@ -213,6 +213,7 @@ static inline bool format_is_yuv(enum video_format format)
 	case VIDEO_FORMAT_R10P:
 	case VIDEO_FORMAT_GBRP12:
 	case VIDEO_FORMAT_GBRP:
+	case VIDEO_FORMAT_RGBA16F:
 		return false;
 	}
 

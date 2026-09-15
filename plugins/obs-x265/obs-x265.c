@@ -838,7 +838,7 @@ static bool obs_x265_update(void *data, obs_data_t *settings)
 static void load_headers(struct obs_x265 *obsx265)
 {
 	x265_nal *nals;
-	int nal_count;
+	uint32_t nal_count;
 	DARRAY(uint8_t) header;
 	DARRAY(uint8_t) sei;
 
@@ -847,7 +847,7 @@ static void load_headers(struct obs_x265 *obsx265)
 
 	obsx265->api->encoder_headers(obsx265->context, &nals, &nal_count);
 
-	for (int i = 0; i < nal_count; i++) {
+	for (uint32_t i = 0; i < nal_count; i++) {
 		x265_nal *nal = nals + i;
 
 		if (nal->type == NAL_UNIT_PREFIX_SEI || nal->type == NAL_UNIT_SUFFIX_SEI)
@@ -1124,7 +1124,7 @@ static bool obs_x265_encode(void *data, struct encoder_frame *frame, struct enco
 {
 	struct obs_x265 *obsx265 = data;
 	x265_nal *nals;
-	int nal_count;
+	uint32_t nal_count;
 	int ret;
 	x265_picture pic, pic_out;
 
