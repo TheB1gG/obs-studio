@@ -62,13 +62,13 @@
               }
             },
             "qt6": {
-              "version": "2026-09-06",
+              "version": "2026-09-08",
               "baseUrl": "https://github.com/TheB1gG/obs-deps/releases/download",
               "label": "Pre-Built Qt6",
               "hashes": {
-                "macos-universal": "d4b8058612a7067e44b2205fe7925ee24e9ec6b15ac8c29d3e6230c70030b102",
-                "windows-x64": "6fb0b8a7432240dd20950aaa48a9e6f20057f01eb3d5f2cf743fc5d3b5bb1b1e",
-                "windows-arm64": "6d5047a04cad3ecc2615bf8b3df6eb22ec953a458b6cd89253bf131ee4981b90"
+                "macos-universal": "76dcc7497dc6403ccfd8e98285b8bd1fccc198611689839e0499428652aba227",
+                "windows-x64": "13aa297ece775c55f23466ed8bb06942f8d12c3a8481ed147a8832ded3a7167a",
+                "windows-arm64": "d5f533e2073b82f2906362c7208b9a2851197a0718ea9fb168534841a6d2aac9"
               },
               "debugSymbols": {
                 "windows-x64": "471d0b2191c424a520a51d064f3741084f117e1ff6ee5af1d16aabcdbacc6659",
