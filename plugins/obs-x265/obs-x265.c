@@ -352,10 +352,10 @@ static bool use_bufsize_modified(obs_properties_t *ppts, obs_property_t *p, obs_
 {
 	bool use_bufsize = obs_data_get_bool(settings, "use_bufsize");
 	const char *rc = obs_data_get_string(settings, "rate_control");
-	bool rc_crf = astrcmpi(rc, "CRF") == 0;
+	bool rc_quality = astrcmpi(rc, "CRF") == 0 || astrcmpi(rc, "CQP") == 0;
 
 	p = obs_properties_get(ppts, "buffer_size");
-	obs_property_set_visible(p, use_bufsize && !rc_crf);
+	obs_property_set_visible(p, use_bufsize && !rc_quality);
 	return true;
 }
 
@@ -364,17 +364,17 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs
 	const char *rc = obs_data_get_string(settings, "rate_control");
 	bool use_bufsize = obs_data_get_bool(settings, "use_bufsize");
 	bool abr = astrcmpi(rc, "CBR") == 0 || astrcmpi(rc, "ABR") == 0;
-	bool rc_crf = astrcmpi(rc, "CRF") == 0;
+	bool rc_quality = astrcmpi(rc, "CRF") == 0 || astrcmpi(rc, "CQP") == 0;
 
 	p = obs_properties_get(ppts, "crf");
 	obs_property_set_visible(p, !abr);
 
 	p = obs_properties_get(ppts, "bitrate");
-	obs_property_set_visible(p, !rc_crf);
+	obs_property_set_visible(p, !rc_quality);
 	p = obs_properties_get(ppts, "use_bufsize");
-	obs_property_set_visible(p, !rc_crf);
+	obs_property_set_visible(p, !rc_quality);
 	p = obs_properties_get(ppts, "buffer_size");
-	obs_property_set_visible(p, !rc_crf && use_bufsize);
+	obs_property_set_visible(p, !rc_quality && use_bufsize);
 	return true;
 }
 
@@ -419,6 +419,7 @@ static obs_properties_t *obs_x265_props(void *unused)
 	obs_property_list_add_string(list, "ABR", "ABR");
 	obs_property_list_add_string(list, "VBR", "VBR");
 	obs_property_list_add_string(list, "CRF", "CRF");
+	obs_property_list_add_string(list, "CQP", "CQP");
 
 	obs_property_set_modified_callback(list, rate_control_modified);
 
@@ -514,6 +515,8 @@ static bool reset_x265_params(struct obs_x265 *obsx265, const char *preset, cons
 	return true;
 }
 
+enum rate_control { RATE_CONTROL_CBR, RATE_CONTROL_VBR, RATE_CONTROL_ABR, RATE_CONTROL_CRF, RATE_CONTROL_CQP };
+
 static void update_params(struct obs_x265 *obsx265, obs_data_t *settings, const struct obs_options *options,
 			  bool update)
 {
@@ -536,6 +539,32 @@ static void update_params(struct obs_x265 *obsx265, obs_data_t *settings, const 
 	int width = (int)obs_encoder_get_width(obsx265->encoder);
 	int height = (int)obs_encoder_get_height(obsx265->encoder);
 	bool use_bufsize = obs_data_get_bool(settings, "use_bufsize");
+	enum rate_control rc;
+
+	/* Determine the rate control mode and normalize bitrate/buffer_size/crf for it.
+	 * Mirrors obs-x264: quality-based modes (CRF/CQP) must NOT carry a VBV/bitrate cap,
+	 * otherwise x265 clamps the output to the VBV max rate even though CRF is selected. */
+	if (astrcmpi(rate_control, "ABR") == 0) {
+		rc = RATE_CONTROL_ABR;
+		crf = 0;
+
+	} else if (astrcmpi(rate_control, "VBR") == 0) {
+		rc = RATE_CONTROL_VBR;
+
+	} else if (astrcmpi(rate_control, "CRF") == 0) {
+		rc = RATE_CONTROL_CRF;
+		bitrate = 0;
+		buffer_size = 0;
+
+	} else if (astrcmpi(rate_control, "CQP") == 0) {
+		rc = RATE_CONTROL_CQP;
+		bitrate = 0;
+		buffer_size = 0;
+
+	} else { /* CBR */
+		rc = RATE_CONTROL_CBR;
+		crf = 0;
+	}
 
 	if (keyint_sec)
 		obsx265->params.keyframeMax = keyint_sec * voi->fps_num / voi->fps_den;
@@ -620,20 +649,23 @@ static void update_params(struct obs_x265 *obsx265, obs_data_t *settings, const 
 	}
 	obsx265->params.vui.matrixCoeffs = get_x265_cs_val(colmatrix, x265_colmatrix_names);
 
-	/* Rate control */
-	if (astrcmpi(rate_control, "CRF") == 0) {
-		obsx265->params.rc.rateControlMode = X265_RC_CRF;
-		obsx265->params.rc.rfConstant = (float)crf;
-	} else if (astrcmpi(rate_control, "CQP") == 0) {
-		obsx265->params.rc.rateControlMode = X265_RC_CQP;
-		obsx265->params.rc.qp = crf;
-	} else { /* CBR, ABR, VBR all use ABR mode */
+	/* Rate control - mirror obs-x264: CBR/ABR use the ABR method, VBR/CRF use the
+	 * constant-ratefactor method (VBR keeps a VBV cap, CRF has none), and CQP uses
+	 * constant QP. */
+	if (rc == RATE_CONTROL_CBR || rc == RATE_CONTROL_ABR) {
 		obsx265->params.rc.rateControlMode = X265_RC_ABR;
 
-		if (astrcmpi(rate_control, "CBR") == 0) {
+		if (rc == RATE_CONTROL_CBR) {
+			/* CBR: pin the VBV max rate and buffer to the target bitrate so the output stays flat */
 			obsx265->params.rc.vbvMaxBitrate = bitrate;
 			obsx265->params.rc.vbvBufferSize = bitrate;
 		}
+	} else if (rc == RATE_CONTROL_CQP) {
+		obsx265->params.rc.rateControlMode = X265_RC_CQP;
+		obsx265->params.rc.qp = crf;
+	} else { /* VBR and CRF both use the constant-ratefactor method */
+		obsx265->params.rc.rateControlMode = X265_RC_CRF;
+		obsx265->params.rc.rfConstant = (float)crf;
 	}
 
 	/* Derive x265 csp/bitdepth from the user's chosen color format */
