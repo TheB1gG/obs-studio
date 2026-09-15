@@ -615,7 +615,7 @@ std::vector<GoLiveApi::AudioEncoderConfiguration> collect_audio_configurations(c
 	return configs;
 }
 
-// If the audio encoder is CoreAudio AAC, override settings to use TVBR at maximum quality (127).
+// If the audio encoder is CoreAudio AAC, override settings to use TVBR at quality 110.
 // Any bitrate value from the JSON config is ignored in that case. Non-AAC encoders are left unchanged.
 static nlohmann::json apply_audio_vbr_override(const GoLiveApi::AudioEncoderConfiguration &config,
                                                const char *encoder_id)
@@ -626,7 +626,7 @@ static nlohmann::json apply_audio_vbr_override(const GoLiveApi::AudioEncoderConf
 		return settings;
 
 	settings["vbr"] = true;
-	settings["quality_target"] = 127;
+	settings["quality_target"] = 110;
 	return settings;
 }
 
