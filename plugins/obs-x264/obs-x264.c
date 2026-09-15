@@ -760,15 +760,15 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 		     "\tbitrate:      %d\n"
 		     "\tbuffer size:  %d\n"
 		     "\tcrf:          %d\n"
-		     "\tfps_num:      %d\n"
-		     "\tfps_den:      %d\n"
+		     "\tFPS:          %g (%u/%u)\n"
 		     "\twidth:        %d\n"
 		     "\theight:       %d\n"
 		     "\tkeyint:       %d\n"
 		     "\tcolor format: %d\n"
 		     "\tbit depth:    %u\n",
 		     rate_control, obsx264->params.rc.i_vbv_max_bitrate, obsx264->params.rc.i_vbv_buffer_size,
-		     (int)obsx264->params.rc.f_rf_constant, voi->fps_num, voi->fps_den, width, height,
+		     (int)obsx264->params.rc.f_rf_constant, obs_encoder_get_effective_fps(obsx264->encoder),
+		     obs_encoder_get_fps_num(obsx264->encoder), obs_encoder_get_fps_den(obsx264->encoder) * obs_encoder_get_frame_rate_divisor(obsx264->encoder), width, height,
 		     obsx264->params.i_keyint_max, (int)obsx264->color_format, bitdepth);
 	}
 }

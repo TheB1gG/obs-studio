@@ -653,6 +653,23 @@ static void update_params(struct obs_x265 *obsx265, obs_data_t *settings, const 
 		set_param(obsx265, options->options[i]);
 
 	if (!update) {
+		info("settings:\n"
+		     "\trate_control: %s\n"
+		     "\tbitrate:      %d\n"
+		     "\tbuffer size:  %d\n"
+		     "\tcrf:          %d\n"
+		     "\tFPS:          %g (%u/%u)\n"
+		     "\twidth:        %d\n"
+		     "\theight:       %d\n"
+		     "\tkeyint:       %d\n"
+		     "\tcolor format: %d\n"
+		     "\tbit depth:    %u\n",
+		     rate_control, bitrate, buffer_size, crf, obs_encoder_get_effective_fps(obsx265->encoder),
+		     obs_encoder_get_fps_num(obsx265->encoder), obs_encoder_get_fps_den(obsx265->encoder) * obs_encoder_get_frame_rate_divisor(obsx265->encoder), width, height,
+		     obsx265->params.keyframeMax, (int)obsx265->color_format, bitdepth);
+	}
+
+	if (!update) {
 		size_t buffer_size = 1;
 		for (size_t i = 0; i < options->count; ++i)
 			buffer_size += strlen(options->options[i].name) + strlen(options->options[i].value) + 4;

@@ -638,10 +638,9 @@ static void dump_encoder_info(struct vt_encoder *enc)
 		"\trate_control:          %s\n"
 		"\tbitrate:               %d (kbps)\n"
 		"\tquality:               %f\n"
-		"\tfps_num:               %d\n"
-		"\tfps_den:               %d\n"
 		"\twidth:                 %d\n"
 		"\theight:                %d\n"
+		"\tFPS:                   %g (%u/%u)\n"
 		"\tkeyint:                %d (s)\n"
 		"\tlimit_bitrate:         %s\n"
 		"\trc_max_bitrate:        %d (kbps)\n"
@@ -650,8 +649,10 @@ static void dump_encoder_info(struct vt_encoder *enc)
 		"\tspatial_aq:            %s\n"
 		"\tprofile:               %s\n"
 		"\tcodec_type:            %.4s\n",
-		enc->vt_encoder_id, enc->rate_control, enc->bitrate, enc->quality, enc->fps_num, enc->fps_den,
-		enc->width, enc->height, enc->keyint, enc->limit_bitrate ? "on" : "off", enc->rc_max_bitrate,
+		enc->vt_encoder_id, enc->rate_control, enc->bitrate, enc->quality,
+		enc->width, enc->height, obs_encoder_get_effective_fps(enc->encoder),
+		obs_encoder_get_fps_num(enc->encoder), obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder), enc->keyint,
+		enc->limit_bitrate ? "on" : "off", enc->rc_max_bitrate,
 		enc->rc_max_bitrate_window, enc->hw_enc ? "on" : "off", enc->spatial_aq ? "on" : "off",
 		(enc->profile != NULL && !!strlen(enc->profile)) ? enc->profile : "default",
 		codec_type_to_print_fmt(enc->codec_type));

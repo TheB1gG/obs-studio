@@ -327,6 +327,11 @@ inline void AdvancedOutput::SetupStreaming()
 	obs_encoder_set_scaled_size(videoStreaming, cx, cy);
 	obs_encoder_set_gpu_scale_type(videoStreaming, (obs_scale_type)rescaleFilter);
 
+	uint32_t stream_fps_divisor = config_get_uint(main->Config(), "AdvOut", "StreamFpsDivisor");
+	if (stream_fps_divisor < 1)
+		stream_fps_divisor = 1;
+	obs_encoder_set_frame_rate_divisor(videoStreaming, stream_fps_divisor);
+
 	const char *id = obs_service_get_id(main->GetService());
 	if (strcmp(id, "rtmp_custom") == 0) {
 		OBSDataAutoRelease settings = obs_data_create();
@@ -379,6 +384,12 @@ inline void AdvancedOutput::SetupRecording()
 
 		obs_encoder_set_scaled_size(videoRecording, cx, cy);
 		obs_encoder_set_gpu_scale_type(videoRecording, (obs_scale_type)rescaleFilter);
+
+		uint32_t rec_fps_divisor = config_get_uint(main->Config(), "AdvOut", "RecFpsDivisor");
+		if (rec_fps_divisor < 1)
+			rec_fps_divisor = 1;
+		obs_encoder_set_frame_rate_divisor(videoRecording, rec_fps_divisor);
+
 		obs_output_set_video_encoder(fileOutput, videoRecording);
 		if (replayBuffer)
 			obs_output_set_video_encoder(replayBuffer, videoRecording);

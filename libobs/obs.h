@@ -2282,6 +2282,19 @@ EXPORT enum obs_scale_type obs_encoder_get_scale_type(obs_encoder_t *encoder);
 /** For video encoders, returns the frame rate divisor (default is 1) */
 EXPORT uint32_t obs_encoder_get_frame_rate_divisor(const obs_encoder_t *encoder);
 
+/**
+ * For video encoders, returns the effective output frame rate in fps: the base
+ * video frame rate divided by the frame rate divisor. Returns 0 if no valid
+ * frame rate information is available (e.g. no video bound and no main video).
+ */
+EXPORT double obs_encoder_get_effective_fps(const obs_encoder_t *encoder);
+
+/** For video encoders, returns the base video frame rate numerator */
+EXPORT uint32_t obs_encoder_get_fps_num(const obs_encoder_t *encoder);
+
+/** For video encoders, returns the base video frame rate denominator */
+EXPORT uint32_t obs_encoder_get_fps_den(const obs_encoder_t *encoder);
+
 /** For video encoders, returns the number of frames encoded */
 EXPORT uint32_t obs_encoder_get_encoded_frames(const obs_encoder_t *encoder);
 

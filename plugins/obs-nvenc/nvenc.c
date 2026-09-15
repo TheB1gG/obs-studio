@@ -717,6 +717,8 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 	dstr_catf(&log, "\tprofile:      %s\n", enc->props.profile);
 	dstr_catf(&log, "\twidth:        %d\n", enc->cx);
 	dstr_catf(&log, "\theight:       %d\n", enc->cy);
+	dstr_catf(&log, "\tFPS:          %g (%u/%u)\n", obs_encoder_get_effective_fps(enc->encoder),
+	          obs_encoder_get_fps_num(enc->encoder), obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder));
 	dstr_catf(&log, "\tb-frames:     %ld\n", enc->props.bf);
 	dstr_catf(&log, "\tb-ref-mode:   %ld\n", enc->props.bframe_ref_mode);
 	dstr_catf(&log, "\tlookahead:    %s (%d frames)\n", lookahead ? "true" : "false",

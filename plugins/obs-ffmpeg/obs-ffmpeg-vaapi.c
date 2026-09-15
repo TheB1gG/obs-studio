@@ -361,10 +361,12 @@ static bool vaapi_update(void *data, obs_data_t *settings)
 	     "\tkeyint:       %d\n"
 	     "\twidth:        %d\n"
 	     "\theight:       %d\n"
+	     "\tFPS:          %g (%u/%u)\n"
 	     "\tb-frames:     %d\n"
 	     "\tffmpeg opts:  %s\n",
 	     device, rate_control, profile, level, qp, bitrate, maxrate, enc->context->gop_size, enc->context->width,
-	     enc->context->height, enc->context->max_b_frames, ffmpeg_opts);
+	     enc->context->height, obs_encoder_get_effective_fps(enc->encoder), obs_encoder_get_fps_num(enc->encoder),
+	     obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder), enc->context->max_b_frames, ffmpeg_opts);
 
 	return vaapi_init_codec(enc, device);
 }

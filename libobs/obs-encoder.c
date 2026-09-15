@@ -1653,6 +1653,54 @@ uint32_t obs_encoder_get_frame_rate_divisor(const obs_encoder_t *encoder)
 	return encoder->frame_rate_divisor;
 }
 
+double obs_encoder_get_effective_fps(const obs_encoder_t *encoder)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_get_effective_fps"))
+		return 0.0;
+	if (encoder->info.type != OBS_ENCODER_VIDEO)
+		return 0.0;
+
+	video_t *media = encoder->media ? encoder->media : obs_get_video();
+	if (!media)
+		return 0.0;
+
+	const struct video_output_info *voi = video_output_get_info(media);
+	if (voi->fps_den == 0)
+		return 0.0;
+
+	double base_fps = (double)voi->fps_num / (double)voi->fps_den;
+	uint32_t divisor = encoder->frame_rate_divisor > 1 ? encoder->frame_rate_divisor : 1;
+	return base_fps / (double)divisor;
+}
+
+uint32_t obs_encoder_get_fps_num(const obs_encoder_t *encoder)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_get_fps_num"))
+		return 0;
+	if (encoder->info.type != OBS_ENCODER_VIDEO)
+		return 0;
+
+	video_t *media = encoder->media ? encoder->media : obs_get_video();
+	if (!media)
+		return 0;
+
+	return video_output_get_info(media)->fps_num;
+}
+
+uint32_t obs_encoder_get_fps_den(const obs_encoder_t *encoder)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_get_fps_den"))
+		return 0;
+	if (encoder->info.type != OBS_ENCODER_VIDEO)
+		return 0;
+
+	video_t *media = encoder->media ? encoder->media : obs_get_video();
+	if (!media)
+		return 0;
+
+	return video_output_get_info(media)->fps_den;
+}
+
 bool obs_encoder_update_frame_rate_divisor(obs_encoder_t *encoder, uint32_t frame_rate_divisor)
 {
 	if (!obs_encoder_valid(encoder, "obs_encoder_update_frame_rate_divisor"))

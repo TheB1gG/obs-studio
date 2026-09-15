@@ -439,6 +439,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->advOutTrack6Quality, SCROLL_CHANGED, OUTPUTS_CHANGED);
 	HookWidget(ui->advOutRescale,        CBEDIT_CHANGED, OUTPUTS_CHANGED);
 	HookWidget(ui->advOutRescaleFilter,  COMBO_CHANGED,  OUTPUTS_CHANGED);
+	HookWidget(ui->advOutStreamFps,      COMBO_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutTrack1,         CHECK_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutTrack2,         CHECK_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutTrack3,         CHECK_CHANGED,  OUTPUTS_CHANGED);
@@ -459,6 +460,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->advOutRecAEncoder,    COMBO_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutRecRescale,     CBEDIT_CHANGED, OUTPUTS_CHANGED);
 	HookWidget(ui->advOutRecRescaleFilter, COMBO_CHANGED, OUTPUTS_CHANGED);
+	HookWidget(ui->advOutRecFps,         COMBO_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutMuxCustom,      EDIT_CHANGED,   OUTPUTS_CHANGED);
 	HookWidget(ui->advOutSplitFile,      CHECK_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutSplitFileType,  COMBO_CHANGED,  OUTPUTS_CHANGED);
@@ -833,6 +835,32 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	InitStreamPage();
 	InitAppearancePage();
 	LoadSettings(false);
+
+	// Per-output FPS (streaming/recording) dropdowns must reflect the base video FPS set in the
+	// Video tab, so repopulate them whenever the base FPS changes. They are initially populated
+	// from the saved configuration once all pages have been loaded above.
+	QObject::connect(ui->fpsType, &QComboBox::currentIndexChanged, this, [this](int) {
+		if (!loading)
+			PopulateOutputFpsDropdowns(GetBaseFpsFromWidgets());
+	});
+	QObject::connect(ui->fpsCommon, &QComboBox::currentIndexChanged, this, [this](int) {
+		if (!loading)
+			PopulateOutputFpsDropdowns(GetBaseFpsFromWidgets());
+	});
+	QObject::connect(ui->fpsInteger, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) {
+		if (!loading)
+			PopulateOutputFpsDropdowns(GetBaseFpsFromWidgets());
+	});
+	QObject::connect(ui->fpsNumerator, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) {
+		if (!loading)
+			PopulateOutputFpsDropdowns(GetBaseFpsFromWidgets());
+	});
+	QObject::connect(ui->fpsDenominator, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) {
+		if (!loading)
+			PopulateOutputFpsDropdowns(GetBaseFpsFromWidgets());
+	});
+
+	PopulateOutputFpsDropdowns(GetBaseFpsFromConfig());
 
 	ui->advOutTrack1->setAccessibleName(QTStr("Basic.Settings.Output.Adv.Audio.Track1"));
 	ui->advOutTrack2->setAccessibleName(QTStr("Basic.Settings.Output.Adv.Audio.Track2"));
@@ -1630,6 +1658,80 @@ void OBSBasicSettings::LoadFPSData()
 
 	ui->fpsType->setCurrentIndex(fpsType);
 	ui->fpsTypes->setCurrentIndex(fpsType);
+}
+
+double OBSBasicSettings::GetBaseFpsFromConfig() const
+{
+	uint32_t fpsType = config_get_uint(main->Config(), "Video", "FPSType");
+	if (fpsType == 0) {
+		const char *val = config_get_string(main->Config(), "Video", "FPSCommon");
+		double fps = val ? QString::fromUtf8(val).toDouble() : 0.0;
+		return fps > 0.0 ? fps : 30.0;
+	} else if (fpsType == 1) {
+		uint32_t val = config_get_uint(main->Config(), "Video", "FPSInt");
+		return val > 0 ? (double)val : 30.0;
+	} else {
+		uint32_t num = config_get_uint(main->Config(), "Video", "FPSNum");
+		uint32_t den = config_get_uint(main->Config(), "Video", "FPSDen");
+		return den > 0 ? (double)num / (double)den : 30.0;
+	}
+}
+
+double OBSBasicSettings::GetBaseFpsFromWidgets() const
+{
+	int fpsType = ui->fpsType->currentIndex();
+	if (fpsType == 0) {
+		double fps = ui->fpsCommon->currentText().toDouble();
+		return fps > 0.0 ? fps : 30.0;
+	} else if (fpsType == 1) {
+		uint32_t val = ui->fpsInteger->value();
+		return val > 0 ? (double)val : 30.0;
+	} else {
+		uint32_t num = ui->fpsNumerator->value();
+		uint32_t den = ui->fpsDenominator->value();
+		return den > 0 ? (double)num / (double)den : 30.0;
+	}
+}
+
+void OBSBasicSettings::PopulateOutputFpsDropdowns(double base_fps)
+{
+	if (base_fps <= 0.0)
+		base_fps = 30.0;
+
+	constexpr double min_fps = 5.0;
+	constexpr uint32_t max_divisor = 128;
+
+	auto populate = [this, base_fps](QComboBox *combo, const char *config_key) {
+		int cur_divisor = combo->currentData().toInt();
+		if (cur_divisor < 1)
+			cur_divisor = (int)config_get_uint(main->Config(), "AdvOut", config_key);
+		if (cur_divisor < 1)
+			cur_divisor = 1;
+
+		combo->blockSignals(true);
+		combo->clear();
+
+		for (uint32_t d = 1; ; d++) {
+			if (d > max_divisor)
+				break;
+			double val = base_fps / (double)d;
+			if (d > 1 && val < min_fps)
+				break;
+			QString text;
+			if (qAbs(val - (double)qRound(val)) < 0.005)
+				text = QString::number(qRound(val));
+			else
+				text = QString::number(val, 'f', 2);
+			combo->addItem(text, (int)d);
+		}
+
+		int idx = combo->findData(cur_divisor);
+		combo->setCurrentIndex(idx != -1 ? idx : 0);
+		combo->blockSignals(false);
+	};
+
+	populate(ui->advOutStreamFps, "StreamFpsDivisor");
+	populate(ui->advOutRecFps, "RecFpsDivisor");
 }
 
 void OBSBasicSettings::LoadVideoSettings()
@@ -3372,6 +3474,7 @@ void OBSBasicSettings::SaveOutputSettings()
 	SaveComboData(ui->advOutAEncoder, "AdvOut", "AudioEncoder");
 	SaveCombo(ui->advOutRescale, "AdvOut", "RescaleRes");
 	SaveComboData(ui->advOutRescaleFilter, "AdvOut", "RescaleFilter");
+	config_set_uint(main->Config(), "AdvOut", "StreamFpsDivisor", ui->advOutStreamFps->currentData().toInt());
 	SaveTrackIndex(main->Config(), "AdvOut", "TrackIndex", ui->advOutTrack1, ui->advOutTrack2, ui->advOutTrack3,
 		       ui->advOutTrack4, ui->advOutTrack5, ui->advOutTrack6);
 	config_set_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes", AdvOutGetStreamingSelectedAudioTracks());
@@ -3386,6 +3489,7 @@ void OBSBasicSettings::SaveOutputSettings()
 	SaveComboData(ui->advOutRecAEncoder, "AdvOut", "RecAudioEncoder");
 	SaveCombo(ui->advOutRecRescale, "AdvOut", "RecRescaleRes");
 	SaveComboData(ui->advOutRecRescaleFilter, "AdvOut", "RecRescaleFilter");
+	config_set_uint(main->Config(), "AdvOut", "RecFpsDivisor", ui->advOutRecFps->currentData().toInt());
 	SaveEdit(ui->advOutMuxCustom, "AdvOut", "RecMuxerCustom");
 	SaveCheckBox(ui->advOutSplitFile, "AdvOut", "RecSplitFile");
 	config_set_string(main->Config(), "AdvOut", "RecSplitFileType",

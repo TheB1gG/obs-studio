@@ -678,11 +678,12 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 	     "\tkeyint:         %d\n"
 	     "\tlatency:        %s\n"
 	     "\tb-frames:       %d\n"
-	     "\tfps_num:        %d\n"
-	     "\tfps_den:        %d\n"
 	     "\twidth:          %d\n"
-	     "\theight:         %d",
-	     target_usage, profile, keyint_sec, latency, bFrames, voi->fps_num, voi->fps_den, width, height);
+	     "\theight:         %d\n"
+	     "\tFPS:            %g (%u/%u)",
+	     target_usage, profile, keyint_sec, latency, bFrames, width, height,
+	     obs_encoder_get_effective_fps(obsqsv->encoder), obs_encoder_get_fps_num(obsqsv->encoder),
+	     obs_encoder_get_fps_den(obsqsv->encoder) * obs_encoder_get_frame_rate_divisor(obsqsv->encoder));
 
 	info("debug info:");
 }

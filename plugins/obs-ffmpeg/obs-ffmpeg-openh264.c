@@ -85,9 +85,11 @@ static bool openh264_update(struct openh264_encoder *enc, obs_data_t *settings)
 	     "\tprofile:      %s\n"
 	     "\twidth:        %d\n"
 	     "\theight:       %d\n"
+	     "\tFPS:          %g (%u/%u)\n"
 	     "\tffmpeg opts:  %s\n",
 	     enc->ffve.enc_name, rc_mode, bitrate, keyint_sec, profile, enc->ffve.context->width, enc->ffve.height,
-	     ffmpeg_opts);
+	     obs_encoder_get_effective_fps(enc->ffve.encoder), obs_encoder_get_fps_num(enc->ffve.encoder),
+	     obs_encoder_get_fps_den(enc->ffve.encoder) * obs_encoder_get_frame_rate_divisor(enc->ffve.encoder), ffmpeg_opts);
 
 	enc->ffve.context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 	return ffmpeg_video_encoder_init_codec(&enc->ffve);

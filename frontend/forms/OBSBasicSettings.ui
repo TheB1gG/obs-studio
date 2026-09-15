@@ -3450,6 +3450,17 @@
                                </property>
                               </widget>
                              </item>
+                              <item>
+                               <widget class="QComboBox" name="advOutStreamFps">
+                                <property name="sizePolicy">
+                                 <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+                                  <horstretch>0</horstretch>
+                                  <verstretch>0</verstretch>
+                                 </sizepolicy>
+                                </property>
+                               </widget>
+                              </item>
+
                             </layout>
                            </item>
                           </layout>
@@ -4071,6 +4082,17 @@
                                     </property>
                                    </widget>
                                   </item>
+                                   <item>
+                                    <widget class="QComboBox" name="advOutRecFps">
+                                     <property name="sizePolicy">
+                                      <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+                                       <horstretch>0</horstretch>
+                                       <verstretch>0</verstretch>
+                                      </sizepolicy>
+                                     </property>
+                                    </widget>
+                                   </item>
+
                                  </layout>
                                 </widget>
                                </item>
@@ -9223,6 +9245,7 @@
   <tabstop>advOutEncoder</tabstop>
   <tabstop>advOutRescaleFilter</tabstop>
   <tabstop>advOutRescale</tabstop>
+  <tabstop>advOutStreamFps</tabstop>
   <tabstop>advOutRecType</tabstop>
   <tabstop>advOutRecPath</tabstop>
   <tabstop>advOutRecPathBrowse</tabstop>
@@ -9237,6 +9260,7 @@
   <tabstop>advOutRecEncoder</tabstop>
   <tabstop>advOutRecRescaleFilter</tabstop>
   <tabstop>advOutRecRescale</tabstop>
+  <tabstop>advOutRecFps</tabstop>
   <tabstop>advOutMuxCustom</tabstop>
   <tabstop>advOutSplitFile</tabstop>
   <tabstop>advOutSplitFileType</tabstop>

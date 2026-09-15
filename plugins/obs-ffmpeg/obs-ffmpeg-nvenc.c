@@ -188,11 +188,14 @@ static bool nvenc_update(struct nvenc_encoder *enc, obs_data_t *settings, bool p
 	     "\tprofile:      %s\n"
 	     "\twidth:        %d\n"
 	     "\theight:       %d\n"
+	     "\tFPS:          %g (%u/%u)\n"
 	     "\tb-frames:     %d\n"
 	     "\tpsycho-aq:    %d\n"
 	     "\tGPU:          %d\n",
 	     enc->ffve.enc_name, rc, bitrate, cqp, enc->ffve.context->gop_size, preset2, tuning, multipass, profile,
-	     enc->ffve.context->width, enc->ffve.height, enc->ffve.context->max_b_frames, psycho_aq, gpu);
+	     enc->ffve.context->width, enc->ffve.height, obs_encoder_get_effective_fps(enc->ffve.encoder),
+	     obs_encoder_get_fps_num(enc->ffve.encoder), obs_encoder_get_fps_den(enc->ffve.encoder) * obs_encoder_get_frame_rate_divisor(enc->ffve.encoder),
+	     enc->ffve.context->max_b_frames, psycho_aq, gpu);
 
 	return ffmpeg_video_encoder_init_codec(&enc->ffve);
 }

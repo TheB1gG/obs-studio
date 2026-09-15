@@ -252,6 +252,7 @@ private:
 	void LoadAdvOutputFFmpegSettings();
 	void LoadAdvOutputAudioSettings();
 	void SetAdvOutputFFmpegEnablement(FFmpegCodecType encoderType, bool enabled, bool enableEncode = false);
+	void PopulateOutputFpsDropdowns(double base_fps);
 
 	/* audio */
 	void LoadListValues(QComboBox *widget, obs_property_t *prop, int index);
@@ -264,6 +265,8 @@ private:
 	void LoadDownscaleFilters();
 	void LoadResolutionLists();
 	void LoadFPSData();
+	double GetBaseFpsFromConfig() const;
+	double GetBaseFpsFromWidgets() const;
 
 	/* a11y */
 	void UpdateA11yColors();

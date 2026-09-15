@@ -1541,8 +1541,11 @@ static bool amf_avc_init(void *data, obs_data_t *settings)
 	     "\tb-frames:     %d\n"
 	     "\twidth:        %d\n"
 	     "\theight:       %d\n"
+	     "\tFPS:          %g (%u/%u)\n"
 	     "\tparams:       %s",
-	     rc_str, bitrate, qp, gop_size, preset, profile, level_str, bf, enc->cx, enc->cy, ffmpeg_opts);
+	     rc_str, bitrate, qp, gop_size, preset, profile, level_str, bf, enc->cx, enc->cy,
+	     obs_encoder_get_effective_fps(enc->encoder), obs_encoder_get_fps_num(enc->encoder),
+	     obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder), ffmpeg_opts);
 
 	return true;
 }
@@ -1852,8 +1855,11 @@ static bool amf_hevc_init(void *data, obs_data_t *settings)
 	     "\tlevel:        %s\n"
 	     "\twidth:        %d\n"
 	     "\theight:       %d\n"
+	     "\tFPS:          %g (%u/%u)\n"
 	     "\tparams:       %s",
-	     rc_str, bitrate, qp, gop_size, preset, profile, level_str, enc->cx, enc->cy, ffmpeg_opts);
+	     rc_str, bitrate, qp, gop_size, preset, profile, level_str, enc->cx, enc->cy,
+	     obs_encoder_get_effective_fps(enc->encoder), obs_encoder_get_fps_num(enc->encoder),
+	     obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder), ffmpeg_opts);
 
 	return true;
 }
@@ -2220,8 +2226,11 @@ static bool amf_av1_init(void *data, obs_data_t *settings)
 	     "\tb-frames:     %d\n"
 	     "\twidth:        %d\n"
 	     "\theight:       %d\n"
+	     "\tFPS:          %g (%u/%u)\n"
 	     "\tparams:       %s",
-	     rc_str, bitrate, qp, gop_size, preset, profile, level_str, bf, enc->cx, enc->cy, ffmpeg_opts);
+	     rc_str, bitrate, qp, gop_size, preset, profile, level_str, bf, enc->cx, enc->cy,
+	     obs_encoder_get_effective_fps(enc->encoder), obs_encoder_get_fps_num(enc->encoder),
+	     obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder), ffmpeg_opts);
 
 	return true;
 }

@@ -196,9 +196,11 @@ static bool av1_update(struct av1_encoder *enc, obs_data_t *settings)
 	     "\tpreset:       %d\n"
 	     "\twidth:        %d\n"
 	     "\theight:       %d\n"
+	     "\tFPS:          %g (%u/%u)\n"
 	     "\tffmpeg opts:  %s\n",
 	     enc->ffve.enc_name, rc, bitrate, cqp, enc->ffve.context->gop_size, preset, enc->ffve.context->width,
-	     enc->ffve.height, ffmpeg_opts);
+	     enc->ffve.height, obs_encoder_get_effective_fps(enc->ffve.encoder),
+	     obs_encoder_get_fps_num(enc->ffve.encoder), obs_encoder_get_fps_den(enc->ffve.encoder) * obs_encoder_get_frame_rate_divisor(enc->ffve.encoder), ffmpeg_opts);
 
 	enc->ffve.context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 	return ffmpeg_video_encoder_init_codec(&enc->ffve);
