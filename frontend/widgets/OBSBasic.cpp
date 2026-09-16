@@ -1457,43 +1457,6 @@ static inline enum obs_scale_type GetScaleType(ConfigFile &activeConfiguration)
 		return OBS_SCALE_BICUBIC;
 }
 
-static inline enum video_format GetVideoFormatFromName(const char *name)
-{
-	if (astrcmpi(name, "I420") == 0)
-		return VIDEO_FORMAT_I420;
-	else if (astrcmpi(name, "NV12") == 0)
-		return VIDEO_FORMAT_NV12;
-	else if (astrcmpi(name, "I444") == 0)
-		return VIDEO_FORMAT_I444;
-	else if (astrcmpi(name, "I010") == 0)
-		return VIDEO_FORMAT_I010;
-	else if (astrcmpi(name, "P010") == 0)
-		return VIDEO_FORMAT_P010;
-	else if (astrcmpi(name, "P216") == 0)
-		return VIDEO_FORMAT_P216;
-	else if (astrcmpi(name, "P416") == 0)
-		return VIDEO_FORMAT_P416;
-	else if (astrcmpi(name, "RGBA16F") == 0)
-		return VIDEO_FORMAT_RGBA16F;
-#ifdef _WIN32
-	else if (astrcmpi(name, "Y410") == 0)
-		return VIDEO_FORMAT_Y410;
-	else if (astrcmpi(name, "R10l") == 0)
-		return VIDEO_FORMAT_R10L;
-	else if (astrcmpi(name, "R10p") == 0)
-		return VIDEO_FORMAT_R10P;
-#endif
-#if 0 //currently unsupported
-	else if (astrcmpi(name, "YVYU") == 0)
-		return VIDEO_FORMAT_YVYU;
-	else if (astrcmpi(name, "YUY2") == 0)
-		return VIDEO_FORMAT_YUY2;
-	else if (astrcmpi(name, "UYVY") == 0)
-		return VIDEO_FORMAT_UYVY;
-#endif
-	else return VIDEO_FORMAT_BGRA;
-}
-
 static inline enum video_colorspace GetVideoColorSpaceFromName(const char *name)
 {
 	enum video_colorspace colorspace = VIDEO_CS_SRGB;
@@ -1521,7 +1484,6 @@ int OBSBasic::ResetVideo()
 
 	GetConfigFPS(ovi.fps_num, ovi.fps_den);
 
-	const char *colorFormat = config_get_string(activeConfiguration, "Video", "ColorFormat");
 	const char *colorSpace = config_get_string(activeConfiguration, "Video", "ColorSpace");
 	const char *colorRange = config_get_string(activeConfiguration, "Video", "ColorRange");
 
@@ -1530,7 +1492,9 @@ int OBSBasic::ResetVideo()
 	ovi.base_height = (uint32_t)config_get_uint(activeConfiguration, "Video", "BaseCY");
 	ovi.output_width = (uint32_t)config_get_uint(activeConfiguration, "Video", "OutputCX");
 	ovi.output_height = (uint32_t)config_get_uint(activeConfiguration, "Video", "OutputCY");
-	ovi.output_format = GetVideoFormatFromName(colorFormat);
+	/* The Video "Color Format" setting no longer exists in this fork: the base canvas is always
+	 * rendered in the high-fidelity master format so any encoder can down-convert losslessly. */
+	ovi.output_format = VIDEO_FORMAT_RGBA16F;
 	ovi.colorspace = GetVideoColorSpaceFromName(colorSpace);
 	ovi.range = astrcmpi(colorRange, "Full") == 0 ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
 	ovi.adapter = config_get_uint(App()->GetUserConfig(), "Video", "AdapterIdx");
