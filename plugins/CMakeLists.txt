@@ -62,6 +62,7 @@ add_obs_plugin(obs-ffmpeg)
 add_obs_plugin(obs-filters)
 add_obs_plugin(obs-libfdk)
 add_obs_plugin(obs-nvenc PLATFORMS WINDOWS LINUX ARCHITECTURES x64 x86_64)
+add_obs_plugin(obs-nvenc-mock PLATFORMS WINDOWS)
 add_obs_plugin(obs-outputs)
 add_obs_plugin(
     obs-qsv11

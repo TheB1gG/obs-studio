@@ -55,6 +55,9 @@ struct nvenc_properties {
 	bool repeat_headers;
 	bool force_cuda_tex;
 
+	uint32_t max_encode_width;  /* 0 = not specified (no headroom) */
+	uint32_t max_encode_height; /* 0 = not specified (no headroom) */
+
 	struct obs_options opts;
 	obs_data_t *data;
 };

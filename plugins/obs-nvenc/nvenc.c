@@ -441,19 +441,31 @@ static void initialize_params(struct nvenc_data *enc, const GUID *nv_preset, NV_
 	params->enablePTD = 1;
 	params->encodeConfig = &enc->config;
 	params->tuningInfo = nv_tuning;
-	/* Reserve dynamic-resolution headroom so live resizes can reconfigure this session. */
-	/* NVIDIA requires maxEncodeWidth/Height to be set at init time; if they stay zero, */
-	/* NvEncReconfigureEncoder rejects size changes with NV_ENC_ERR_INVALID_PARAM. The  */
-	/* device's maximum supported output dimensions cap it - the same caps that         */
-	/* apply_nvenc_resize() validates against at runtime.                               */
+	/* Dynamic resize headroom: controlled by max_encode_width/height settings. */
+	/* If not specified (0), no headroom is reserved — minimum VRAM usage.      */
+	/* If specified, the session allows live resizes up to that size.           */
 	const uint32_t cap_w = (uint32_t)nv_get_cap(enc, NV_ENC_CAPS_WIDTH_MAX);
 	const uint32_t cap_h = (uint32_t)nv_get_cap(enc, NV_ENC_CAPS_HEIGHT_MAX);
-	if (cap_w && cap_h) {
-		params->maxEncodeWidth  = max(cap_w, width);
-		params->maxEncodeHeight = max(cap_h, height);
-		info("dynamic resize headroom reserved: up to %ux%u", params->maxEncodeWidth, params->maxEncodeHeight);
+
+	uint32_t max_w = enc->props.max_encode_width;
+	uint32_t max_h = enc->props.max_encode_height;
+
+	if (max_w || max_h) {
+		/* User specified headroom — clamp to at least encode size, at most GPU cap. */
+		max_w = max(max_w, width);
+		max_h = max(max_h, height);
+		if (cap_w && cap_h) {
+			max_w = min(max_w, cap_w);
+			max_h = min(max_h, cap_h);
+		}
+		params->maxEncodeWidth = max_w;
+		params->maxEncodeHeight = max_h;
+		info("resize headroom: user-specified max %ux%u (encode %ux%u)", max_w, max_h, width, height);
 	} else {
-		info("dynamic resolution change disabled for this session (caps unavailable)");
+		/* No headroom specified — set to encode size (disables live resize). */
+		params->maxEncodeWidth = width;
+		params->maxEncodeHeight = height;
+		info("resize headroom: disabled (fixed resolution %ux%u, minimum VRAM)", width, height);
 	}
 #ifdef NVENC_12_1_OR_LATER
 	params->splitEncodeMode = (NV_ENC_SPLIT_ENCODE_MODE)enc->props.split_encode;

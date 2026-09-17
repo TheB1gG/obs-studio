@@ -24,6 +24,10 @@ void nvenc_properties_read(struct nvenc_properties *props, obs_data_t *settings)
 	props->repeat_headers = obs_data_get_bool(settings, "repeat_headers");
 	props->force_cuda_tex = obs_data_get_bool(settings, "force_cuda_tex");
 
+	/* Optional resize headroom: 0 = not specified (no headroom reserved). */
+	props->max_encode_width = (uint32_t)obs_data_get_int(settings, "max_encode_width");
+	props->max_encode_height = (uint32_t)obs_data_get_int(settings, "max_encode_height");
+
 	if (obs_data_has_user_value(settings, "opts")) {
 		props->opts_str = obs_data_get_string(settings, "opts");
 		props->opts = obs_parse_options(props->opts_str);
