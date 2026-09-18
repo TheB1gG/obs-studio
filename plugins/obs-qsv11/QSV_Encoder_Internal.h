@@ -77,6 +77,8 @@ public:
 	mfxStatus ClearData();
 	mfxStatus Reset(qsv_param_t *pParams, enum qsv_codec codec);
 	mfxStatus ReconfigureEncoder();
+	mfxStatus Resize(qsv_param_t *pParams);
+	void ForceIDR() { m_force_idr_next = true; }
 	bool UpdateParams(qsv_param_t *pParams);
 	void AddROI(mfxU32 left, mfxU32 top, mfxU32 right, mfxU32 bottom, mfxI16 delta);
 	void ClearROI();
@@ -134,6 +136,7 @@ private:
 	static mfxHDL g_GFX_Handle; // we only want one handle for all instances to use;
 
 	mfxEncodeCtrl m_ctrl;
+	bool m_force_idr_next;
 	mfxExtEncoderROI m_roi;
 	std::vector<mfxExtBuffer *> m_extbuf;
 };

@@ -173,7 +173,7 @@ int qsv_encoder_encode(qsv_t *pContext, uint64_t ts, uint8_t *pDataY, uint8_t *p
 	else if (sts == MFX_ERR_MORE_DATA)
 		return 1;
 	else
-		return -1;
+		return (int)sts; // pass through actual MFX error code
 }
 
 int qsv_encoder_encode_tex(qsv_t *pContext, uint64_t ts, void *tex, uint64_t lock_key, uint64_t *next_key,
@@ -189,7 +189,7 @@ int qsv_encoder_encode_tex(qsv_t *pContext, uint64_t ts, void *tex, uint64_t loc
 	else if (sts == MFX_ERR_MORE_DATA)
 		return 1;
 	else
-		return -1;
+		return (int)sts; // pass through actual MFX error code
 }
 
 int qsv_encoder_close(qsv_t *pContext)
@@ -230,6 +230,22 @@ int qsv_encoder_reconfig(qsv_t *pContext, qsv_param_t *pParams)
 	if (sts != MFX_ERR_NONE)
 		return false;
 	return true;
+}
+
+int qsv_encoder_reset_full(qsv_t *pContext, qsv_param_t *pParams, enum qsv_codec codec)
+{
+	QSV_Encoder_Internal *pEncoder = (QSV_Encoder_Internal *)pContext;
+	mfxStatus sts = pEncoder->Resize(pParams);
+
+	if (sts != MFX_ERR_NONE)
+		return false;
+	return true;
+}
+
+void qsv_encoder_force_idr(qsv_t *pContext)
+{
+	QSV_Encoder_Internal *pEncoder = (QSV_Encoder_Internal *)pContext;
+	pEncoder->ForceIDR();
 }
 
 enum qsv_cpu_platform qsv_get_cpu_platform()

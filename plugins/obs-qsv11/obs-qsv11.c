@@ -100,6 +100,29 @@ struct obs_qsv {
 	os_performance_token_t *performance_token;
 
 	uint32_t roi_increment;
+
+	/* Live RC/bitrate changes are staged here and applied at the next */
+	/* GOP boundary so sibling encoders of a multitrack output stay   */
+	/* keyframe-aligned (see qsv_check_staged).                       */
+	bool reconfig_pending;
+	int64_t frames_since_idr; /* submitted frames since last observed IDR packet */
+
+	/* Live RESOLUTION changes cannot be staged the same way: libobs  */
+	/* starts delivering frames at the new size on the very next tick,*/
+	/* so the MFX session is resized immediately (forced mid-GOP      */
+	/* IDR). align_pending then counts down submissions and forces one*/
+	/* more keyframe exactly on the next shared GOP boundary so this  */
+	/* track re-locks onto its sibling encoders' keyframe pts grid.   */
+	bool align_pending;
+	int64_t align_remaining; /* encode() calls until realignment fires (incl. current) */
+
+	/* Current encoded resolution (for live resize detection).        */
+	uint32_t cx;
+	uint32_t cy;
+
+	/* Pipeline delay estimate: frames in flight between submission   */
+	/* and output observation. Derived from async depth at init.      */
+	int output_delay;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -744,16 +767,178 @@ static void load_headers(struct obs_qsv *obsqsv)
 	obsqsv->sei_size = 1;
 }
 
+/* Live RC reconfig: mfxVideoEncoder::Reset() resets state; next frame is IDR. */
+static bool qsv_apply_reconfigure(struct obs_qsv *obsqsv)
+{
+	if (!qsv_encoder_reconfig(obsqsv->context, &obsqsv->params)) {
+		warn("live reconfigure failed");
+		return false;
+	}
+	obsqsv->frames_since_idr = 0;
+	if (obsqsv->codec == QSV_CODEC_HEVC)
+		load_hevc_headers(obsqsv);
+	else
+		load_headers(obsqsv);
+	return true;
+}
+
+static bool qsv_apply_resize(struct obs_qsv *obsqsv, uint32_t w, uint32_t h)
+{
+	info("live resize: %ux%u -> %ux%u (forced IDR)", obsqsv->cx, obsqsv->cy, w, h);
+	obsqsv->params.nWidth = (mfxU16)w;
+	obsqsv->params.nHeight = (mfxU16)h;
+	obsqsv->cx = w;
+	obsqsv->cy = h;
+
+	if (!qsv_encoder_reset_full(obsqsv->context, &obsqsv->params, obsqsv->codec)) {
+		warn("live resize failed, restart required");
+		return false;
+	}
+	if (obsqsv->codec == QSV_CODEC_HEVC)
+		load_hevc_headers(obsqsv);
+	else
+		load_headers(obsqsv);
+	info("resize reconfigure accepted");
+	return true;
+}
+
+static bool qsv_maybe_resize(struct obs_qsv *obsqsv, uint32_t frame_linesize_y)
+{
+	uint32_t w = obs_encoder_get_width(obsqsv->encoder);
+	uint32_t h = obs_encoder_get_height(obsqsv->encoder);
+	if (w == obsqsv->cx && h == obsqsv->cy)
+		return true; // no resize needed - safe to encode
+
+	/* Race guard: obs_encoder_set_scaled_size updates scaled_width/height
+	 * immediately, but the GPU mix rebind takes effect on the next tick.
+	 * If the incoming frame's Y-plane stride is smaller than the target
+	 * width, the frame is still at the old size — defer to next tick. */
+	if (frame_linesize_y < w)
+		return true; // not yet at new size, will retry next frame
+
+	if (!qsv_apply_resize(obsqsv, w, h)) {
+		error("live resize to %ux%u failed - restart required", w, h);
+		return false; // resize FAILED - encoder is broken
+	}
+
+	video_t *video = obs_encoder_video(obsqsv->encoder);
+	const struct video_output_info *voi = video_output_get_info(video);
+	int64_t g = (int64_t)obsqsv->params.nKeyIntSec;
+	if (g > 0)
+		g *= voi->fps_num / voi->fps_den;
+
+	if (!obs_encoder_active(obsqsv->encoder) || g <= 0 || obsqsv->output_delay < 2) {
+		info("resize applied off-grid; alignment not staged");
+		return true;
+	}
+
+	const int64_t s = g - ((int64_t)obsqsv->output_delay - 1);
+	const int64_t p = obsqsv->frames_since_idr + 1;
+	int64_t delta;
+	if (p < s)      delta = s - p;
+	else if (p > s) delta = g - (p - s);
+	else            delta = 0;
+
+	if (delta == 0) {
+		info("resize on keyframe boundary - alignment preserved");
+		obsqsv->reconfig_pending = false;
+	} else {
+		obsqsv->align_pending   = true;
+		obsqsv->align_remaining = delta + 1;
+		info("staged resize realignment (%lld frames)", (long long)delta);
+	}
+	return true;
+}
+
+static bool qsv_check_staged(struct obs_qsv *obsqsv, uint32_t frame_linesize_y)
+{
+	++obsqsv->frames_since_idr;
+	if (!qsv_maybe_resize(obsqsv, frame_linesize_y))
+		return false; // resize failed - encoder is broken, skip this frame
+
+	int64_t gop_length = 0;
+	int64_t g = (int64_t)obsqsv->params.nKeyIntSec;
+	if (g > 0) {
+		video_t *video = obs_encoder_video(obsqsv->encoder);
+		const struct video_output_info *voi = video_output_get_info(video);
+		gop_length = g * voi->fps_num / voi->fps_den;
+	}
+
+	const int64_t pipeline_delay = (int64_t)obsqsv->output_delay - 1;
+	const int64_t keyframe_boundary = gop_length - pipeline_delay;
+
+	if (obsqsv->align_pending) {
+		if (--obsqsv->align_remaining == 0) {
+			info("resize realignment: forcing IDR at keyframe boundary (counter=%lld gop=%lld)",
+			     (long long)obsqsv->frames_since_idr, (long long)gop_length);
+			qsv_encoder_force_idr(obsqsv->context);
+			obsqsv->align_pending = false;
+			obsqsv->frames_since_idr = 0;
+		}
+	} else if (obsqsv->reconfig_pending && gop_length > 0 && obsqsv->frames_since_idr >= keyframe_boundary) {
+		info("firing staged reconfigure at keyframe boundary (counter=%lld gop=%lld)",
+		     (long long)obsqsv->frames_since_idr, (long long)gop_length);
+		bool ok = qsv_apply_reconfigure(obsqsv);
+		obsqsv->reconfig_pending = false;
+		if (!ok)
+			warn("staged reconfigure failed - restart required");
+	}
+	return true; // safe to proceed with encoding
+}
+
 static bool obs_qsv_update(void *data, obs_data_t *settings)
 {
 	struct obs_qsv *obsqsv = data;
-	obsqsv->params.nTargetBitRate = (mfxU16)obs_data_get_int(settings, "bitrate");
+	update_settings(obsqsv, settings);
 
-	if (!qsv_encoder_reconfig(obsqsv->context, &obsqsv->params)) {
-		warn("Failed to reconfigure");
-		return false;
+	mfxU16 new_bitrate = (mfxU16)obs_data_get_int(settings, "bitrate");
+	const char *rc_name = obs_data_get_string(settings, "rate_control");
+
+	bool rc_changed = false;
+	bool br_changed = false;
+
+	switch (obsqsv->params.nRateControl) {
+	case MFX_RATECONTROL_CBR:
+		br_changed = (obsqsv->params.nTargetBitRate != new_bitrate);
+		break;
+	case MFX_RATECONTROL_VBR:
+		br_changed = (obsqsv->params.nTargetBitRate != new_bitrate) ||
+		             (obsqsv->params.nMaxBitRate != (mfxU16)obs_data_get_int(settings, "max_bitrate"));
+		break;
+	case MFX_RATECONTROL_ICQ:
+	case MFX_RATECONTROL_CQP:
+		rc_changed = true;
+		break;
+	default:
+		break;
 	}
 
+	if (astrcmpi(rc_name, "CBR") == 0 && obsqsv->params.nRateControl != MFX_RATECONTROL_CBR)
+		rc_changed = true;
+	else if (astrcmpi(rc_name, "VBR") == 0 && obsqsv->params.nRateControl != MFX_RATECONTROL_VBR)
+		rc_changed = true;
+	else if (astrcmpi(rc_name, "ICQ") == 0 && obsqsv->params.nRateControl != MFX_RATECONTROL_ICQ)
+		rc_changed = true;
+	else if (astrcmpi(rc_name, "CQP") == 0 && obsqsv->params.nRateControl != MFX_RATECONTROL_CQP)
+		rc_changed = true;
+
+	if (!rc_changed && !br_changed)
+		return true;
+
+	video_t *video = obs_encoder_video(obsqsv->encoder);
+	const struct video_output_info *voi = video_output_get_info(video);
+	int64_t gop_length = (int64_t)obsqsv->params.nKeyIntSec;
+	if (gop_length > 0)
+		gop_length *= voi->fps_num / voi->fps_den;
+
+	if (!obs_encoder_active(obsqsv->encoder) || gop_length <= 0) {
+		info("applying reconfigure immediately (not streaming or no GOP)");
+		return qsv_apply_reconfigure(obsqsv);
+	}
+
+	info("staged RC change - applying at next keyframe (gop=%lld counter=%lld)",
+	     (long long)gop_length, (long long)obsqsv->frames_since_idr);
+	obsqsv->reconfig_pending = true;
 	return true;
 }
 
@@ -846,6 +1031,11 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 		bfree(obsqsv);
 		return NULL;
 	}
+
+	/* Initialize live reconfig/resize tracking state */
+	obsqsv->cx = obs_encoder_get_width(encoder);
+	obsqsv->cy = obs_encoder_get_height(encoder);
+	obsqsv->output_delay = (int)obsqsv->params.nAsyncDepth;
 
 	obsqsv->performance_token = os_request_high_performance("qsv encoding");
 
@@ -1131,6 +1321,8 @@ static void parse_packet(struct obs_qsv *obsqsv, struct encoder_packet *packet, 
 #endif
 
 	*received_packet = true;
+	if (pBS->FrameType & MFX_FRAMETYPE_IDR)
+		obsqsv->frames_since_idr = 0;
 	pBS->DataLength = 0;
 }
 
@@ -1174,6 +1366,8 @@ static void parse_packet_av1(struct obs_qsv *obsqsv, struct encoder_packet *pack
 #endif
 
 	*received_packet = true;
+	if (pBS->FrameType & MFX_FRAMETYPE_IDR)
+		obsqsv->frames_since_idr = 0;
 	pBS->DataLength = 0;
 }
 
@@ -1222,6 +1416,8 @@ static void parse_packet_hevc(struct obs_qsv *obsqsv, struct encoder_packet *pac
 		iType, packet->pts, packet->dts);
 #endif
 	*received_packet = true;
+	if (pBS->FrameType & MFX_FRAMETYPE_IDR)
+		obsqsv->frames_since_idr = 0;
 	pBS->DataLength = 0;
 }
 
@@ -1274,6 +1470,12 @@ static bool obs_qsv_encode(void *data, struct encoder_frame *frame, struct encod
 
 	mfxU64 qsvPTS = ts_obs_to_mfx(frame->pts, voi);
 
+	if (!qsv_check_staged(obsqsv, frame ? frame->linesize[0] : 0)) {
+		pthread_mutex_unlock(&g_QsvLock);
+		*received_packet = false;
+		return true; // skip this frame - encoder is transitioning
+	}
+
 	if (obs_encoder_has_roi(obsqsv->encoder))
 		obs_qsv_setup_rois(obsqsv);
 
@@ -1286,7 +1488,7 @@ static bool obs_qsv_encode(void *data, struct encoder_frame *frame, struct encod
 		ret = qsv_encoder_encode(obsqsv->context, qsvPTS, NULL, NULL, 0, 0, &pBS);
 
 	if (ret < 0) {
-		warn("encode failed");
+		warn("encode failed: mfxStatus=%d", ret);
 		pthread_mutex_unlock(&g_QsvLock);
 		return false;
 	}
@@ -1332,13 +1534,22 @@ static bool obs_qsv_encode_tex(void *data, struct encoder_texture *tex, int64_t 
 
 	mfxU64 qsvPTS = ts_obs_to_mfx(pts, voi);
 
+	/* Texture path: dimensions are self-describing in the D3D11 texture,
+	 * so no linesize guard needed (pass UINT32_MAX to skip the check). */
+	if (!qsv_check_staged(obsqsv, UINT32_MAX)) {
+		pthread_mutex_unlock(&g_QsvLock);
+		*next_key = lock_key;
+		*received_packet = false;
+		return true; // skip this frame - encoder is transitioning
+	}
+
 	if (obs_encoder_has_roi(obsqsv->encoder))
 		obs_qsv_setup_rois(obsqsv);
 
 	ret = qsv_encoder_encode_tex(obsqsv->context, qsvPTS, (void *)tex, lock_key, next_key, &pBS);
 
 	if (ret < 0) {
-		warn("encode failed");
+		warn("encode failed: mfxStatus=%d", ret);
 		pthread_mutex_unlock(&g_QsvLock);
 		return false;
 	}

@@ -820,7 +820,8 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 		    old_encoder_config.range != new_encoder_config.range ||
 		    old_encoder_config.format != new_encoder_config.format;
 
-		const bool is_nvenc = strstr(new_encoder_config.type.c_str(), "nvenc") != nullptr;
+		const bool supports_live_resize = strstr(new_encoder_config.type.c_str(), "nvenc") != nullptr ||
+		                                   strstr(new_encoder_config.type.c_str(), "qsv") != nullptr;
 		const bool resolution_changed = old_encoder_config.width != new_encoder_config.width ||
 		    old_encoder_config.height != new_encoder_config.height;
 		const bool scale_type_changed = old_encoder_config.gpu_scale_type != new_encoder_config.gpu_scale_type;
@@ -834,15 +835,15 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 			continue;
 		}
 
-		if (is_nvenc) {
-			// NVENC applies scale type and resolution changes live: the libobs setter re-points the
-			// GPU rescale mix right away (see live_rebind_encoder_mix in obs-encoder.c), and obs-nvenc
-			// detects input size changes on its encode side, resizing the driver session in place. The
-			// forced keyframe realignment happens at the next shared GOP boundary so the multitrack
-			// tracks stay keyframe-aligned (see nvenc_maybe_resize).
+		if (supports_live_resize) {
+			// NVENC/QSV apply scale type and resolution changes live: the libobs setter re-points the
+			// GPU rescale mix right away (see live_rebind_encoder_mix in obs-encoder.c), and the encoder
+			// detects input size changes on its encode side, resizing the session in place. The forced
+			// keyframe realignment happens at the next shared GOP boundary so the multitrack tracks stay
+			// keyframe-aligned (see nvenc_maybe_resize / qsv_maybe_resize).
 			// Colorspace/range/format changes stay deferred until a stream restart: live rebinding does
-			// not update the NVENC session's color parameters mid-stream, so the encoded output would not
-			// reflect them reliably.
+			// not update the encoder session's color parameters mid-stream, so the encoded output would
+			// not reflect them reliably.
 
 			if (scale_type_changed && new_encoder_config.gpu_scale_type.has_value()) {
 				char line[160];
@@ -886,7 +887,7 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 				             "x%" PRIu32,
 				         i, old_encoder_config.width, old_encoder_config.height, new_encoder_config.width,
 				         new_encoder_config.height);
-				blog(LOG_INFO, "MultitrackVideoOutput: applied live:%s (NVENC resizes at the next frame)", line);
+				blog(LOG_INFO, "MultitrackVideoOutput: applied live:%s (encoder resizes at the next frame)", line);
 				obs_encoder_set_scaled_size(encoder, new_encoder_config.width, new_encoder_config.height);
 			}
 		} else if (structural_video_change) {

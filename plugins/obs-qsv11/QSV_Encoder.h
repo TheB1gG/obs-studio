@@ -155,6 +155,8 @@ int qsv_param_parse(qsv_param_t *, const char *name, const char *value);
 int qsv_param_apply_profile(qsv_param_t *, const char *profile);
 int qsv_param_default_preset(qsv_param_t *, const char *preset, const char *tune);
 int qsv_encoder_reconfig(qsv_t *, qsv_param_t *);
+int qsv_encoder_reset_full(qsv_t *, qsv_param_t *, enum qsv_codec);
+void qsv_encoder_force_idr(qsv_t *);
 void qsv_encoder_version(unsigned short *major, unsigned short *minor);
 qsv_t *qsv_encoder_open(qsv_param_t *, enum qsv_codec codec, bool useTexAlloc);
 void qsv_encoder_add_roi(qsv_t *, const struct obs_encoder_roi *roi);
