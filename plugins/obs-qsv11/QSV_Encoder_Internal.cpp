@@ -303,6 +303,8 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	else
 		m_co2.RepeatPPS = MFX_CODINGOPTION_OFF;
 
+	m_co2.AdaptiveB = MFX_CODINGOPTION_ON;
+
 	if (pParams->nbFrames > 1)
 		m_co2.BRefType = MFX_B_REF_PYRAMID;
 
