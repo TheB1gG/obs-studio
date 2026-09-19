@@ -123,6 +123,29 @@ struct obs_qsv {
 	/* Pipeline delay estimate: frames in flight between submission   */
 	/* and output observation. Derived from async depth at init.      */
 	int output_delay;
+
+	/* The MFX GopPicSize is fixed for the life of the encoder session
+	 * (set once at create, never changed by a live reconfigure). Store it
+	 * here so the IDR-boundary timing in qsv_check_staged always matches
+	 * the encoder's actual GOP. Using the *current* effective FPS instead
+	 * would make gop_length larger than the real GOP after an FPS increase,
+	 * so frames_since_idr would never reach the boundary and the staged
+	 * reconfigure would silently never fire (leaving MFX at the old, lower
+	 * frame rate while receiving more frames -> inflated bitrate). */
+	int64_t gop_frames;
+
+	/* Output timestamp continuity across a live reconfigure. MFX's Reset()
+	 * restarts its internal output-timestamp base, so after an FPS change the
+	 * first decoded frame can carry a decode/presentation timestamp that REGRESSES
+	 * behind the previous frame. A non-monotonic DTS is fatal to downstream
+	 * muxers/decoders on a live stream (this is what crashes viewers when the
+	 * FPS is lowered). We therefore apply a running offset to both PTS and DTS:
+	 * whenever a timestamp would fall back onto or before the last emitted DTS,
+	 * we grow the offset to bridge the gap. Shifting PTS and DTS by the same
+	 * amount preserves B-frame reordering, so only the discontinuity is removed. */
+	int64_t ts_offset;
+	int64_t last_dts;
+	bool have_last_dts;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -664,8 +687,18 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 	obsqsv->params.nMaxBitRate = (mfxU16)max_bitrate;
 	obsqsv->params.nWidth = (mfxU16)width;
 	obsqsv->params.nHeight = (mfxU16)height;
-	obsqsv->params.nFpsNum = (mfxU16)voi->fps_num;
-	obsqsv->params.nFpsDen = (mfxU16)voi->fps_den;
+	/* Pass the effective FPS to QSV: base rate with the frame-rate divisor
+	 * folded into the denominator (e.g. 60/1 with divisor 2 -> 60/2 = 30fps),
+	 * exactly like nvenc. We take the BASE rate from obs_encoder_get_fps_* (which
+	 * read encoder->media) and apply the divisor ourselves - we must NOT use
+	 * voi->fps_den here, because obs_encoder_video() already returns an
+	 * fps_override whose fps_den carries the divisor, which would fold it twice.
+	 * QSV's BRC derives per-frame bit budgets from FrameRateExtN/Den, so this
+	 * keeps the bitrate calculation correct when the effective encoding rate
+	 * differs from the base canvas rate. */
+	obsqsv->params.nFpsNum = (mfxU16)obs_encoder_get_fps_num(obsqsv->encoder);
+	obsqsv->params.nFpsDen =
+		(mfxU16)(obs_encoder_get_fps_den(obsqsv->encoder) * obs_encoder_get_frame_rate_divisor(obsqsv->encoder));
 	obsqsv->params.nbFrames = (mfxU16)bFrames;
 	obsqsv->params.nKeyIntSec = (mfxU16)keyint_sec;
 	obsqsv->params.nICQQuality = (mfxU16)icq_quality;
@@ -856,14 +889,33 @@ static bool qsv_check_staged(struct obs_qsv *obsqsv, uint32_t frame_linesize_y)
 	if (!qsv_maybe_resize(obsqsv, frame_linesize_y))
 		return false; // resize failed - encoder is broken, skip this frame
 
-	int64_t gop_length = 0;
-	int64_t g = (int64_t)obsqsv->params.nKeyIntSec;
-	if (g > 0) {
-		video_t *video = obs_encoder_video(obsqsv->encoder);
-		const struct video_output_info *voi = video_output_get_info(video);
-		gop_length = g * voi->fps_num / voi->fps_den;
+	/* Detect a live effective-FPS change (base rate or frame-rate divisor)
+	 * and stage a reconfigure so it is applied at the next IDR boundary.
+	 * This runs per-frame on the encode thread so it catches divisor changes
+	 * made via obs_encoder_update_frame_rate_divisor(), which do NOT go
+	 * through update() and would otherwise never be detected (leaving MFX at
+	 * the old frame rate while receiving more/fewer frames -> wrong bitrate). */
+	{
+		uint32_t fps_num = obs_encoder_get_fps_num(obsqsv->encoder);
+		uint32_t fps_den = obs_encoder_get_fps_den(obsqsv->encoder) *
+		                   obs_encoder_get_frame_rate_divisor(obsqsv->encoder);
+		if (fps_num != 0 && fps_den != 0 &&
+		    ((mfxU16)fps_num != obsqsv->params.nFpsNum ||
+		     (mfxU16)fps_den != obsqsv->params.nFpsDen)) {
+			info("live FPS change %u/%u -> %u/%u, staging reconfigure at next keyframe",
+			     obsqsv->params.nFpsNum, obsqsv->params.nFpsDen, fps_num, fps_den);
+			obsqsv->params.nFpsNum = (mfxU16)fps_num;
+			obsqsv->params.nFpsDen = (mfxU16)fps_den;
+			obsqsv->reconfig_pending = true;
+		}
 	}
 
+	/* Use the MFX GopPicSize fixed at create time (see gop_frames). The
+	 * encoder's actual GOP does not change on a live reconfigure, so timing
+	 * the boundary off the current effective FPS would desync it - notably
+	 * after an FPS increase, where the computed length exceeds the real GOP
+	 * and frames_since_idr never reaches the boundary. */
+	const int64_t gop_length = obsqsv->gop_frames;
 	const int64_t pipeline_delay = (int64_t)obsqsv->output_delay - 1;
 	const int64_t keyframe_boundary = gop_length - pipeline_delay;
 
@@ -889,7 +941,26 @@ static bool qsv_check_staged(struct obs_qsv *obsqsv, uint32_t frame_linesize_y)
 static bool obs_qsv_update(void *data, obs_data_t *settings)
 {
 	struct obs_qsv *obsqsv = data;
+
+	/* Capture the effective FPS currently active in the encoder BEFORE
+	 * update_settings() overwrites params. This is what was last applied to
+	 * the MFX session, so we can tell whether a live FPS change (base frame
+	 * rate or frame-rate divisor) needs pushing - at an IDR boundary, exactly
+	 * like nvenc. */
+	mfxU16 old_fps_num = obsqsv->params.nFpsNum;
+	mfxU16 old_fps_den = obsqsv->params.nFpsDen;
+
 	update_settings(obsqsv, settings);
+
+	/* Detect an effective-FPS change. QSV's BRC derives per-frame bit budgets
+	 * from FrameRateExtN/Den (which now carry the frame-rate divisor folded into
+	 * the denominator - see update_params), so the encoder must be reconfigured
+	 * whenever the effective rate changes to keep the bitrate calculation correct. */
+	bool fps_changed = (obsqsv->params.nFpsNum != old_fps_num || obsqsv->params.nFpsDen != old_fps_den);
+	if (fps_changed) {
+		info("changing effective FPS from %u/%u to %u/%u while streaming",
+		     old_fps_num, old_fps_den, obsqsv->params.nFpsNum, obsqsv->params.nFpsDen);
+	}
 
 	mfxU16 new_bitrate = (mfxU16)obs_data_get_int(settings, "bitrate");
 	const char *rc_name = obs_data_get_string(settings, "rate_control");
@@ -922,7 +993,7 @@ static bool obs_qsv_update(void *data, obs_data_t *settings)
 	else if (astrcmpi(rc_name, "CQP") == 0 && obsqsv->params.nRateControl != MFX_RATECONTROL_CQP)
 		rc_changed = true;
 
-	if (!rc_changed && !br_changed)
+	if (!rc_changed && !br_changed && !fps_changed)
 		return true;
 
 	video_t *video = obs_encoder_video(obsqsv->encoder);
@@ -936,7 +1007,7 @@ static bool obs_qsv_update(void *data, obs_data_t *settings)
 		return qsv_apply_reconfigure(obsqsv);
 	}
 
-	info("staged RC change - applying at next keyframe (gop=%lld counter=%lld)",
+	info("staged encoder change - applying at next keyframe (gop=%lld counter=%lld)",
 	     (long long)gop_length, (long long)obsqsv->frames_since_idr);
 	obsqsv->reconfig_pending = true;
 	return true;
@@ -1018,6 +1089,15 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 			load_headers(obsqsv);
 	} else {
 		warn("bad settings specified");
+	}
+
+	/* Mirror the GopPicSize that InitParams() computes for the MFX session
+	 * (nKeyIntSec * effective_fps at create time). This value is fixed for the
+	 * life of the encoder, so it is the correct GOP length to use when timing
+	 * live reconfigure boundaries in qsv_check_staged. */
+	if (obsqsv->context != NULL) {
+		obsqsv->gop_frames = obsqsv->params.nKeyIntSec ?
+			(int64_t)((mfxU16)(obsqsv->params.nKeyIntSec * obsqsv->params.nFpsNum / (float)obsqsv->params.nFpsDen)) : 0;
 	}
 
 	qsv_encoder_version(&g_verMajor, &g_verMinor);
@@ -1249,6 +1329,33 @@ static int64_t ts_mfx_to_obs(mfxI64 ts, const struct video_output_info *voi)
 		return (ts * voi->fps_num + div / 2) / div * voi->fps_den;
 }
 
+/* Enforce monotonic, continuous output timestamps across a live reconfigure.
+ * See the ts_offset/last_dts fields in struct obs_qsv for the rationale. The
+ * same offset is added to PTS and DTS so B-frame presentation reordering is
+ * preserved; only the regression introduced by MFX Reset() is removed. */
+static void qsv_fix_timestamps(struct obs_qsv *obsqsv, struct encoder_packet *packet)
+{
+	int64_t dts = packet->dts + obsqsv->ts_offset;
+	int64_t pts = packet->pts + obsqsv->ts_offset;
+
+	if (obsqsv->have_last_dts && dts <= obsqsv->last_dts) {
+		/* Regression: MFX restarted its timestamp base. Grow the offset so this
+		 * frame continues from where the previous one left off (+1 tick). */
+		int64_t shift = obsqsv->last_dts - dts + 1;
+		obsqsv->ts_offset += shift;
+		dts += shift;
+		pts += shift;
+	}
+
+	if (pts < dts)
+		pts = dts;
+
+	packet->dts = dts;
+	packet->pts = pts;
+	obsqsv->last_dts = dts;
+	obsqsv->have_last_dts = true;
+}
+
 static void parse_packet(struct obs_qsv *obsqsv, struct encoder_packet *packet, mfxBitstream *pBS,
 			 const struct video_output_info *voi, bool *received_packet)
 {
@@ -1306,6 +1413,7 @@ static void parse_packet(struct obs_qsv *obsqsv, struct encoder_packet *packet, 
 	/* ------------------------------------ */
 
 	packet->dts = ts_mfx_to_obs(pBS->DecodeTimeStamp, voi);
+	qsv_fix_timestamps(obsqsv, packet);
 
 #if 0
 	bool iFrame = pBS->FrameType & MFX_FRAMETYPE_I;
@@ -1356,6 +1464,7 @@ static void parse_packet_av1(struct obs_qsv *obsqsv, struct encoder_packet *pack
 	packet->priority = priority;
 
 	packet->dts = ts_mfx_to_obs(pBS->DecodeTimeStamp, voi);
+	qsv_fix_timestamps(obsqsv, packet);
 
 #if 0
 	info("parse packet:\n"
@@ -1401,6 +1510,7 @@ static void parse_packet_hevc(struct obs_qsv *obsqsv, struct encoder_packet *pac
 	/* ------------------------------------ */
 
 	packet->dts = ts_mfx_to_obs(pBS->DecodeTimeStamp, voi);
+	qsv_fix_timestamps(obsqsv, packet);
 
 #if 0
 	bool iFrame = pBS->FrameType & MFX_FRAMETYPE_I;

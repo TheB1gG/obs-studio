@@ -506,6 +506,20 @@ bool QSV_Encoder_Internal::UpdateParams(qsv_param_t *pParams)
 		break;
 	}
 
+	/* Update the effective frame rate. nFpsNum/nFpsDen already carry the
+	 * frame-rate divisor folded into the denominator (see update_params in
+	 * obs-qsv11.c), so this pushes the true encoding rate to the BRC and keeps
+	 * the per-frame bit budget / bitrate calculation correct after a live FPS
+	 * change. It takes effect from the forced IDR of the following Reset(). */
+	if (pParams->nFpsNum != 0 && pParams->nFpsDen != 0) {
+		m_mfxEncParams.mfx.FrameInfo.FrameRateExtN = pParams->nFpsNum;
+		m_mfxEncParams.mfx.FrameInfo.FrameRateExtD = pParams->nFpsDen;
+
+		/* Refresh the fps-derived BRC window size (frames/second) so it keeps
+		 * representing ~1 second of video at the new effective rate. */
+		m_co3.WinBRCSize = pParams->nFpsNum / pParams->nFpsDen;
+	}
+
 	return true;
 }
 
