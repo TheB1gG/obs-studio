@@ -54,6 +54,21 @@ struct obs_x265 {
 	x265_encoder *context;
 	const x265_api *api; /* resolved via x265_api_get(bitdepth) at create */
 
+	/* Effective fps (num/den) the x265 context was last OPENED with. The rate
+	 * control's per-frame bit budget is derived from this at open time and is NOT
+	 * rebuilt by encoder_reconfig, so a live FPS change requires re-opening the
+	 * context. Tracked separately from params.fpsNum/fpsDenom (which update() may
+	 * already have advanced via reconfig) so the re-init is detected regardless of
+	 * whether the deferred update() runs before or after this check on the encode
+	 * thread. */
+	uint32_t inited_fps_num;
+	uint32_t inited_fps_den;
+
+	/* User's keyframe interval in seconds (0 = use the encoder default). Stored so a
+	 * live FPS change can recompute keyframeMax for the new rate without depending on
+	 * whether a deferred update() has already rescaled it from the new fps. */
+	int keyint_sec;
+
 	DARRAY(uint8_t) packet_data;
 
 	uint8_t *extra_data;
@@ -535,6 +550,7 @@ static void update_params(struct obs_x265 *obsx265, obs_data_t *settings, const 
 	int bitrate = (int)obs_data_get_int(settings, "bitrate");
 	int buffer_size = (int)obs_data_get_int(settings, "buffer_size");
 	int keyint_sec = (int)obs_data_get_int(settings, "keyint_sec");
+	obsx265->keyint_sec = keyint_sec;
 	int crf = (int)obs_data_get_int(settings, "crf");
 	int width = (int)obs_encoder_get_width(obsx265->encoder);
 	int height = (int)obs_encoder_get_height(obsx265->encoder);
@@ -925,8 +941,13 @@ static void *obs_x265_create(obs_data_t *settings, obs_encoder_t *encoder)
 
 		if (obsx265->context == NULL)
 			warn("x265 failed to load");
-		else
+		else {
 			load_headers(obsx265);
+			/* Record the fps the context was opened with so a later live FPS change
+			 * can be detected against it (see obs_x265_check_fps). */
+			obsx265->inited_fps_num = obsx265->params.fpsNum;
+			obsx265->inited_fps_den = obsx265->params.fpsDenom;
+		}
 	} else {
 		warn("bad settings specified");
 	}
@@ -1119,6 +1140,75 @@ static void add_roi(struct obs_x265 *obsx265, x265_picture *pic)
 	obsx265->roi_increment = increment;
 }
 
+/* Detect a live effective-FPS change (base rate or frame-rate divisor) and force
+ * x265 to re-initialise so its ABR per-frame bit budget is rebuilt for the new rate.
+ * libobs does not call update() when only the frame-rate divisor changes, and even
+ * when it does, x265 encoder_reconfig does NOT rebuild the rate control's fps-derived
+ * state (reconfig cannot rewrite the SPS VUI either - see the csp-change path above).
+ * Left alone the encoder keeps targeting bits/frame for the old rate, so the total
+ * bitrate scales with the delivery rate (e.g. 30->60 fps doubles it, 30->15 halves it).
+ * Re-opening the context re-runs the rate-control init with the new fps and emits a
+ * fresh IDR + VPS/SPS/PPS. Output timing is driven by the caller's pts (frame->pts),
+ * which libobs keeps continuous via the frame-rate divisor, so DTS/PTS do not regress
+ * across the re-init. This runs on the encode thread - the same thread libobs uses for
+ * deferred update() - so no extra lock is needed. */
+static void obs_x265_reinit_fps(struct obs_x265 *obsx265)
+{
+	/* params.fpsNum/fpsDenom and keyframeMax are already updated by the caller. */
+	obsx265->api->encoder_close(obsx265->context);
+	obsx265->context = NULL;
+	bfree(obsx265->extra_data);
+	obsx265->extra_data = NULL;
+	bfree(obsx265->sei);
+	obsx265->sei = NULL;
+
+	obsx265->context = obsx265->api->encoder_open(&obsx265->params);
+	if (!obsx265->context) {
+		warn("failed to re-initialise x265 after live FPS change");
+		return;
+	}
+	load_headers(obsx265);
+}
+
+static void obs_x265_check_fps(struct obs_x265 *obsx265)
+{
+	uint32_t num = obs_encoder_get_fps_num(obsx265->encoder);
+	uint32_t den = obs_encoder_get_fps_den(obsx265->encoder) *
+	                obs_encoder_get_frame_rate_divisor(obsx265->encoder);
+
+	if (num == 0 || den == 0)
+		return;
+	/* Compare against the fps the context was actually opened with, not params.fpsNum:
+	 * a deferred update() may already have advanced params.fpsNum via reconfig without
+	 * rebuilding the rate control, in which case a params-based comparison would miss
+	 * the change and the re-init would never fire. */
+	if (num == obsx265->inited_fps_num && den == obsx265->inited_fps_den)
+		return;
+
+	info("live FPS change %u/%u -> %u/%u, re-initialising x265", obsx265->inited_fps_num,
+	     obsx265->inited_fps_den, num, den);
+
+	/* Keep the keyframe interval (in seconds) constant across the rate change. When the
+	 * user set an explicit interval in seconds, recompute it for the new rate directly
+	 * (order-independent of any deferred update()); otherwise scale the current frame
+	 * count from the fps the context was opened with. */
+	if (obsx265->keyint_sec > 0) {
+		obsx265->params.keyframeMax = obsx265->keyint_sec * (int)num / (int)den;
+	} else if (obsx265->params.keyframeMax > 0 && obsx265->inited_fps_num != 0) {
+		int64_t knew = (int64_t)obsx265->params.keyframeMax * obsx265->inited_fps_den * num /
+		               ((int64_t)obsx265->inited_fps_num * den);
+		if (knew > 0)
+			obsx265->params.keyframeMax = (int)knew;
+	}
+
+	obsx265->params.fpsNum = num;
+	obsx265->params.fpsDenom = den;
+
+	obs_x265_reinit_fps(obsx265);
+	obsx265->inited_fps_num = num;
+	obsx265->inited_fps_den = den;
+}
+
 static bool obs_x265_encode(void *data, struct encoder_frame *frame, struct encoder_packet *packet,
 			     bool *received_packet)
 {
@@ -1130,6 +1220,13 @@ static bool obs_x265_encode(void *data, struct encoder_frame *frame, struct enco
 
 	if (!frame || !packet || !received_packet)
 		return false;
+
+	/* A failed live-FPS re-init leaves the context NULL; do not hammer a broken
+	 * encoder (and avoid retrying encoder_open every frame). */
+	if (!obsx265->context)
+		return false;
+
+	obs_x265_check_fps(obsx265);
 
 	init_pic_data(obsx265, &pic, frame);
 
