@@ -963,9 +963,6 @@ static void h264_video_info_fallback(void *, struct video_scale_info *info)
 	case VIDEO_FORMAT_BGRX:
 		info->format = VIDEO_FORMAT_RGBA;
 		break;
-	default:
-		info->format = VIDEO_FORMAT_NV12;
-		break;
 	}
 }
 
@@ -981,8 +978,6 @@ static void h265_video_info_fallback(void *, struct video_scale_info *info)
 	case VIDEO_FORMAT_P010:
 		info->format = VIDEO_FORMAT_P010;
 		break;
-	default:
-		info->format = VIDEO_FORMAT_NV12;
 	}
 }
 
@@ -998,8 +993,6 @@ static void av1_video_info_fallback(void *, struct video_scale_info *info)
 	case VIDEO_FORMAT_P010:
 		info->format = VIDEO_FORMAT_P010;
 		break;
-	default:
-		info->format = VIDEO_FORMAT_NV12;
 	}
 }
 
@@ -1077,6 +1070,12 @@ try {
 	case VIDEO_FORMAT_RGBA:
 		enc->amf_format = AMF_SURFACE_RGBA;
 		break;
+	default:
+		blog(LOG_ERROR, "[AMF encoder] Unsupported video format (enum %d). "
+		     "Supported formats are NV12 (YUV 4:2:0), P010 (YUV 4:2:0 10-bit), and RGBA. "
+		     "Please configure a supported color format in your encoder settings.",
+		     (int)info.format);
+		return false;
 	}
 
 	/* ------------------------------------ */

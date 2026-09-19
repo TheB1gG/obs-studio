@@ -148,6 +148,12 @@ mfxStatus QSV_Encoder_Internal::Open(qsv_param_t *pParams, enum qsv_codec codec)
 
 	InitParams(pParams, codec);
 	sts = m_pmfxENC->Query(&m_mfxEncParams, &m_mfxEncParams);
+	if (sts == MFX_WRN_INCOMPATIBLE_VIDEO_PARAM) {
+		blog(LOG_WARNING, "[qsv encoder] MFXVideoENCODE_Query modified encoding parameters "
+		     "(MFX_WRN_INCOMPATIBLE_VIDEO_PARAM). The driver may have changed your rate control "
+		     "mode, profile, or other settings to values it supports. Check the log for the "
+		     "actual parameters in use.");
+	}
 	MSDK_IGNORE_MFX_STS(sts, MFX_WRN_INCOMPATIBLE_VIDEO_PARAM);
 	MSDK_CHECK_RESULT(sts, MFX_ERR_NONE, sts);
 

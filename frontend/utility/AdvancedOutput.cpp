@@ -255,18 +255,7 @@ void AdvancedOutput::UpdateStreamSettings()
 	if (dynBitrate && strstr(streamEncoder, "nvenc") != nullptr)
 		obs_data_set_bool(settings, "lookahead", false);
 
-	video_t *video = obs_get_video();
-	enum video_format format = video_output_get_format(video);
 
-	switch (format) {
-	case VIDEO_FORMAT_I420:
-	case VIDEO_FORMAT_NV12:
-	case VIDEO_FORMAT_I010:
-	case VIDEO_FORMAT_P010:
-		break;
-	default:
-		obs_encoder_set_preferred_video_format(videoStreaming, VIDEO_FORMAT_NV12);
-	}
 
 	// Update frame rate divisor BEFORE obs_encoder_update so that nvenc_update can
 	// detect the new effective FPS and update its internal frameRateNum/Den params.

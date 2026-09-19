@@ -288,11 +288,20 @@ int SimpleOutput::GetAudioBitrate() const
 {
 	const char *audio_encoder = config_get_string(main->Config(), "SimpleOutput", "StreamAudioEncoder");
 	int bitrate = (int)config_get_uint(main->Config(), "SimpleOutput", "ABitrate");
+	int result;
 
 	if (strcmp(audio_encoder, "opus") == 0)
-		return FindClosestAvailableSimpleOpusBitrate(bitrate);
+		result = FindClosestAvailableSimpleOpusBitrate(bitrate);
+	else
+		result = FindClosestAvailableSimpleAACBitrate(bitrate);
 
-	return FindClosestAvailableSimpleAACBitrate(bitrate);
+	if (result != bitrate) {
+		blog(LOG_INFO, "[SimpleOutput] Requested audio bitrate %d kbps is not available for %s encoder, "
+		     "using closest supported bitrate %d kbps instead",
+		     bitrate, audio_encoder, result);
+	}
+
+	return result;
 }
 
 void SimpleOutput::Update()

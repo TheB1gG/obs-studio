@@ -77,11 +77,9 @@ static void nvenc_video_info(void *data, struct video_scale_info *info)
 
 	pref_format = obs_encoder_get_preferred_video_format(enc->ffve.encoder);
 
-	if (!valid_format(pref_format)) {
-		pref_format = valid_format(info->format) ? info->format : VIDEO_FORMAT_NV12;
+	if (valid_format(pref_format)) {
+		info->format = pref_format;
 	}
-
-	info->format = pref_format;
 }
 
 static void set_psycho_aq(struct nvenc_encoder *enc, bool psycho_aq)
