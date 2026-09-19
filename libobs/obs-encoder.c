@@ -1734,6 +1734,10 @@ bool obs_encoder_update_frame_rate_divisor(obs_encoder_t *encoder, uint32_t fram
 
 	// Used for packet timestamp/timebase scaling on both paths; takes effect for subsequent frames.
 	encoder->frame_rate_divisor = frame_rate_divisor;
+	// Reset the skip counter so that the new divisor takes effect immediately. Without this,
+	// decreasing the divisor (e.g. 12→1) leaves the counter above the new value and the reset
+	// condition (counter == divisor) is never met, causing all frames to be skipped.
+	encoder->frame_rate_divisor_counter = 0;
 
 	if (encoder->fps_override) {
 		video_output_free_frame_rate_divisor(encoder->fps_override);

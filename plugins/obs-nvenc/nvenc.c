@@ -330,7 +330,34 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 	bool br_changed = enc->can_change_bitrate &&
 			(enc->props.bitrate != bitrate || enc->props.max_bitrate != max_bitrate);
 
-	if (!rc_changed && !br_changed)
+	/* Detect effective FPS change (e.g. frame rate divisor changed live). NVENC's CBR
+	 * rate controller uses frameRateNum/Den to calculate per-frame bit budgets, so it
+	 * must be updated when the effective encoding rate changes. */
+	uint32_t fps_num = obs_encoder_get_fps_num(enc->encoder);
+	uint32_t fps_den = obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder);
+	bool fps_changed = (enc->params.frameRateNum != fps_num || enc->params.frameRateDen != fps_den);
+
+	/* Build a description of what changed for logging */
+	struct dstr change_desc = {0};
+	if (fps_changed) {
+		dstr_catf(&change_desc, "%gFPS (%u/%u) -> %gFPS (%u/%u)",
+		         (double)enc->params.frameRateNum / enc->params.frameRateDen,
+		         enc->params.frameRateNum, enc->params.frameRateDen,
+		         (double)fps_num / fps_den, fps_num, fps_den);
+		enc->params.frameRateNum = fps_num;
+		enc->params.frameRateDen = fps_den;
+	}
+	if (br_changed) {
+		if (change_desc.array) dstr_cat(&change_desc, ", ");
+		dstr_catf(&change_desc, "bitrate %lld -> %lld",
+		         (long long)enc->props.bitrate, (long long)bitrate);
+	}
+	if (rc_changed) {
+		if (change_desc.array) dstr_cat(&change_desc, ", ");
+		dstr_catf(&change_desc, "RC %s", rc_name ? rc_name : "?");
+	}
+
+	if (!rc_changed && !br_changed && !fps_changed)
 		return true; // nothing to do - avoids needless encoder reset + IDR churn
 
 	/* --- apply desired state --------------------------------------------- */
@@ -392,10 +419,12 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 		return apply_nvenc_reconfigure(enc);
 	}
 
-	info("staged rate control change - applying at next keyframe (%u frames, boundary=%lld counter_now=%lld)",
+	info("staged reconfigure [%s] - applying at next keyframe (%u frames, boundary=%lld counter_now=%lld)",
+	     change_desc.array ? change_desc.array : "(none)",
 	     (unsigned int)enc->config.gopLength,
 	     (long long)((int64_t)enc->config.gopLength - ((int64_t)enc->output_delay - 1)),
 	     (long long)enc->frames_since_idr);
+	dstr_free(&change_desc);
 	enc->reconfig_pending = true;
 	return true;
 }

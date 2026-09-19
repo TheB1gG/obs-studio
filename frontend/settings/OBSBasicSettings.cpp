@@ -862,6 +862,10 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 
 	PopulateOutputFpsDropdowns(GetBaseFpsFromConfig());
 
+
+
+
+
 	ui->advOutTrack1->setAccessibleName(QTStr("Basic.Settings.Output.Adv.Audio.Track1"));
 	ui->advOutTrack2->setAccessibleName(QTStr("Basic.Settings.Output.Adv.Audio.Track2"));
 	ui->advOutTrack3->setAccessibleName(QTStr("Basic.Settings.Output.Adv.Audio.Track3"));
@@ -2314,7 +2318,11 @@ void OBSBasicSettings::LoadOutputSettings()
 		ui->simpleOutStrAEncoder->setEnabled(false);
 		ui->simpleRecordingGroupBox->setEnabled(false);
 		ui->simpleReplayBuf->setEnabled(false);
-		ui->advOutTopContainer->setEnabled(false);
+		// Disable individual streaming output widgets, but keep Rescale (resolution/filter) and FPS
+		// enabled so they can be changed live while streaming (see the live-apply handlers above).
+		ui->advStreamTrackWidget->setEnabled(false);
+		ui->advOutAEncoder->setEnabled(false);
+		ui->advOutEncoder->setEnabled(false);
 		ui->advOutRecTopContainer->setEnabled(false);
 		ui->advOutRecTypeContainer->setEnabled(false);
 		ui->advOutputAudioTracksTab->setEnabled(false);

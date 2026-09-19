@@ -268,13 +268,36 @@ void AdvancedOutput::UpdateStreamSettings()
 		obs_encoder_set_preferred_video_format(videoStreaming, VIDEO_FORMAT_NV12);
 	}
 
+	// Update frame rate divisor BEFORE obs_encoder_update so that nvenc_update can
+	// detect the new effective FPS and update its internal frameRateNum/Den params.
+	uint32_t stream_fps_divisor = config_get_uint(main->Config(), "AdvOut", "StreamFpsDivisor");
+	if (stream_fps_divisor < 1)
+		stream_fps_divisor = 1;
+	obs_encoder_update_frame_rate_divisor(videoStreaming, stream_fps_divisor);
+
 	obs_encoder_update(videoStreaming, settings);
+	const char *rescaleRes = config_get_string(main->Config(), "AdvOut", "RescaleRes");
+	int rescaleFilter = config_get_int(main->Config(), "AdvOut", "RescaleFilter");
+	uint32_t cx = 0, cy = 0;
+	if (rescaleFilter != OBS_SCALE_DISABLE && rescaleRes && *rescaleRes) {
+		if (sscanf(rescaleRes, "%ux%u", &cx, &cy) != 2) {
+			cx = 0;
+			cy = 0;
+		}
+	}
+	obs_encoder_set_scaled_size(videoStreaming, cx, cy);
 }
 
 inline void AdvancedOutput::UpdateRecordingSettings()
 {
 	OBSData settings = GetDataFromJsonFile("recordEncoder.json");
 	obs_encoder_update(videoRecording, settings);
+
+	// Update frame rate divisor for live FPS changes while recording
+	uint32_t rec_fps_divisor = config_get_uint(main->Config(), "AdvOut", "RecFpsDivisor");
+	if (rec_fps_divisor < 1)
+		rec_fps_divisor = 1;
+	obs_encoder_update_frame_rate_divisor(videoRecording, rec_fps_divisor);
 }
 
 void AdvancedOutput::Update()
