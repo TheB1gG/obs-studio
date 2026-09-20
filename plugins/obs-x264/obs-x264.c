@@ -100,6 +100,27 @@ struct obs_x264 {
 	 * matrix. The scratch is cached across frames, reallocated only on resolution change. */
 	uint8_t *gbr_deinter;
 	size_t gbr_deinter_size;
+
+	/* Live resolution change (multitrack) support - mirrors nvenc/qsv. The size the
+	 * x264 context was last opened with, plus the plane-0 stride of frames at that size
+	 * (race guard: the mix rebind takes effect on the next tick). A resize re-opens the
+	 * context so the change lands exactly on an IDR. */
+	uint32_t inited_width;
+	uint32_t inited_height;
+	uint32_t inited_ls0;
+	int      resize_stall;
+
+	/* Multitrack keyframe-grid realignment after a live resize. The resize re-open emits an
+	 * off-grid IDR that re-anchors this track mid-GOP; to re-lock onto the siblings' shared
+	 * keyframe pts grid we stage a second context re-open exactly on the next shared boundary.
+	 * We target it by PTS (not frame counting, which proved fragile): last_keyframe_pts/gop_pts
+	 * track the steady-state on-grid keyframe cadence, and target_pts is the next shared
+	 * boundary to re-open on. x264 cannot reliably force an IDR mid-GOP, so the realignment
+	 * re-opens (a freshly opened context always emits a real IDR as its first frame). */
+	bool     align_pending;
+	int64_t  target_pts;        /* next shared keyframe pts to re-open on (0 = not staged) */
+	int64_t  last_keyframe_pts; /* most recent steady-state on-grid keyframe pts (-1 = none yet) */
+	int64_t  gop_pts;           /* measured keyframe interval in pts units */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -997,6 +1018,15 @@ static void *obs_x264_create(obs_data_t *settings, obs_encoder_t *encoder)
 			 * can be detected against it (see obs_x264_check_fps). */
 			obsx264->inited_fps_num = (uint32_t)obsx264->params.i_fps_num;
 			obsx264->inited_fps_den = (uint32_t)obsx264->params.i_fps_den;
+
+			/* Record the size the context was opened with so a later live resolution
+			 * change can be detected against it (see obs_x264_maybe_resize). */
+			obsx264->inited_width  = (uint32_t)obsx264->params.i_width;
+			obsx264->inited_height = (uint32_t)obsx264->params.i_height;
+
+			/* No keyframe cadence observed yet (see the realignment tracking in
+			 * obs_x264_encode). */
+			obsx264->last_keyframe_pts = -1;
 		}
 	} else {
 		warn("bad settings specified");
@@ -1193,22 +1223,37 @@ static void add_roi(struct obs_x264 *obsx264, x264_picture_t *pic)
  * frame-rate divisor, so DTS/PTS do not regress across the re-init. This runs on the
  * encode thread - the same thread libobs uses for deferred update() - so no extra lock
  * is needed. */
-static void obs_x264_reinit_fps(struct obs_x264 *obsx264)
+/* Close the x264 context, drop its cached headers, and re-open it with the current
+ * params. A freshly opened encoder emits an IDR as its very first frame, so this is how
+ * live changes that x264_encoder_reconfig cannot apply (fps, resolution) are applied on
+ * the fly - the change lands exactly on an IDR. Returns false if re-opening failed. */
+static bool obs_x264_reopen_context(struct obs_x264 *obsx264)
 {
-	/* params.i_fps_num/den and i_keyint_max are already updated by the caller. */
-	x264_encoder_close(obsx264->context);
-	obsx264->context = NULL;
+	if (obsx264->context) {
+		x264_encoder_close(obsx264->context);
+		obsx264->context = NULL;
+	}
+
 	bfree(obsx264->extra_data);
 	obsx264->extra_data = NULL;
 	bfree(obsx264->sei);
 	obsx264->sei = NULL;
 
 	obsx264->context = x264_encoder_open(&obsx264->params);
-	if (!obsx264->context) {
+	if (!obsx264->context)
+		return false;
+
+	load_headers(obsx264);
+	return true;
+}
+
+static void obs_x264_reinit_fps(struct obs_x264 *obsx264)
+{
+	/* params.i_fps_num/den and i_keyint_max are already updated by the caller. */
+	if (!obs_x264_reopen_context(obsx264)) {
 		warn("failed to re-initialise x264 after live FPS change");
 		return;
 	}
-	load_headers(obsx264);
 }
 
 static void obs_x264_check_fps(struct obs_x264 *obsx264)
@@ -1252,6 +1297,83 @@ static void obs_x264_check_fps(struct obs_x264 *obsx264)
 	obsx264->inited_fps_den = den;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Live resolution changes (multitrack) - mirrors nvenc_maybe_resize / qsv_   */
+/* maybe_resize. libobs starts delivering frames at the new size on the next  */
+/* tick after obs_encoder_set_scaled_size(), so we detect it here on the      */
+/* encode side and re-open the x264 context at the new size. The first frame  */
+/* of a freshly opened encoder is an IDR, so the resolution change lands      */
+/* exactly on an IDR (required for multitrack keyframe alignment). That IDR   */
+/* re-anchors this track mid-GOP (off-grid), so we then stage a SECOND        */
+/* context re-open on the next shared GOP boundary to re-lock this track onto */
+/* its siblings' keyframe pts grid. We re-open rather than force an IDR       */
+/* because x264 does not reliably honour i_type=X264_TYPE_IDR mid-GOP, which  */
+/* is why a forced realignment would leave the track permanently off-grid.    */
+
+static void obs_x264_maybe_resize(struct obs_x264 *obsx264, struct encoder_frame *frame)
+{
+	const uint32_t target_w = obs_encoder_get_width(obsx264->encoder);
+	const uint32_t target_h = obs_encoder_get_height(obsx264->encoder);
+
+	if (target_w == obsx264->inited_width && target_h == obsx264->inited_height) {
+		obsx264->inited_ls0 = frame->linesize[0]; /* keep in sync with current context size */
+		obsx264->resize_stall = 0;
+		return;
+	}
+
+	/* Race guard: the mix rebind takes effect on the next tick, so for up to one frame
+	 * after the scaled size is updated the delivered frame still carries the OLD size.
+	 * Re-opening to the new size and feeding it an old-size frame would read out of
+	 * bounds, so defer until the plane-0 stride actually changes (width change) or we've
+	 * clearly passed the one-tick window (a same-width height change leaves the stride
+	 * unchanged). Until then encode the frame into the current context as-is. */
+	const bool arrived = (frame->linesize[0] != obsx264->inited_ls0);
+	if (!arrived && ++obsx264->resize_stall < 2)
+		return;
+
+	info("applying live resolution change: %ux%u -> %ux%u (IDR this frame)", obsx264->inited_width,
+	     obsx264->inited_height, target_w, target_h);
+
+	obsx264->params.i_width  = (int)target_w;
+	obsx264->params.i_height = (int)target_h;
+
+	if (!obs_x264_reopen_context(obsx264)) {
+		err("live resize to %ux%u failed - restart required", target_w, target_h);
+		return; /* context unchanged; retried on the next frame */
+	}
+
+	obsx264->inited_width  = target_w;
+	obsx264->inited_height = target_h;
+	obsx264->inited_ls0    = frame->linesize[0];
+	obsx264->resize_stall  = 0;
+
+	/* Stage realignment onto the shared multitrack keyframe grid. The off-grid IDR above
+	 * re-anchors this track mid-GOP, so stage a second context re-open on the next shared
+	 * boundary (checked by PTS in obs_x264_encode). The target is the next on-grid keyframe pts,
+	 * derived from the steady-state cadence tracked before this resize. */
+	if (!obs_encoder_active(obsx264->encoder)) {
+		info("resize applied off-grid (not streaming); alignment not staged");
+		return;
+	}
+
+	if (obsx264->last_keyframe_pts < 0 || obsx264->gop_pts <= 0) {
+		info("resize applied off-grid (no keyframe cadence observed yet); alignment not staged");
+		return;
+	}
+
+	/* last_keyframe_pts is the most recent on-grid keyframe before this frame, so the next
+	 * shared boundary is one GOP later. This frame's pts sits between them, so the target is
+	 * strictly ahead of us (defensively bump it forward if a deep pipeline has already passed it). */
+	int64_t target = obsx264->last_keyframe_pts + obsx264->gop_pts;
+	while (target <= frame->pts)
+		target += obsx264->gop_pts;
+
+	obsx264->target_pts    = target;
+	obsx264->align_pending = true;
+	info("staged resize realignment - re-opening at next shared boundary (target pts %lld, gop_pts %lld)",
+	     (long long)target, (long long)obsx264->gop_pts);
+}
+
 static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct encoder_packet *packet,
 			    bool *received_packet)
 {
@@ -1264,12 +1386,36 @@ static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct enco
 	if (!frame || !packet || !received_packet)
 		return false;
 
-	/* A failed live-FPS re-init leaves the context NULL; do not hammer a broken
-	 * encoder (and avoid retrying x264_encoder_open every frame). */
+	/* A failed live re-init leaves the context NULL; do not hammer a broken encoder
+	 * (and avoid retrying x264_encoder_open every frame). */
 	if (!obsx264->context)
 		return false;
 
 	obs_x264_check_fps(obsx264);
+	if (!obsx264->context)
+		return false;
+
+	/* Live resolution change (multitrack): detected on the encode side and applied by
+	 * re-opening at the new size so the change lands exactly on an IDR. */
+	obs_x264_maybe_resize(obsx264, frame);
+	if (!obsx264->context)
+		return false;
+
+	/* Staged realignment: re-open the context exactly on the next shared keyframe boundary so
+	 * this track re-locks onto its sibling encoders' keyframe pts grid. We target it by PTS:
+	 * target_pts is the next shared (on-grid) keyframe pts computed at resize time, so re-opening
+	 * on the first frame that reaches it starts the new GOP phase exactly on the shared grid. A
+	 * freshly opened x264 context always emits a real IDR as its first frame (unlike a forced
+	 * i_type, which x264 does not reliably honour mid-GOP). */
+	if (obsx264->align_pending && frame->pts >= obsx264->target_pts) {
+		obsx264->align_pending = false;
+		info("resize realignment: re-opening context at shared keyframe boundary (pts %lld, target %lld)",
+		     (long long)frame->pts, (long long)obsx264->target_pts);
+		if (!obs_x264_reopen_context(obsx264)) {
+			err("resize realignment re-open failed - restart required");
+			return false;
+		}
+	}
 
 	init_pic_data(obsx264, &pic, frame);
 
@@ -1284,6 +1430,15 @@ static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct enco
 
 	*received_packet = (nal_count != 0);
 	parse_packet(obsx264, packet, nals, nal_count, &pic_out);
+
+	/* Track the steady-state on-grid keyframe cadence for future realignment. Only update
+	 * when not mid-realignment so the off-grid resize IDR does not corrupt the grid phase. */
+	if (nal_count > 0 && pic_out.b_keyframe && !obsx264->align_pending) {
+		const int64_t kpts = pic_out.i_pts;
+		if (obsx264->last_keyframe_pts >= 0)
+			obsx264->gop_pts = kpts - obsx264->last_keyframe_pts;
+		obsx264->last_keyframe_pts = kpts;
+	}
 
 	return true;
 }

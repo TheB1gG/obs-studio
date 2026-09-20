@@ -821,7 +821,8 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 		    old_encoder_config.format != new_encoder_config.format;
 
 		const bool supports_live_resize = strstr(new_encoder_config.type.c_str(), "nvenc") != nullptr ||
-		                                   strstr(new_encoder_config.type.c_str(), "qsv") != nullptr;
+		                                   strstr(new_encoder_config.type.c_str(), "qsv") != nullptr ||
+		                                   strstr(new_encoder_config.type.c_str(), "x264") != nullptr;
 		const bool resolution_changed = old_encoder_config.width != new_encoder_config.width ||
 		    old_encoder_config.height != new_encoder_config.height;
 		const bool scale_type_changed = old_encoder_config.gpu_scale_type != new_encoder_config.gpu_scale_type;
@@ -836,11 +837,11 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 		}
 
 		if (supports_live_resize) {
-			// NVENC/QSV apply scale type and resolution changes live: the libobs setter re-points the
-			// GPU rescale mix right away (see live_rebind_encoder_mix in obs-encoder.c), and the encoder
+			// NVENC/QSV/x264 apply scale type and resolution changes live: the libobs setter re-points the
+			// rescale mix right away (see live_rebind_encoder_mix in obs-encoder.c), and the encoder
 			// detects input size changes on its encode side, resizing the session in place. The forced
 			// keyframe realignment happens at the next shared GOP boundary so the multitrack tracks stay
-			// keyframe-aligned (see nvenc_maybe_resize / qsv_maybe_resize).
+			// keyframe-aligned (see nvenc_maybe_resize / qsv_maybe_resize / obs_x264_maybe_resize).
 			// Colorspace/range/format changes stay deferred until a stream restart: live rebinding does
 			// not update the encoder session's color parameters mid-stream, so the encoded output would
 			// not reflect them reliably.
