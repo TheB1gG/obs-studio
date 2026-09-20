@@ -69,15 +69,26 @@ struct obs_x265 {
 	 * whether a deferred update() has already rescaled it from the new fps. */
 	int keyint_sec;
 
-	/* Live resolution change (multitrack) support - mirrors obs-x264/obs-nvenc. The context
-	 * is re-opened at the new size so the change lands exactly on an IDR (a fresh x265 context
-	 * always emits VPS/SPS/PPS + IDR as its first frame). That IDR re-anchors this track mid-GOP
-	 * (off-grid), so we then stage a SECOND context re-open on the next shared GOP boundary to
-	 * re-lock this track onto its siblings' keyframe pts grid. */
+	/* Live resolution change (multitrack) support - mirrors obs-x264/obs-nvenc. The size the
+	 * x265 context was last opened with, plus the plane-0 stride of frames at that size
+	 * (race guard: the mix rebind takes effect on the next tick). A resize is applied by
+	 * re-opening the context at a keyframe boundary so the IDR lands on-grid with no DTS gap. */
 	uint32_t inited_width;
 	uint32_t inited_height;
 	uint32_t inited_ls0;
 	int      resize_stall;
+
+	/* Timed resize: when a resolution change is detected, we defer the re-open until the next
+	 * shared keyframe boundary. Between detection and the boundary, incoming frames (at the new
+	 * size) are scaled down to the old resolution so they can be encoded by the current context
+	 * without dropping any frames or creating DTS gaps. At the boundary we re-open with the new
+	 * resolution - the IDR lands exactly on-grid. */
+	bool     resize_pending;
+	uint32_t pending_width;
+	uint32_t pending_height;
+	int64_t  resize_target_pts;
+	uint8_t *scale_buf[4];   /* old-resolution buffers for scaling incoming frames */
+	uint32_t scale_stride[4];
 
 	/* Multitrack keyframe-grid realignment after a live resize (PTS-based, mirrors obs-x264).
 	 * The off-grid resize IDR re-anchors this track mid-GOP; we stage a second context re-open
@@ -126,6 +137,7 @@ struct obs_x265 {
 
 /* Forward declaration */
 static void obs_x265_video_info(void *data, struct video_scale_info *info);
+static void free_scale_buffers(struct obs_x265 *obsx265);
 
 /* ------------------------------------------------------------------------- */
 
@@ -325,6 +337,7 @@ static void clear_data(struct obs_x265 *obsx265)
 	bfree(obsx265->gbr_deinter);
 	obsx265->gbr_deinter = NULL;
 	obsx265->gbr_deinter_size = 0;
+	free_scale_buffers(obsx265);
 }
 
 static void obs_x265_destroy(void *data)
@@ -1052,6 +1065,127 @@ static uint8_t *deinterleave_gbra(struct obs_x265 *obsx265, struct encoder_frame
 	return obsx265->gbr_deinter;
 }
 
+/* Nearest-neighbor YUV scaler for the timed-resize transition period. Scales a frame from
+ * src_w x src_h to dst_w x dst_h into pre-allocated buffers. Handles NV12, I420/I422, and BGRA. */
+static void scale_frame_to_old_size(struct obs_x265 *obsx265, struct encoder_frame *frame)
+{
+	const uint32_t src_w = obs_encoder_get_width(obsx265->encoder);
+	const uint32_t src_h = obs_encoder_get_height(obsx265->encoder);
+	const uint32_t dst_w = obsx265->inited_width;
+	const uint32_t dst_h = obsx265->inited_height;
+
+	if (src_w == dst_w && src_h == dst_h)
+		return;
+
+	const int csp = obsx265->active_csp;
+
+	if (obsx265->color_format == VIDEO_FORMAT_BGRA) {
+		for (uint32_t y = 0; y < dst_h; y++) {
+			const uint32_t sy = (y * src_h) / dst_h;
+			const uint8_t *srow = frame->data[0] + (size_t)sy * frame->linesize[0];
+			uint8_t *drow = obsx265->scale_buf[0] + (size_t)y * obsx265->scale_stride[0];
+			for (uint32_t x = 0; x < dst_w; x++) {
+				const uint32_t sx = (x * src_w) / dst_w;
+				memcpy(drow + x * 4, srow + sx * 4, 4);
+			}
+		}
+		return;
+	}
+
+	if (csp == X265_CSP_NV12) {
+		for (uint32_t y = 0; y < dst_h; y++) {
+			const uint32_t sy = (y * src_h) / dst_h;
+			const uint8_t *srow = frame->data[0] + (size_t)sy * frame->linesize[0];
+			uint8_t *drow = obsx265->scale_buf[0] + (size_t)y * obsx265->scale_stride[0];
+			for (uint32_t x = 0; x < dst_w; x++)
+				drow[x] = srow[(x * src_w) / dst_w];
+		}
+		const uint32_t src_uv_w = src_w / 2, src_uv_h = src_h / 2;
+		const uint32_t dst_uv_w = dst_w / 2, dst_uv_h = dst_h / 2;
+		for (uint32_t y = 0; y < dst_uv_h; y++) {
+			const uint32_t sy = (y * src_uv_h) / dst_uv_h;
+			const uint8_t *srow = frame->data[1] + (size_t)sy * frame->linesize[1];
+			uint8_t *drow = obsx265->scale_buf[1] + (size_t)y * obsx265->scale_stride[1];
+			for (uint32_t x = 0; x < dst_uv_w; x++) {
+				const uint32_t sx = (x * src_uv_w) / dst_uv_w;
+				drow[x * 2]     = srow[sx * 2];
+				drow[x * 2 + 1] = srow[sx * 2 + 1];
+			}
+		}
+		return;
+	}
+
+	if (csp == X265_CSP_I420 || csp == X265_CSP_I422 || csp == X265_CSP_I444) {
+		for (uint32_t y = 0; y < dst_h; y++) {
+			const uint32_t sy = (y * src_h) / dst_h;
+			const uint8_t *srow = frame->data[0] + (size_t)sy * frame->linesize[0];
+			uint8_t *drow = obsx265->scale_buf[0] + (size_t)y * obsx265->scale_stride[0];
+			for (uint32_t x = 0; x < dst_w; x++)
+				drow[x] = srow[(x * src_w) / dst_w];
+		}
+		const bool half_w = (csp != X265_CSP_I444);
+		const bool half_h = (csp == X265_CSP_I420);
+		const uint32_t src_uv_w = half_w ? src_w / 2 : src_w;
+		const uint32_t src_uv_h = half_h ? src_h / 2 : src_h;
+		const uint32_t dst_uv_w = half_w ? dst_w / 2 : dst_w;
+		const uint32_t dst_uv_h = half_h ? dst_h / 2 : dst_h;
+		for (int plane = 1; plane <= 2; plane++) {
+			for (uint32_t y = 0; y < dst_uv_h; y++) {
+				const uint32_t sy = (y * src_uv_h) / dst_uv_h;
+				const uint8_t *srow = frame->data[plane] + (size_t)sy * frame->linesize[plane];
+				uint8_t *drow = obsx265->scale_buf[plane] + (size_t)y * obsx265->scale_stride[plane];
+				for (uint32_t x = 0; x < dst_uv_w; x++)
+					drow[x] = srow[(x * src_uv_w) / dst_uv_w];
+			}
+		}
+		return;
+	}
+}
+
+static void alloc_scale_buffers(struct obs_x265 *obsx265)
+{
+	const uint32_t w = obsx265->inited_width;
+	const uint32_t h = obsx265->inited_height;
+	const int csp = obsx265->active_csp;
+
+	for (int i = 0; i < 4; i++)
+		bfree(obsx265->scale_buf[i]);
+
+	if (obsx265->color_format == VIDEO_FORMAT_BGRA) {
+		obsx265->scale_stride[0] = w * 4;
+		obsx265->scale_buf[0] = bmalloc((size_t)w * 4 * h);
+		return;
+	}
+
+	if (csp == X265_CSP_NV12) {
+		obsx265->scale_stride[0] = w;
+		obsx265->scale_buf[0] = bmalloc((size_t)w * h);
+		obsx265->scale_stride[1] = w;
+		obsx265->scale_buf[1] = bmalloc((size_t)w * (h / 2));
+		return;
+	}
+
+	if (csp == X265_CSP_I420 || csp == X265_CSP_I422 || csp == X265_CSP_I444) {
+		const bool half_w = (csp != X265_CSP_I444);
+		const bool half_h = (csp == X265_CSP_I420);
+		obsx265->scale_stride[0] = w;
+		obsx265->scale_buf[0] = bmalloc((size_t)w * h);
+		obsx265->scale_stride[1] = half_w ? w / 2 : w;
+		obsx265->scale_buf[1] = bmalloc((size_t)(half_w ? w / 2 : w) * (half_h ? h / 2 : h));
+		obsx265->scale_stride[2] = half_w ? w / 2 : w;
+		obsx265->scale_buf[2] = bmalloc((size_t)(half_w ? w / 2 : w) * (half_h ? h / 2 : h));
+		return;
+	}
+}
+
+static void free_scale_buffers(struct obs_x265 *obsx265)
+{
+	for (int i = 0; i < 4; i++) {
+		bfree(obsx265->scale_buf[i]);
+		obsx265->scale_buf[i] = NULL;
+	}
+}
+
 static inline void init_pic_data(struct obs_x265 *obsx265, x265_picture *pic, struct encoder_frame *frame)
 {
 	obsx265->api->picture_init(&obsx265->params, pic);
@@ -1211,21 +1345,19 @@ static bool obs_x265_reinit_fps(struct obs_x265 *obsx265)
 	return true;
 }
 
-/* Stage a realignment onto the shared multitrack keyframe grid after a live re-init (a resize or an
- * FPS change) that emitted an off-grid IDR and re-anchored this track mid-GOP. Computes the next
- * on-grid boundary pts from the steady-state cadence tracked before the change and sets
- * align_pending/target_pts so the encode path re-opens exactly there (a freshly opened context emits
- * a real IDR as its first frame). `reason` is logged for context. */
-static void obs_x265_stage_grid_realignment(struct obs_x265 *obsx265, struct encoder_frame *frame, const char *reason)
+/* Compute the target PTS for the next shared multitrack keyframe grid boundary after a live
+ * re-init (resize or FPS change). Must be called AFTER the context re-open. Sets target_pts
+ * on success and returns 1, or returns 0 if no realignment is needed. */
+static int obs_x265_compute_realign_keyint(struct obs_x265 *obsx265, struct encoder_frame *frame)
 {
 	if (!obs_encoder_active(obsx265->encoder)) {
-		info("%s applied off-grid (not streaming); alignment not staged", reason);
-		return;
+		info("realignment skipped (not streaming)");
+		return 0;
 	}
 
 	if (obsx265->last_keyframe_pts < 0 || obsx265->gop_pts <= 0) {
-		info("%s applied off-grid (no keyframe cadence observed yet); alignment not staged", reason);
-		return;
+		info("realignment skipped (no keyframe cadence observed yet)");
+		return 0;
 	}
 
 	/* last_keyframe_pts is the most recent on-grid keyframe before this frame, so the next shared
@@ -1235,10 +1367,16 @@ static void obs_x265_stage_grid_realignment(struct obs_x265 *obsx265, struct enc
 	while (target <= frame->pts)
 		target += obsx265->gop_pts;
 
-	obsx265->target_pts    = target;
+	obsx265->target_pts = target;
+	return 1;
+}
+
+/* Mark that realignment is pending (call after the re-open has been applied). */
+static void obs_x265_commit_realign(struct obs_x265 *obsx265, const char *reason)
+{
 	obsx265->align_pending = true;
-	info("staged realignment after %s - re-opening at next shared boundary (target pts %lld, gop_pts %lld)",
-	     reason, (long long)target, (long long)obsx265->gop_pts);
+	info("staged realignment after %s (target pts %lld, gop_pts %lld)",
+	     reason, (long long)obsx265->target_pts, (long long)obsx265->gop_pts);
 }
 
 static void obs_x265_check_fps(struct obs_x265 *obsx265, struct encoder_frame *frame)
@@ -1337,20 +1475,17 @@ static void obs_x265_check_fps(struct obs_x265 *obsx265, struct encoder_frame *f
 	if (obs_x265_reinit_fps(obsx265)) {
 		obsx265->inited_fps_num = num;
 		obsx265->inited_fps_den = den;
-		/* The re-init emitted an off-grid IDR that re-anchored this track mid-GOP; stage a realignment so it
-		 * re-locks onto the siblings' shared keyframe grid. */
-		obs_x265_stage_grid_realignment(obsx265, frame, "FPS change");
+		int realign_keyint = obs_x265_compute_realign_keyint(obsx265, frame);
+		if (realign_keyint > 0) {
+			obs_x265_commit_realign(obsx265, "FPS change");
+		}
 	}
 }
 
-/* Detect a live resolution change (multitrack) and apply it by re-opening the x265 context at
- * the new size so the change lands exactly on an IDR. A freshly opened encoder's first frame is
- * an IDR, so the resolution change lands exactly on an IDR (required for multitrack keyframe
- * alignment). That IDR re-anchors this track mid-GOP (off-grid), so we then stage a SECOND
- * context re-open on the next shared GOP boundary to re-lock this track onto its siblings'
- * keyframe pts grid. We re-open rather than force an IDR because x265, like x264, does not
- * reliably honour a forced keyframe mid-GOP, which is why a forced realignment would leave the
- * track permanently off-grid. */
+/* Detect a live resolution change (multitrack) and stage a timed re-open at the next shared
+ * keyframe boundary. During the wait, incoming new-size frames are scaled to the old resolution
+ * so every frame is encoded with continuous DTS. At the boundary, the re-open emits an IDR that
+ * lands exactly on-grid - no DTS gap, no second realignment re-open needed. */
 static void obs_x265_maybe_resize(struct obs_x265 *obsx265, struct encoder_frame *frame)
 {
 	const uint32_t target_w = obs_encoder_get_width(obsx265->encoder);
@@ -1372,26 +1507,51 @@ static void obs_x265_maybe_resize(struct obs_x265 *obsx265, struct encoder_frame
 	if (!arrived && ++obsx265->resize_stall < 2)
 		return;
 
-	info("applying live resolution change: %ux%u -> %ux%u (IDR this frame)", obsx265->inited_width,
-	     obsx265->inited_height, target_w, target_h);
+	/* If a timed resize is already pending, just keep scaling - the re-open will happen
+	 * at the scheduled keyframe boundary. */
+	if (obsx265->resize_pending)
+		return;
 
-	obsx265->params.sourceWidth  = (int)target_w;
-	obsx265->params.sourceHeight = (int)target_h;
-
-	if (!obs_x265_reopen_context(obsx265)) {
-		err("live resize to %ux%u failed - restart required", target_w, target_h);
-		return; /* context unchanged; retried on the next frame */
+	/* Compute the target PTS for the next shared keyframe boundary. If we have no cadence
+	 * data yet (first GOP), fall back to an immediate re-open. */
+	int64_t target_pts = 0;
+	if (obsx265->last_keyframe_pts >= 0 && obsx265->gop_pts > 0) {
+		target_pts = obsx265->last_keyframe_pts + obsx265->gop_pts;
+		while (target_pts <= frame->pts)
+			target_pts += obsx265->gop_pts;
 	}
 
-	obsx265->inited_width  = target_w;
-	obsx265->inited_height = target_h;
-	obsx265->inited_ls0    = frame->linesize[0];
-	obsx265->resize_stall  = 0;
+	if (target_pts == 0) {
+		/* No keyframe cadence observed yet: fall back to immediate re-open. */
+		info("live resize %ux%u -> %ux%u (immediate, no cadence)", obsx265->inited_width,
+		     obsx265->inited_height, target_w, target_h);
+		obsx265->params.sourceWidth  = (int)target_w;
+		obsx265->params.sourceHeight = (int)target_h;
+		if (!obs_x265_reopen_context(obsx265)) {
+			err("live resize to %ux%u failed - restart required", target_w, target_h);
+			return;
+		}
+		obsx265->inited_width  = target_w;
+		obsx265->inited_height = target_h;
+		obsx265->inited_ls0    = frame->linesize[0];
+		obsx265->resize_stall  = 0;
+		int realign_keyint = obs_x265_compute_realign_keyint(obsx265, frame);
+		if (realign_keyint > 0)
+			obs_x265_commit_realign(obsx265, "resize");
+		return;
+	}
 
-	/* Stage realignment onto the shared multitrack keyframe grid. The off-grid IDR above re-anchors
-	 * this track mid-GOP, so stage a second context re-open on the next shared boundary (checked by
-	 * PTS in obs_x265_encode). */
-	obs_x265_stage_grid_realignment(obsx265, frame, "resize");
+	/* Timed resize: defer the re-open to the next keyframe boundary. */
+	info("live resize %ux%u -> %ux%u staged (will apply at pts %lld, current pts %lld)",
+	     obsx265->inited_width, obsx265->inited_height, target_w, target_h,
+	     (long long)target_pts, (long long)frame->pts);
+
+	obsx265->resize_pending     = true;
+	obsx265->pending_width      = target_w;
+	obsx265->pending_height     = target_h;
+	obsx265->resize_target_pts  = target_pts;
+	obsx265->resize_stall       = 0;
+	alloc_scale_buffers(obsx265);
 }
 
 static bool obs_x265_encode(void *data, struct encoder_frame *frame, struct encoder_packet *packet,
@@ -1399,7 +1559,7 @@ static bool obs_x265_encode(void *data, struct encoder_frame *frame, struct enco
 {
 	struct obs_x265 *obsx265 = data;
 	x265_nal *nals;
-	uint32_t nal_count;
+	uint32_t nal_count = 0;
 	int ret;
 	x265_picture pic, pic_out;
 
@@ -1415,18 +1575,39 @@ static bool obs_x265_encode(void *data, struct encoder_frame *frame, struct enco
 	if (!obsx265->context)
 		return false;
 
-	/* Live resolution change (multitrack): detected on the encode side and applied by
-	 * re-opening at the new size so the change lands exactly on an IDR. */
+	/* Live resolution change (multitrack): detect and stage the timed resize. */
 	obs_x265_maybe_resize(obsx265, frame);
 	if (!obsx265->context)
 		return false;
 
-	/* Staged realignment: re-open the context exactly on the next shared keyframe boundary so
-	 * this track re-locks onto its sibling encoders' keyframe pts grid. We target it by PTS:
-	 * target_pts is the next shared (on-grid) keyframe pts computed at resize time, so re-opening
-	 * on the first frame that reaches it starts the new GOP phase exactly on the shared grid. A
-	 * freshly opened x265 context always emits a real IDR as its first frame (unlike a forced
-	 * keyframe, which x265 does not reliably honour mid-GOP). */
+	/* Timed resize: at the keyframe boundary, perform the actual re-open with the new size.
+	 * The freshly opened context emits an IDR that lands exactly on-grid. */
+	if (obsx265->resize_pending && frame->pts >= obsx265->resize_target_pts) {
+		info("timed resize: applying %ux%u -> %ux%u at pts %lld (target %lld)",
+		     obsx265->inited_width, obsx265->inited_height,
+		     obsx265->pending_width, obsx265->pending_height,
+		     (long long)frame->pts, (long long)obsx265->resize_target_pts);
+		obsx265->params.sourceWidth  = (int)obsx265->pending_width;
+		obsx265->params.sourceHeight = (int)obsx265->pending_height;
+		if (!obs_x265_reopen_context(obsx265)) {
+			err("timed resize re-open to %ux%u failed - restart required",
+			    obsx265->pending_width, obsx265->pending_height);
+			obsx265->resize_pending = false;
+			free_scale_buffers(obsx265);
+			return false;
+		}
+		obsx265->inited_width  = obsx265->pending_width;
+		obsx265->inited_height = obsx265->pending_height;
+		obsx265->inited_ls0    = frame->linesize[0];
+		obsx265->resize_pending = false;
+		free_scale_buffers(obsx265);
+		/* The IDR at the shared boundary re-anchors the grid; update tracking. */
+		obsx265->last_keyframe_pts = frame->pts;
+	}
+
+	/* Keyframe-grid realignment: re-open the context exactly on the next shared keyframe
+	 * boundary so this track re-locks onto its sibling encoders' keyframe pts grid. A freshly
+	 * opened x265 context always emits a real IDR as its first frame. */
 	if (obsx265->align_pending && frame->pts >= obsx265->target_pts) {
 		obsx265->align_pending = false;
 		info("realignment: re-opening context at shared keyframe boundary (pts %lld, target %lld)",
@@ -1435,30 +1616,43 @@ static bool obs_x265_encode(void *data, struct encoder_frame *frame, struct enco
 			err("realignment re-open failed - restart required");
 			return false;
 		}
-		/* Refresh the fps the context was opened with so a subsequent live change is detected against the new
-		 * values (params.fpsNum/Denom already hold them; this covers the boundary-aligned FPS path where the
-		 * divisor only just took effect). */
 		obsx265->inited_fps_num = (uint32_t)obsx265->params.fpsNum;
 		obsx265->inited_fps_den = (uint32_t)obsx265->params.fpsDenom;
+		/* The re-open emitted an IDR at the shared boundary; update grid tracking. */
+		obsx265->last_keyframe_pts = frame->pts;
 	}
 
-	init_pic_data(obsx265, &pic, frame);
+	/* If a timed resize is pending and we haven't hit the boundary yet, scale the incoming
+	 * new-size frame down to the old resolution so it can be encoded by the current context. */
+	struct encoder_frame scaled_frame;
+	struct encoder_frame *enc_frame = frame;
+	if (obsx265->resize_pending && obsx265->scale_buf[0]) {
+		scale_frame_to_old_size(obsx265, frame);
+		scaled_frame = *frame;
+		for (int i = 0; i < 4; i++) {
+			scaled_frame.data[i]     = obsx265->scale_buf[i];
+			scaled_frame.linesize[i] = obsx265->scale_stride[i];
+		}
+		enc_frame = &scaled_frame;
+	}
+
+	init_pic_data(obsx265, &pic, enc_frame);
 
 	if (obs_encoder_has_roi(obsx265->encoder))
 		add_roi(obsx265, &pic);
 
-	ret = obsx265->api->encoder_encode(obsx265->context, &nals, &nal_count, (frame ? &pic : NULL), &pic_out);
+	ret = obsx265->api->encoder_encode(obsx265->context, &nals, &nal_count, &pic, &pic_out);
 	if (ret < 0) {
 		warn("encode failed");
 		return false;
 	}
 
-	*received_packet = (nal_count != 0);
+	*received_packet = (nal_count > 0);
 	parse_packet(obsx265, packet, nals, nal_count, &pic_out);
 
 	/* Track the steady-state on-grid keyframe cadence for future realignment. Only update
 	 * when not mid-realignment so the off-grid resize IDR does not corrupt the grid phase. */
-	if (nal_count > 0 && IS_X265_TYPE_I(pic_out.sliceType) && !obsx265->align_pending) {
+	if (nal_count > 0 && IS_X265_TYPE_I(pic_out.sliceType) && !obsx265->align_pending && !obsx265->resize_pending) {
 		const int64_t kpts = pic_out.pts;
 		if (obsx265->last_keyframe_pts >= 0)
 			obsx265->gop_pts = kpts - obsx265->last_keyframe_pts;
