@@ -2247,6 +2247,25 @@ EXPORT bool obs_encoder_set_frame_rate_divisor(obs_encoder_t *encoder, uint32_t 
 EXPORT bool obs_encoder_update_frame_rate_divisor(obs_encoder_t *encoder, uint32_t divisor);
 
 /**
+ * Record a desired live frame rate divisor for a video encoder without applying it immediately. The value is picked
+ * up by the encoder plugin (via obs_encoder_get_pending_frame_rate_divisor()), which stages the actual change on a
+ * shared keyframe boundary with obs_encoder_set_frame_rate_divisor_at_pts(). Pass 0 to clear any pending request.
+ */
+EXPORT void obs_encoder_set_pending_frame_rate_divisor(obs_encoder_t *encoder, uint32_t divisor);
+
+/** For video encoders, returns the pending frame rate divisor (0 if none is staged). */
+EXPORT uint32_t obs_encoder_get_pending_frame_rate_divisor(const obs_encoder_t *encoder);
+
+/**
+ * Stage a live frame rate divisor change so that it takes effect exactly when the encoder's presentation timestamp
+ * reaches target_pts. Unlike obs_encoder_update_frame_rate_divisor(), which resets the skip counter immediately and
+ * therefore shifts the PTS phase by an arbitrary amount, this defers the change to a shared keyframe boundary so
+ * that multitrack sibling encoders stay keyframe-aligned. The encoder plugin computes target_pts from its observed
+ * on-grid keyframe cadence and also re-opens there to emit an IDR exactly on the grid.
+ */
+EXPORT bool obs_encoder_set_frame_rate_divisor_at_pts(obs_encoder_t *encoder, uint32_t divisor, int64_t target_pts);
+
+/**
  * Adds region of interest (ROI) for an encoder. This allows prioritizing
  * quality of regions of the frame.
  * If regions overlap, regions added earlier take precedence.

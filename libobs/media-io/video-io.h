@@ -467,6 +467,14 @@ EXPORT bool video_output_disconnect2(video_t *video, void (*callback)(void *para
 EXPORT bool video_output_set_frame_rate_divisor(video_t *video, uint32_t frame_rate_divisor,
 		void (*callback)(void *param, struct video_data *frame), void *param);
 
+// Stages a frame-rate divisor change for an existing raw connection (identified by callback/param) so that it is
+// applied inline by the video thread on the next frame it processes. Unlike video_output_set_frame_rate_divisor this
+// takes no lock, so it may be called from within that connection's own callback (which already runs under the input
+// lock in video_output_cur_frame) without deadlocking. Used to apply a live per-track rate change exactly on a shared
+// keyframe boundary (see obs_encoder_set_frame_rate_divisor_at_pts).
+EXPORT void video_output_set_pending_frame_rate_divisor(video_t *video, uint32_t frame_rate_divisor,
+		void (*callback)(void *param, struct video_data *frame), void *param);
+
 EXPORT bool video_output_active(const video_t *video);
 
 EXPORT const struct video_output_info *video_output_get_info(const video_t *video);

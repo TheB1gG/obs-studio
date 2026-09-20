@@ -1247,37 +1247,129 @@ static bool obs_x264_reopen_context(struct obs_x264 *obsx264)
 	return true;
 }
 
-static void obs_x264_reinit_fps(struct obs_x264 *obsx264)
+static bool obs_x264_reinit_fps(struct obs_x264 *obsx264)
 {
 	/* params.i_fps_num/den and i_keyint_max are already updated by the caller. */
 	if (!obs_x264_reopen_context(obsx264)) {
 		warn("failed to re-initialise x264 after live FPS change");
-		return;
+		return false;
 	}
+	return true;
 }
 
-static void obs_x264_check_fps(struct obs_x264 *obsx264)
+/* Stage a realignment onto the shared multitrack keyframe grid after a live re-init (a resize or an
+ * FPS change) that emitted an off-grid IDR and re-anchored this track mid-GOP. Computes the next
+ * on-grid boundary pts from the steady-state cadence tracked before the change and sets
+ * align_pending/target_pts so the encode path re-opens exactly there (a freshly opened context emits
+ * a real IDR as its first frame). `reason` is logged for context. */
+static void obs_x264_stage_grid_realignment(struct obs_x264 *obsx264, struct encoder_frame *frame, const char *reason)
 {
+	if (!obs_encoder_active(obsx264->encoder)) {
+		info("%s applied off-grid (not streaming); alignment not staged", reason);
+		return;
+	}
+
+	if (obsx264->last_keyframe_pts < 0 || obsx264->gop_pts <= 0) {
+		info("%s applied off-grid (no keyframe cadence observed yet); alignment not staged", reason);
+		return;
+	}
+
+	/* last_keyframe_pts is the most recent on-grid keyframe before this frame, so the next shared
+	 * boundary is one GOP later. This frame's pts sits between them, so the target is strictly ahead
+	 * of us (defensively bump it forward if a deep pipeline has already passed it). */
+	int64_t target = obsx264->last_keyframe_pts + obsx264->gop_pts;
+	while (target <= frame->pts)
+		target += obsx264->gop_pts;
+
+	obsx264->target_pts    = target;
+	obsx264->align_pending = true;
+	info("staged realignment after %s - re-opening at next shared boundary (target pts %lld, gop_pts %lld)",
+	     reason, (long long)target, (long long)obsx264->gop_pts);
+}
+
+static void obs_x264_check_fps(struct obs_x264 *obsx264, struct encoder_frame *frame)
+{
+	/* Mid-realignment (a resize or FPS re-open is already staged): don't re-detect, the inited_* values are
+	 * refreshed when the staged re-open fires in obs_x264_encode. */
+	if (obsx264->align_pending)
+		return;
+
+	/* Live per-track FPS change (multitrack): the frontend stages a divisor change via
+	 * obs_encoder_set_pending_frame_rate_divisor(). We apply it exactly on the next shared keyframe boundary so
+	 * this track's keyframes stay aligned with its siblings. An immediate change would reset the skip counter
+	 * without frame-boundary synchronisation and shift the synthetic PTS phase by an arbitrary amount, which no
+	 * later re-open can recover (the sub-rate stream only ever delivers frames at that one offset). */
+	uint32_t pending_div = obs_encoder_get_pending_frame_rate_divisor(obsx264->encoder);
+	if (pending_div != 0 && pending_div != obs_encoder_get_frame_rate_divisor(obsx264->encoder)) {
+		uint32_t num = obs_encoder_get_fps_num(obsx264->encoder);
+		uint32_t den = obs_encoder_get_fps_den(obsx264->encoder) * pending_div;
+
+		if (num == 0 || den == 0)
+			return;
+
+		info("live FPS change %u/%u -> %u/%u, staging boundary-aligned re-init", obsx264->inited_fps_num,
+		     obsx264->inited_fps_den, num, den);
+
+		/* Keep the keyframe interval (in seconds) constant across the rate change. When the user set an
+		 * explicit interval in seconds, recompute it for the new rate directly; otherwise scale the current
+		 * frame count from the fps the context was opened with. */
+		if (obsx264->keyint_sec > 0) {
+			obsx264->params.i_keyint_max = obsx264->keyint_sec * (int)num / (int)den;
+		} else if (obsx264->params.i_keyint_max > 0 && obsx264->inited_fps_num != 0) {
+			int64_t knew = (int64_t)obsx264->params.i_keyint_max * obsx264->inited_fps_den * num /
+			              ((int64_t)obsx264->inited_fps_num * den);
+			if (knew > 0)
+				obsx264->params.i_keyint_max = (int)knew;
+		}
+
+		obsx264->params.i_fps_num = num;
+		obsx264->params.i_fps_den = den;
+		obsx264->params.i_timebase_num = den;
+		obsx264->params.i_timebase_den = num;
+
+		if (obs_encoder_active(obsx264->encoder) && obsx264->last_keyframe_pts >= 0 && obsx264->gop_pts > 0) {
+			/* Defer the divisor change to the next shared keyframe boundary and re-open there. The encode
+			 * path fires both at target_pts: libobs switches the delivery rate exactly on that PTS and the
+			 * context re-open emits an IDR there, so the new GOP phase starts exactly on the shared grid. */
+			int64_t target = obsx264->last_keyframe_pts + obsx264->gop_pts;
+			while (target <= frame->pts)
+				target += obsx264->gop_pts;
+
+			obs_encoder_set_frame_rate_divisor_at_pts(obsx264->encoder, pending_div, target);
+			obsx264->target_pts    = target;
+			obsx264->align_pending = true;
+			info("staged FPS divisor change at shared keyframe boundary (target pts %lld, gop_pts %lld)",
+			     (long long)target, (long long)obsx264->gop_pts);
+		} else {
+			/* No on-grid cadence measured yet (change within the first GOP): apply at the next frame as a best effort.
+			 * Use the same staged mechanism (no lock) - we must NOT call obs_encoder_update_frame_rate_divisor here,
+			 * because check_fps runs on the video thread already holding the input lock and that setter would deadlock. */
+			info("no keyframe cadence observed yet; applying FPS divisor change at the next frame");
+			int64_t target = frame->pts + 1;
+			obs_encoder_set_frame_rate_divisor_at_pts(obsx264->encoder, pending_div, target);
+			obsx264->target_pts    = target;
+			obsx264->align_pending = true;
+		}
+
+		obs_encoder_set_pending_frame_rate_divisor(obsx264->encoder, 0);
+		return;
+	}
+
+	/* Fallback: detect any other effective-FPS change (e.g. a base-rate change) against the fps the context was
+	 * actually opened with, not params.i_fps (a deferred update() may have advanced params.i_fps via reconfig
+	 * without rebuilding the rate control, which a params-based comparison would miss). */
 	uint32_t num = obs_encoder_get_fps_num(obsx264->encoder);
 	uint32_t den = obs_encoder_get_fps_den(obsx264->encoder) *
 	                obs_encoder_get_frame_rate_divisor(obsx264->encoder);
 
 	if (num == 0 || den == 0)
 		return;
-	/* Compare against the fps the context was actually opened with, not params.i_fps:
-	 * a deferred update() may already have advanced params.i_fps via reconfig without
-	 * rebuilding the rate control, in which case a params-based comparison would miss
-	 * the change and the re-init would never fire. */
 	if (num == obsx264->inited_fps_num && den == obsx264->inited_fps_den)
 		return;
 
 	info("live FPS change %u/%u -> %u/%u, re-initialising x264", obsx264->inited_fps_num,
 	     obsx264->inited_fps_den, num, den);
 
-	/* Keep the keyframe interval (in seconds) constant across the rate change. When the
-	 * user set an explicit interval in seconds, recompute it for the new rate directly
-	 * (order-independent of any deferred update()); otherwise scale the current frame
-	 * count from the fps the context was opened with. */
 	if (obsx264->keyint_sec > 0) {
 		obsx264->params.i_keyint_max = obsx264->keyint_sec * (int)num / (int)den;
 	} else if (obsx264->params.i_keyint_max > 0 && obsx264->inited_fps_num != 0) {
@@ -1292,9 +1384,13 @@ static void obs_x264_check_fps(struct obs_x264 *obsx264)
 	obsx264->params.i_timebase_num = den;
 	obsx264->params.i_timebase_den = num;
 
-	obs_x264_reinit_fps(obsx264);
-	obsx264->inited_fps_num = num;
-	obsx264->inited_fps_den = den;
+	if (obs_x264_reinit_fps(obsx264)) {
+		obsx264->inited_fps_num = num;
+		obsx264->inited_fps_den = den;
+		/* The re-init emitted an off-grid IDR that re-anchored this track mid-GOP; stage a realignment so it
+		 * re-locks onto the siblings' shared keyframe grid. */
+		obs_x264_stage_grid_realignment(obsx264, frame, "FPS change");
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1347,31 +1443,10 @@ static void obs_x264_maybe_resize(struct obs_x264 *obsx264, struct encoder_frame
 	obsx264->inited_ls0    = frame->linesize[0];
 	obsx264->resize_stall  = 0;
 
-	/* Stage realignment onto the shared multitrack keyframe grid. The off-grid IDR above
-	 * re-anchors this track mid-GOP, so stage a second context re-open on the next shared
-	 * boundary (checked by PTS in obs_x264_encode). The target is the next on-grid keyframe pts,
-	 * derived from the steady-state cadence tracked before this resize. */
-	if (!obs_encoder_active(obsx264->encoder)) {
-		info("resize applied off-grid (not streaming); alignment not staged");
-		return;
-	}
-
-	if (obsx264->last_keyframe_pts < 0 || obsx264->gop_pts <= 0) {
-		info("resize applied off-grid (no keyframe cadence observed yet); alignment not staged");
-		return;
-	}
-
-	/* last_keyframe_pts is the most recent on-grid keyframe before this frame, so the next
-	 * shared boundary is one GOP later. This frame's pts sits between them, so the target is
-	 * strictly ahead of us (defensively bump it forward if a deep pipeline has already passed it). */
-	int64_t target = obsx264->last_keyframe_pts + obsx264->gop_pts;
-	while (target <= frame->pts)
-		target += obsx264->gop_pts;
-
-	obsx264->target_pts    = target;
-	obsx264->align_pending = true;
-	info("staged resize realignment - re-opening at next shared boundary (target pts %lld, gop_pts %lld)",
-	     (long long)target, (long long)obsx264->gop_pts);
+	/* Stage realignment onto the shared multitrack keyframe grid. The off-grid IDR above re-anchors
+	 * this track mid-GOP, so stage a second context re-open on the next shared boundary (checked by
+	 * PTS in obs_x264_encode). */
+	obs_x264_stage_grid_realignment(obsx264, frame, "resize");
 }
 
 static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct encoder_packet *packet,
@@ -1391,7 +1466,7 @@ static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct enco
 	if (!obsx264->context)
 		return false;
 
-	obs_x264_check_fps(obsx264);
+	obs_x264_check_fps(obsx264, frame);
 	if (!obsx264->context)
 		return false;
 
@@ -1409,12 +1484,17 @@ static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct enco
 	 * i_type, which x264 does not reliably honour mid-GOP). */
 	if (obsx264->align_pending && frame->pts >= obsx264->target_pts) {
 		obsx264->align_pending = false;
-		info("resize realignment: re-opening context at shared keyframe boundary (pts %lld, target %lld)",
+		info("realignment: re-opening context at shared keyframe boundary (pts %lld, target %lld)",
 		     (long long)frame->pts, (long long)obsx264->target_pts);
 		if (!obs_x264_reopen_context(obsx264)) {
-			err("resize realignment re-open failed - restart required");
+			err("realignment re-open failed - restart required");
 			return false;
 		}
+		/* Refresh the fps the context was opened with so a subsequent live change is detected against the new
+		 * values (params.i_fps already hold them; this covers the boundary-aligned FPS path where the divisor
+		 * only just took effect). */
+		obsx264->inited_fps_num = (uint32_t)obsx264->params.i_fps_num;
+		obsx264->inited_fps_den = (uint32_t)obsx264->params.i_fps_den;
 	}
 
 	init_pic_data(obsx264, &pic, frame);

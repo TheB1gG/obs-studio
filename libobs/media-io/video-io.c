@@ -56,6 +56,12 @@ struct video_input {
 	uint32_t frame_rate_divisor;
 	uint32_t frame_rate_divisor_counter;
 
+	// A divisor change staged via video_output_set_pending_frame_rate_divisor(). When non-zero it is applied
+	// inline in video_output_cur_frame (resetting the counter) on the next frame, so a live per-track rate change
+	// can be made to take effect exactly on a shared keyframe boundary. Written lock-free from the connection's own
+	// callback; read here under input_mutex.
+	uint32_t pending_frame_rate_divisor;
+
 	void (*callback)(void *param, struct video_data *frame);
 	void *param;
 };
@@ -144,6 +150,16 @@ static inline bool video_output_cur_frame(struct video_output *video)
 	for (size_t i = 0; i < video->inputs.num; i++) {
 		struct video_input *input = video->inputs.array + i;
 		struct video_data frame = frame_info->frame;
+
+		// Apply a divisor change staged via video_output_set_pending_frame_rate_divisor(). It is applied here,
+		// under input_mutex, right before the skip logic so this frame becomes the first one delivered at the new
+		// rate (the counter is reset to 0). This lets a live per-track rate change take effect exactly on a shared
+		// keyframe boundary (see obs_encoder_set_frame_rate_divisor_at_pts).
+		if (input->pending_frame_rate_divisor) {
+			input->frame_rate_divisor = input->pending_frame_rate_divisor;
+			input->frame_rate_divisor_counter = 0;
+			input->pending_frame_rate_divisor = 0;
+		}
 
 		// an explicit counter is used instead of remainder calculation
 		// to allow multiple encoders started at the same time to start on
@@ -515,6 +531,27 @@ bool video_output_set_frame_rate_divisor(video_t *video, uint32_t frame_rate_div
 	pthread_mutex_unlock(&video->input_mutex);
 
 	return found;
+}
+
+void video_output_set_pending_frame_rate_divisor(video_t *video, uint32_t frame_rate_divisor,
+		void (*callback)(void *param, struct video_data *frame), void *param)
+{
+	if (!video || !callback || frame_rate_divisor == 0)
+		return;
+
+	video = get_root(video);
+
+	// No lock is taken: this is called from within the connection's own callback (receive_video), which already
+	// runs under input_mutex in video_output_cur_frame, so locking here would deadlock. The inputs array is stable
+	// while streaming (connections are not added/removed mid-stream), so a single pass to find the matching input
+	// and a single 32-bit store are safe. The staged divisor is consumed by video_output_cur_frame on the next frame.
+	for (size_t i = 0; i < video->inputs.num; i++) {
+		struct video_input *input = video->inputs.array + i;
+		if (input->callback == callback && input->param == param) {
+			input->pending_frame_rate_divisor = frame_rate_divisor;
+			return;
+		}
+	}
 }
 
 bool video_output_active(const video_t *video)

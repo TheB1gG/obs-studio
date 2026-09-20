@@ -1250,6 +1250,10 @@ static inline void obs_encoder_start_internal(obs_encoder_t *encoder, encoded_ca
 		pause_reset(&encoder->pause);
 
 		encoder->cur_pts = 0;
+		// A fresh stream starts clean: drop any divisor change staged mid-stream so it is not re-applied on top
+		// of the rate already configured for this start.
+		encoder->pending_frame_rate_divisor = 0;
+		encoder->staged_frame_rate_divisor = 0;
 		add_connection(encoder);
 	}
 }
@@ -1749,6 +1753,52 @@ bool obs_encoder_update_frame_rate_divisor(obs_encoder_t *encoder, uint32_t fram
 	return true;
 }
 
+// Records a desired live per-track frame-rate divisor without applying it yet. The value is picked up by the
+// encoder plugin (via obs_encoder_get_pending_frame_rate_divisor), which stages the actual change on a shared
+// keyframe boundary with obs_encoder_set_frame_rate_divisor_at_pts. A value of 0 clears any pending request.
+void obs_encoder_set_pending_frame_rate_divisor(obs_encoder_t *encoder, uint32_t frame_rate_divisor)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_set_pending_frame_rate_divisor"))
+		return;
+	if (encoder->info.type != OBS_ENCODER_VIDEO) {
+		blog(LOG_WARNING,
+		     "obs_encoder_set_pending_frame_rate_divisor: encoder '%s' is not a video encoder",
+		     obs_encoder_get_name(encoder));
+		return;
+	}
+
+	encoder->pending_frame_rate_divisor = frame_rate_divisor;
+}
+
+uint32_t obs_encoder_get_pending_frame_rate_divisor(const obs_encoder_t *encoder)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_get_pending_frame_rate_divisor"))
+		return 0;
+	return encoder->pending_frame_rate_divisor;
+}
+
+// Stages a live per-track frame-rate divisor change so that it takes effect exactly when the encoder's synthetic
+// PTS (cur_pts) reaches target_cur_pts. Used by multitrack to apply an FPS/divisor change on a shared keyframe
+// boundary, keeping every track's keyframes aligned (a naive immediate change shifts cur_pts by an arbitrary
+// amount because the skip counter is reset without frame-boundary synchronisation). The actual skip-counter reset
+// and cur_pts rate switch happen on the video thread in receive_video() once cur_pts >= target_cur_pts.
+bool obs_encoder_set_frame_rate_divisor_at_pts(obs_encoder_t *encoder, uint32_t frame_rate_divisor,
+		int64_t target_cur_pts)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_set_frame_rate_divisor_at_pts"))
+		return false;
+	if (encoder->info.type != OBS_ENCODER_VIDEO || frame_rate_divisor == 0) {
+		blog(LOG_WARNING,
+		     "obs_encoder_set_frame_rate_divisor_at_pts: encoder '%s' is not an active video encoder",
+		     obs_encoder_get_name(encoder));
+		return false;
+	}
+
+	encoder->staged_frame_rate_divisor = frame_rate_divisor;
+	encoder->staged_frame_rate_divisor_target = target_cur_pts;
+	return true;
+}
+
 uint32_t obs_encoder_get_sample_rate(const obs_encoder_t *encoder)
 {
 	if (!obs_encoder_valid(encoder, "obs_encoder_get_sample_rate"))
@@ -2189,6 +2239,28 @@ static void receive_video(void *param, struct video_data *frame)
 
 	if (video_pause_check(&encoder->pause, frame->timestamp))
 		goto wait_for_audio;
+
+	// Apply a staged live frame-rate divisor change exactly on its target PTS (a shared multitrack keyframe
+	// boundary). We are on the video thread and already under input_mutex (receive_video is invoked from
+	// video_output_cur_frame), so the skip-counter reset is staged lock-free for this connection and consumed by
+	// video_output_cur_frame on the next frame, while the cur_pts advance rate switches to the new divisor from
+	// this frame onward. The net effect is that the first post-change frame sits exactly on the target grid point,
+	// keeping this track's keyframes aligned with its sibling encoders (see obs_encoder_set_frame_rate_divisor_at_pts).
+	if (encoder->staged_frame_rate_divisor &&
+	    encoder->cur_pts >= encoder->staged_frame_rate_divisor_target) {
+		uint32_t div = encoder->staged_frame_rate_divisor;
+		if (!gpu_encode_available(encoder))
+			video_output_set_pending_frame_rate_divisor(encoder->media, div, receive_video, encoder);
+		encoder->frame_rate_divisor = div;
+		encoder->frame_rate_divisor_counter = 0;
+		if (encoder->fps_override) {
+			video_output_free_frame_rate_divisor(encoder->fps_override);
+			encoder->fps_override = NULL;
+		}
+		if (encoder->media)
+			encoder->fps_override = video_output_create_with_frame_rate_divisor(encoder->media, div);
+		encoder->staged_frame_rate_divisor = 0;
+	}
 
 	memset(&enc_frame, 0, sizeof(struct encoder_frame));
 

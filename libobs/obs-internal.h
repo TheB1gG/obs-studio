@@ -1342,6 +1342,17 @@ struct obs_encoder {
 	uint32_t frame_rate_divisor_counter; // only used for GPU encoders
 	video_t *fps_override;
 
+	// A live per-track frame-rate divisor change staged via obs_encoder_set_frame_rate_divisor_at_pts() to take
+	// effect exactly when cur_pts reaches staged_frame_rate_divisor_target (a shared multitrack keyframe boundary).
+	// Applied on the video thread in receive_video(); 0 in staged_frame_rate_divisor means none is armed.
+	uint32_t staged_frame_rate_divisor;
+	int64_t staged_frame_rate_divisor_target;
+
+	// A divisor change requested by the caller via obs_encoder_set_pending_frame_rate_divisor() but not yet picked up
+	// by the encoder plugin (which reads it with obs_encoder_get_pending_frame_rate_divisor and stages it on a shared
+	// keyframe boundary). Distinct from staged_frame_rate_divisor, which is the armed-for-application state. 0 = none.
+	uint32_t pending_frame_rate_divisor;
+
 	// Number of frames successfully encoded
 	uint32_t encoded_frames;
 
