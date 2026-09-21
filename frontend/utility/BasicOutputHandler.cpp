@@ -453,9 +453,27 @@ std::shared_future<void> BasicOutputHandler::SetupMultitrackVideo(obs_service_t 
 	bool is_custom = strncmp("rtmp_custom", obs_service_get_type(service), 11) == 0;
 
 	std::optional<std::string> custom_config = std::nullopt;
-	if (config_get_bool(main->Config(), "Stream1", "MultitrackVideoConfigOverrideEnabled"))
-		custom_config = DeserializeConfigText(
-			config_get_string(main->Config(), "Stream1", "MultitrackVideoConfigOverride"));
+	{
+		int active_source = 1; // None
+		if (config_has_user_value(main->Config(), "Stream1", "MultitrackVideoConfigOverrideActiveSource"))
+			active_source = config_get_int(main->Config(), "Stream1", "MultitrackVideoConfigOverrideActiveSource");
+
+		if (active_source == 0 || active_source == 2) {
+			// A preset is active: use its saved JSON, ignoring the enable checkbox and the config override box.
+			const std::string key = "MultitrackVideoConfigOverridePreset" + std::to_string(active_source == 0 ? 1 : 2);
+			if (config_has_user_value(main->Config(), "Stream1", key.c_str())) {
+				const char *raw = config_get_string(main->Config(), "Stream1", key.c_str());
+				std::string json = raw ? DeserializeConfigText(raw) : std::string();
+				if (!json.empty())
+					custom_config = json;
+			}
+		} else {
+			// None: original behavior — go-live API, or the config override box when "Enable config override" is on.
+			if (config_get_bool(main->Config(), "Stream1", "MultitrackVideoConfigOverrideEnabled"))
+				custom_config = DeserializeConfigText(
+					config_get_string(main->Config(), "Stream1", "MultitrackVideoConfigOverride"));
+		}
+	}
 
 	std::optional<QString> extraCanvasUUID;
 	const char *uuid = config_get_string(main->Config(), "Stream1", "MultitrackExtraCanvas");

@@ -2,6 +2,8 @@
 #include "OBSBasic.hpp"
 #include "qt-wrappers.hpp"
 
+#include <QButtonGroup>
+
 #include "moc_OBSBasicControls.cpp"
 
 OBSBasicControls::OBSBasicControls(OBSBasic *main) : QFrame(nullptr), ui(new Ui::OBSBasicControls)
@@ -48,6 +50,23 @@ OBSBasicControls::OBSBasicControls(OBSBasic *main) : QFrame(nullptr), ui(new Ui:
 	connect(
 		ui->streamSkullButton, &QPushButton::clicked, this,
 		[this]() { emit this->KillStreamButtonClicked(); }, Qt::DirectConnection);
+
+	connect(
+		ui->configOverridePreset1Button, &QPushButton::clicked, this,
+		[this]() { emit this->ConfigOverridePresetClicked(0); }, Qt::DirectConnection);
+	connect(
+		ui->configOverrideNoneButton, &QPushButton::clicked, this,
+		[this]() { emit this->ConfigOverridePresetClicked(1); }, Qt::DirectConnection);
+	connect(
+		ui->configOverridePreset2Button, &QPushButton::clicked, this,
+		[this]() { emit this->ConfigOverridePresetClicked(2); }, Qt::DirectConnection);
+
+	/* Config override preset toggles: exclusive so the applied preset stays highlighted */
+	QButtonGroup *preset_group = new QButtonGroup(this);
+	preset_group->setExclusive(true);
+	preset_group->addButton(ui->configOverridePreset1Button, 0);
+	preset_group->addButton(ui->configOverrideNoneButton, 1);
+	preset_group->addButton(ui->configOverridePreset2Button, 2);
 
 	/* Transfer menu actions signals as OBSBasicControls signals */
 	connect(
@@ -292,4 +311,18 @@ void OBSBasicControls::EnableVirtualCamButtons()
 {
 	ui->virtualCamButton->setVisible(true);
 	ui->virtualCamConfigButton->setVisible(true);
+}
+
+void OBSBasicControls::SetConfigOverridePresetActive(int index)
+{
+	ui->configOverridePreset1Button->setChecked(index == 0);
+	ui->configOverrideNoneButton->setChecked(index == 1);
+	ui->configOverridePreset2Button->setChecked(index == 2);
+}
+
+void OBSBasicControls::SetConfigOverridePresetVisible(bool visible)
+{
+	ui->configOverridePreset1Button->setVisible(visible);
+	ui->configOverrideNoneButton->setVisible(visible);
+	ui->configOverridePreset2Button->setVisible(visible);
 }

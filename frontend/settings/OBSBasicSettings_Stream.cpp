@@ -175,6 +175,17 @@ void OBSBasicSettings::LoadStream1Settings()
 				config_get_string(main->Config(), "Stream1", "MultitrackVideoConfigOverride"))
 				.c_str());
 
+	{
+		QPlainTextEdit *preset_edits[2] = {ui->multitrackVideoConfigOverridePreset1,
+		                                   ui->multitrackVideoConfigOverridePreset2};
+		for (int i = 0; i < 2; i++) {
+			const std::string key = "MultitrackVideoConfigOverridePreset" + std::to_string(i + 1);
+			if (config_has_user_value(main->Config(), "Stream1", key.c_str()))
+				preset_edits[i]->setPlainText(
+					DeserializeConfigText(config_get_string(main->Config(), "Stream1", key.c_str())).c_str());
+		}
+	}
+
 	ui->multitrackVideoAdditionalCanvas->clear();
 	ui->multitrackVideoAdditionalCanvas->addItem(QTStr("None"));
 	for (const auto &canvas : main->GetCanvases()) {
@@ -364,6 +375,14 @@ void OBSBasicSettings::SaveStream1Settings()
 	SaveCheckBox(ui->multitrackVideoStreamDumpEnable, "Stream1", "MultitrackVideoStreamDumpEnabled");
 	SaveCheckBox(ui->multitrackVideoConfigOverrideEnable, "Stream1", "MultitrackVideoConfigOverrideEnabled");
 	SaveText(ui->multitrackVideoConfigOverride, "Stream1", "MultitrackVideoConfigOverride");
+	{
+		QPlainTextEdit *preset_edits[2] = {ui->multitrackVideoConfigOverridePreset1,
+		                                   ui->multitrackVideoConfigOverridePreset2};
+		for (int i = 0; i < 2; i++) {
+			const std::string key = "MultitrackVideoConfigOverridePreset" + std::to_string(i + 1);
+			SaveText(preset_edits[i], "Stream1", key.c_str());
+		}
+	}
 	SaveComboData(ui->multitrackVideoAdditionalCanvas, "Stream1", "MultitrackExtraCanvas");
 
 	// While a multitrack video stream is active, apply safe changes to it live; everything else that was saved above

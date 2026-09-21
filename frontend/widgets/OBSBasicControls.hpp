@@ -53,6 +53,9 @@ public:
 	OBSBasicControls(OBSBasic *main);
 	inline ~OBSBasicControls() {}
 
+	void SetConfigOverridePresetActive(int index);
+	void SetConfigOverridePresetVisible(bool visible);
+
 signals:
 	void StreamButtonClicked();
 	void KillStreamButtonClicked();
@@ -65,6 +68,7 @@ signals:
 	void VirtualCamConfigButtonClicked();
 	void StudioModeButtonClicked();
 	void SettingsButtonClicked();
+	void ConfigOverridePresetClicked(int index);
 
 	void StartStreamMenuActionClicked();
 	void StopStreamMenuActionClicked();

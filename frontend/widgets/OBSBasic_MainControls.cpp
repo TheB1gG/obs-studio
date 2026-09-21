@@ -204,6 +204,8 @@ void OBSBasic::on_action_Settings_triggered()
 
 	settings_already_executing = false;
 
+	UpdateConfigOverridePresetDock();
+
 	if (restart) {
 		QMessageBox::StandardButton button =
 			OBSMessageBox::question(this, QTStr("Restart"), QTStr("NeedsRestart"));

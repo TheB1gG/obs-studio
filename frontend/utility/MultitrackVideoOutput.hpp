@@ -42,6 +42,10 @@ public:
 	// Returns false when nothing was applied; *failure_reason then describes why (and the stream is untouched).
 	bool ApplyConfigOverride(const std::string &custom_config_json, std::string *failure_reason);
 
+	// Returns the original go-live API config JSON captured when this stream started (empty if none was fetched),
+	// so the "None" dock source can re-apply it to a running stream without restarting.
+	std::string GetGoLiveConfigJson();
+
 	OBSOutputAutoRelease StreamingOutput()
 	{
 		const std::lock_guard current_lock{current_mutex};
@@ -60,6 +64,7 @@ private:
 		OBSSignal start_signal, stop_signal;
 		std::vector<OBSCanvasAutoRelease> canvases;
 		std::string config_json_; // active go-live/custom config JSON (reference for live apply diffs)
+		std::string go_live_config_json_; // original go-live API config, so "None" can revert a running stream
 	};
 
 	std::optional<OBSOutputObjects> take_current();

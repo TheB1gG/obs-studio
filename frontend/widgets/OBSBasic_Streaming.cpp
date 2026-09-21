@@ -18,6 +18,7 @@
 ******************************************************************************/
 
 #include "OBSBasic.hpp"
+#include "OBSBasicControls.hpp"
 
 #include <components/UIValidation.hpp>
 #ifdef YOUTUBE_ENABLED
@@ -513,3 +514,116 @@ bool OBSBasic::ApplyMultitrackConfigOverride(const std::string &json, std::strin
 
 	return outputHandler->multitrackVideo->ApplyConfigOverride(json, failure_reason);
 }
+
+extern std::string DeserializeConfigText(const char *value);
+
+void OBSBasic::ApplyMultitrackConfigOverridePreset(int index)
+{
+	if (index < 0 || index > 2)
+		return;
+
+	config_t *config = Config();
+	if (!config)
+		return;
+
+	const bool stream_active =
+		outputHandler && outputHandler->multitrackVideo && outputHandler->multitrackVideoActive;
+
+	auto set_active = [&](int active_index) {
+		config_set_int(config, "Stream1", "MultitrackVideoConfigOverrideActiveSource", active_index);
+		if (controlsDock) {
+			if (auto *controls = controlsDock->findChild<OBSBasicControls *>())
+				controls->SetConfigOverridePresetActive(active_index);
+		}
+	};
+
+	// "None": fall back to the default behavior (go-live API, or the config override box when enabled). The
+	// enable checkbox and the JSON box are left untouched.
+	if (index == 1) {
+		set_active(1);
+
+		if (!stream_active)
+			return;
+
+		// Mirror the stream-start resolution for "None": the config override box when enabled, otherwise go-live.
+		std::string json;
+		if (config_get_bool(config, "Stream1", "MultitrackVideoConfigOverrideEnabled")) {
+			const char *raw = config_get_string(config, "Stream1", "MultitrackVideoConfigOverride");
+			json = raw ? DeserializeConfigText(raw) : std::string();
+		}
+		if (json.empty())
+			json = outputHandler->multitrackVideo->GetGoLiveConfigJson();
+
+		if (json.empty()) {
+			QMessageBox::information(this, QTStr("Basic.Settings.Stream.MultitrackVideoLabel"),
+				QString("No config override is available to apply live; the default settings apply on restart."));
+			return;
+		}
+
+		std::string reason;
+		if (!ApplyMultitrackConfigOverride(json, &reason)) {
+			QString msg = QString("The config override could not be applied to the running stream: %1")
+					.arg(QString::fromStdString(reason));
+			QMessageBox::warning(this, QTStr("Basic.Settings.Stream.MultitrackVideoLabel"), msg);
+		}
+		return;
+	}
+
+	// Preset 1 (index 0) / Preset 2 (index 2): use that preset's JSON, ignoring the enable checkbox and box.
+	const int preset_number = (index == 0) ? 1 : 2;
+	const std::string preset_key = "MultitrackVideoConfigOverridePreset" + std::to_string(preset_number);
+
+	std::string json;
+	if (config_has_user_value(config, "Stream1", preset_key.c_str())) {
+		const char *raw = config_get_string(config, "Stream1", preset_key.c_str());
+		json = raw ? DeserializeConfigText(raw) : std::string();
+	}
+
+	if (json.empty()) {
+		QMessageBox::warning(this, QTStr("Basic.Settings.Stream.MultitrackVideoLabel"),
+		                     QString("Config override preset %1 has not been set.\nSet it in Settings -> Stream.")
+			                     .arg(preset_number));
+		return;
+	}
+
+	set_active(index);
+
+	// Apply live only when a multitrack video stream is actually running; otherwise it is saved for the next start.
+	if (!stream_active)
+		return;
+
+	std::string reason;
+	if (!ApplyMultitrackConfigOverride(json, &reason))
+		QMessageBox::warning(this, QTStr("Basic.Settings.Stream.MultitrackVideoLabel"),
+		                      QString("The config override preset could not be applied to the running stream: %1")
+			                      .arg(QString::fromStdString(reason)));
+}
+
+void OBSBasic::UpdateConfigOverridePresetDock()
+{
+	if (!controlsDock)
+		return;
+
+	auto *controls = controlsDock->findChild<OBSBasicControls *>();
+	if (!controls)
+		return;
+
+	config_t *config = Config();
+	if (!config)
+		return;
+
+	// Only show the preset toggles when enhanced broadcasting (multitrack video) is enabled.
+	const bool multitrack_enabled = config_get_bool(config, "Stream1", "EnableMultitrackVideo");
+	controls->SetConfigOverridePresetVisible(multitrack_enabled);
+	if (!multitrack_enabled)
+		return;
+
+	// Restore the highlighted toggle (the persisted active source, default None).
+	int active = 1; // None
+	if (config_has_user_value(config, "Stream1", "MultitrackVideoConfigOverrideActiveSource"))
+		active = config_get_int(config, "Stream1", "MultitrackVideoConfigOverrideActiveSource");
+	if (active < 0 || active > 2)
+		active = 1;
+	controls->SetConfigOverridePresetActive(active);
+}
+

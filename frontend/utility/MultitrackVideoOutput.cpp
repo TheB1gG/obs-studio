@@ -524,6 +524,9 @@ void MultitrackVideoOutput::PrepareStreaming(
 	// Stored with the output objects so live applies can diff against what is actually running.
 	std::string active_override_json = nlohmann::json(output_config).dump();
 
+	// The original go-live API config, kept for the life of the stream so "None" can revert a running stream to it.
+	std::string go_live_override_json = go_live_config ? nlohmann::json(*go_live_config).dump() : std::string();
+
 	std::vector<OBSEncoderAutoRelease> audio_encoders;
 	std::shared_ptr<obs_encoder_group_t> video_encoder_group;
 	auto outputs = SetupOBSOutput(parent, multitrack_video_name, dump_stream_to_file_config, output_config,
@@ -583,6 +586,7 @@ void MultitrackVideoOutput::PrepareStreaming(
 				std::move(stop_recording),
 				std::move(recording_canvases),
 				active_override_json,
+				go_live_override_json,
 			});
 		}
 	}
@@ -597,6 +601,7 @@ void MultitrackVideoOutput::PrepareStreaming(
 		std::move(stop_streaming),
 		std::move(canvases),
 		active_override_json,
+		go_live_override_json,
 	});
 }
 
@@ -1000,6 +1005,12 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 
 	blog(LOG_INFO, "MultitrackVideoOutput: applied live config override changes to the active stream");
 	return true;
+}
+
+std::string MultitrackVideoOutput::GetGoLiveConfigJson()
+{
+	const std::lock_guard current_lock{current_mutex};
+	return current ? current->go_live_config_json_ : std::string();
 }
 
 signal_handler_t *MultitrackVideoOutput::StreamingSignalHandler()

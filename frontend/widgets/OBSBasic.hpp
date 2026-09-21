@@ -1379,6 +1379,15 @@ public slots:
 	// MultitrackVideoOutput::ApplyConfigOverride). Returns false when no change was applied.
 	bool ApplyMultitrackConfigOverride(const std::string &json, std::string *failure_reason);
 
+	// Applies one of the saved multitrack video config override presets (selected via the controls dock preset
+	// toggles), or selects "None" to fall back to the default behavior. Persists the active source and applies it
+	// live when a stream is running.
+	void ApplyMultitrackConfigOverridePreset(int index);
+
+	// Shows/hides the config override preset toggles in the controls dock based on whether enhanced broadcasting
+	// (EnableMultitrackVideo) is enabled, and restores the highlighted toggle (the persisted active source).
+	void UpdateConfigOverridePresetDock();
+
 private slots:
 	/* Stream action (start/stop) slot */
 	void StreamActionTriggered();

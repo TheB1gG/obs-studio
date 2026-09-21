@@ -2077,6 +2077,41 @@
                      </property>
                     </widget>
                    </item>
+                    <item row="8" column="0">
+                     <widget class="QLabel" name="multitrackVideoConfigOverridePreset1Label">
+                      <property name="text">
+                       <string>Preset 1</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="8" column="1">
+                     <widget class="QPlainTextEdit" name="multitrackVideoConfigOverridePreset1">
+                      <property name="maximumSize">
+                       <size>
+                        <width>16777215</width>
+                        <height>80</height>
+                       </size>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="9" column="0">
+                     <widget class="QLabel" name="multitrackVideoConfigOverridePreset2Label">
+                      <property name="text">
+                       <string>Preset 2</string>
+                      </property>
+                     </widget>
+                    </item>
+                    <item row="9" column="1">
+                     <widget class="QPlainTextEdit" name="multitrackVideoConfigOverridePreset2">
+                      <property name="maximumSize">
+                       <size>
+                        <width>16777215</width>
+                        <height>80</height>
+                       </size>
+                      </property>
+                     </widget>
+                    </item>
+
                    <item row="4" column="0">
                     <widget class="QLabel" name="multitrackVideoAdditionalCanvasLabel">
                      <property name="text">

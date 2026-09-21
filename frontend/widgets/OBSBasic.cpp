@@ -53,6 +53,7 @@
 #include <qt-wrappers.hpp>
 
 #include <QActionGroup>
+#include <QTimer>
 #include <QThread>
 #include <QWidgetAction>
 
@@ -287,6 +288,12 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	connect(controls, &OBSBasicControls::StudioModeButtonClicked, this, &OBSBasic::TogglePreviewProgramMode);
 
 	connect(controls, &OBSBasicControls::SettingsButtonClicked, this, &OBSBasic::on_action_Settings_triggered);
+
+	connect(controls, &OBSBasicControls::ConfigOverridePresetClicked, this,
+	        &OBSBasic::ApplyMultitrackConfigOverridePreset);
+
+	/* Refresh the config override preset dock once initialization (and config loading) has completed. */
+	QTimer::singleShot(0, this, [this]() { UpdateConfigOverridePresetDock(); });
 
 	startingDockLayout = saveState();
 
