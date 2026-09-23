@@ -80,6 +80,14 @@ struct nvenc_data {
 	bool can_change_bitrate;
 	bool non_texture;
 
+	/* NVENC bakes its SPS/VUI at create() time, before the delivery mix is bound to
+	 * encoder->media, so the identity-RGB VUI override in init_encoder_* may miss RGB
+	 * encodes. vui_identity_applied records what the SPS was generated with; the
+	 * first-encode path re-checks and, if RGB turned out active, regenerates the SPS
+	 * via reconfigure (see nvenc_encode_base). */
+	bool vui_identity_applied;
+	bool vui_identity_checked;
+
 	DARRAY(struct handle_tex) input_textures;
 	DARRAY(struct nv_bitstream) bitstreams;
 	DARRAY(struct nv_cuda_surface) surfaces;

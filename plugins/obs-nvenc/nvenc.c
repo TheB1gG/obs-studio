@@ -778,6 +778,46 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 	return true;
 }
 
+/* True when this encoder is delivering an identity-RGB texture (GBRA/GBR10), i.e. raw
+ * G/B/R samples with no YUV transform. Such encodes can only carry a valid VUI of the
+ * identity (RGB) matrix, full range, unspecified primaries/transfer - anything else
+ * conflicts with the colr box the muxer writes. */
+static bool nvenc_identity_rgb_active(const struct nvenc_data *enc)
+{
+	return obs_encoder_video_tex_active(enc->encoder, VIDEO_FORMAT_GBRA) ||
+	       obs_encoder_video_tex_active(enc->encoder, VIDEO_FORMAT_GBR10);
+}
+
+/* Force the active codec's VUI to the identity-RGB description above. NVENC generates its
+ * SPS/VUI at create() time - before the delivery mix is bound - so this may need
+ * (re)applying once the texture format is actually known, after which the SPS is
+ * regenerated via apply_nvenc_reconfigure(). */
+static void nvenc_apply_identity_vui(struct nvenc_data *enc)
+{
+	NV_ENC_CONFIG *config = &enc->config;
+
+	switch (enc->codec) {
+	case CODEC_H264: {
+		NV_ENC_CONFIG_H264_VUI_PARAMETERS *v = &config->encodeCodecConfig.h264Config.h264VUIParameters;
+		v->videoFullRangeFlag      = 1;
+		v->colourPrimaries         = NV_ENC_VUI_COLOR_PRIMARIES_UNSPECIFIED;
+		v->transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_UNSPECIFIED;
+		v->colourMatrix            = NV_ENC_VUI_MATRIX_COEFFS_RGB;
+		break;
+	}
+	case CODEC_HEVC: {
+		NV_ENC_CONFIG_HEVC_VUI_PARAMETERS *v = &config->encodeCodecConfig.hevcConfig.hevcVUIParameters;
+		v->videoFullRangeFlag      = 1;
+		v->colourPrimaries         = NV_ENC_VUI_COLOR_PRIMARIES_UNSPECIFIED;
+		v->transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_UNSPECIFIED;
+		v->colourMatrix            = NV_ENC_VUI_MATRIX_COEFFS_RGB;
+		break;
+	}
+	default:
+		break;
+	}
+}
+
 static bool init_encoder_h264(struct nvenc_data *enc, obs_data_t *settings)
 {
 	bool lossless = strcmp(enc->props.rate_control, "lossless") == 0;
@@ -832,11 +872,18 @@ static bool init_encoder_h264(struct nvenc_data *enc, obs_data_t *settings)
 	case VIDEO_CS_SRGB:
 		vui_params->colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
 		vui_params->transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SRGB;
-		vui_params->colourMatrix = use_identity ? NV_ENC_VUI_MATRIX_COEFFS_RGB : NV_ENC_VUI_MATRIX_COEFFS_BT709;
+		vui_params->colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
 		break;
 	default:
 		break;
 	}
+
+	/* Identity-RGB (GBRA/GBR10): samples are raw G/B/R with no YUV transform, so the only valid VUI is
+	 * the identity (RGB) matrix + full range with primaries/transfer unspecified. Mirror the obs-x264
+	 * identity-RGB path so both encoders tag RGB identically. */
+	if (use_identity)
+		nvenc_apply_identity_vui(enc);
+	enc->vui_identity_applied = use_identity;
 
 	if (lossless) {
 		h264_config->qpPrimeYZeroTransformBypassFlag = 1;
@@ -939,7 +986,7 @@ static bool init_encoder_hevc(struct nvenc_data *enc, obs_data_t *settings)
 	case VIDEO_CS_SRGB:
 		vui_params->colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
 		vui_params->transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SRGB;
-		vui_params->colourMatrix = use_identity ? NV_ENC_VUI_MATRIX_COEFFS_RGB : NV_ENC_VUI_MATRIX_COEFFS_BT709;
+		vui_params->colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
 		break;
 	case VIDEO_CS_2100_PQ:
 		vui_params->colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
@@ -957,6 +1004,13 @@ static bool init_encoder_hevc(struct nvenc_data *enc, obs_data_t *settings)
 		vui_params->chromaSampleLocationTop = 2;
 		vui_params->chromaSampleLocationBot = 2;
 	}
+
+	/* Identity-RGB (GBRA/GBR10): samples are raw G/B/R with no YUV transform, so the only valid VUI is
+	 * the identity (RGB) matrix + full range with primaries/transfer unspecified. Mirror the obs-x264
+	 * identity-RGB path so both encoders tag RGB identically. */
+	if (use_identity)
+		nvenc_apply_identity_vui(enc);
+	enc->vui_identity_applied = use_identity;
 
 	if (astrcmpi(enc->props.rate_control, "cbr") == 0) {
 		hevc_config->outputBufferingPeriodSEI = 1;
@@ -1638,6 +1692,26 @@ static void add_roi(struct nvenc_data *enc, NV_ENC_PIC_PARAMS *params)
 bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pic, int64_t pts,
 		       struct encoder_packet *packet, bool *received_packet)
 {
+	/* NVENC bakes its SPS/VUI at create() time, before the delivery mix is bound to
+	 * encoder->media, so the identity-RGB VUI override in init_encoder_* can miss RGB
+	 * encodes (obs_encoder_video_tex_active() not yet true). By the first encode the
+	 * texture format is known; if identity-RGB applies now but the SPS was generated
+	 * without it, regenerate the SPS via reconfigure so the VUI matches the colr box
+	 * the muxer writes (avoids conflicting MediaInfo *_Original tags). */
+	if (!enc->vui_identity_checked) {
+		enc->vui_identity_checked = true;
+		if (!enc->non_texture && (enc->codec == CODEC_H264 || enc->codec == CODEC_HEVC)) {
+			const bool identity_now = nvenc_identity_rgb_active(enc);
+			if (identity_now && !enc->vui_identity_applied) {
+				info("nvenc: identity-RGB active but SPS lacks RGB VUI; reconfiguring to "
+				     "regenerate SPS with identity-RGB VUI");
+				nvenc_apply_identity_vui(enc);
+				if (apply_nvenc_reconfigure(enc))
+					enc->vui_identity_applied = true;
+			}
+		}
+	}
+
 	/* Count submissions since last observed IDR. get_encoded_packet() */
 	/* only starts returning packets once buffers_queued reaches       */
 	/* output_delay, so in steady state exactly output_delay - 1      */

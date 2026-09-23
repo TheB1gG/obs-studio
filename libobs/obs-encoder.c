@@ -297,10 +297,13 @@ static enum encoder_mix_acquire acquire_encoder_only_mix(struct obs_encoder *enc
 			encoder_info.width = obs_encoder_get_width(encoder);
 			encoder_info.height = obs_encoder_get_height(encoder);
 
-			/* Ask the encoder to remap our format to its texture equivalent (e.g. I444->AYUV).
-			 * This needs a live context; before create() we keep the requested format as-is,
-			 * which is already a texture-encodable layout for the explicit-preference path. */
-			if (encoder->context.data && encoder->info.get_video_info)
+			/* Ask the encoder to remap our format to its texture equivalent (e.g. I444->AYUV,
+			 * BGRA->GBRA). Texture encoders used on this path (NVENC/QSV) tolerate a NULL
+			 * context, so we can remap even pre-create() when maybe_pre_bind_texture_mix()
+			 * binds the mix before the encoder context exists. Without this, an explicit RGB
+			 * preference (BGRA) is never remapped to its GBRA texture layout and the
+			 * shared-texture mix cannot be created, forcing a non-texture YUV fallback. */
+			if (encoder->info.get_video_info)
 				encoder->info.get_video_info(encoder->context.data, &encoder_info);
 
 			/* The encoder callback may have remapped our format to its texture equivalent. */

@@ -146,40 +146,58 @@ static void add_video_encoder_params(struct ffmpeg_muxer *stream, os_process_arg
 
 	obs_data_release(settings);
 
-	enum AVColorPrimaries pri = AVCOL_PRI_UNSPECIFIED;
-	enum AVColorTransferCharacteristic trc = AVCOL_TRC_UNSPECIFIED;
-	enum AVColorSpace spc = AVCOL_SPC_UNSPECIFIED;
-	switch (info->colorspace) {
-	case VIDEO_CS_601:
-		pri = AVCOL_PRI_SMPTE170M;
-		trc = AVCOL_TRC_SMPTE170M;
-		spc = AVCOL_SPC_SMPTE170M;
-		break;
-	case VIDEO_CS_DEFAULT:
-	case VIDEO_CS_709:
-		pri = AVCOL_PRI_BT709;
-		trc = AVCOL_TRC_BT709;
-		spc = AVCOL_SPC_BT709;
-		break;
-	case VIDEO_CS_SRGB:
-		pri = AVCOL_PRI_BT709;
-		trc = AVCOL_TRC_IEC61966_2_1;
-		spc = AVCOL_SPC_BT709;
-		break;
-	case VIDEO_CS_2100_PQ:
-		pri = AVCOL_PRI_BT2020;
-		trc = AVCOL_TRC_SMPTE2084;
-		spc = AVCOL_SPC_BT2020_NCL;
-		break;
-	case VIDEO_CS_2100_HLG:
-		pri = AVCOL_PRI_BT2020;
-		trc = AVCOL_TRC_ARIB_STD_B67;
-		spc = AVCOL_SPC_BT2020_NCL;
-	}
+	/* Match the identity-RGB VUI (GBRA/GBR10 texture) so the colr box doesn't conflict with it */
+	const bool rgb_identity = vencoder &&
+			(obs_encoder_video_tex_active(vencoder, VIDEO_FORMAT_GBRA) ||
+			 obs_encoder_video_tex_active(vencoder, VIDEO_FORMAT_GBR10));
 
-	const enum AVColorRange range = (info->range == VIDEO_RANGE_FULL) ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
-	const enum AVChromaLocation chroma_location =
-		determine_chroma_location(obs_to_ffmpeg_video_format(info->format), spc);
+	enum AVColorPrimaries pri;
+	enum AVColorTransferCharacteristic trc;
+	enum AVColorSpace spc;
+	enum AVColorRange range;
+	enum AVChromaLocation chroma_location;
+
+	if (rgb_identity) {
+		pri = AVCOL_PRI_UNSPECIFIED;
+		trc = AVCOL_TRC_UNSPECIFIED;
+		spc = AVCOL_SPC_RGB;
+		range = AVCOL_RANGE_JPEG;
+		chroma_location = AVCHROMA_LOC_UNSPECIFIED;
+	} else {
+		pri = AVCOL_PRI_UNSPECIFIED;
+		trc = AVCOL_TRC_UNSPECIFIED;
+		spc = AVCOL_SPC_UNSPECIFIED;
+		switch (info->colorspace) {
+		case VIDEO_CS_601:
+			pri = AVCOL_PRI_SMPTE170M;
+			trc = AVCOL_TRC_SMPTE170M;
+			spc = AVCOL_SPC_SMPTE170M;
+			break;
+		case VIDEO_CS_DEFAULT:
+		case VIDEO_CS_709:
+			pri = AVCOL_PRI_BT709;
+			trc = AVCOL_TRC_BT709;
+			spc = AVCOL_SPC_BT709;
+			break;
+		case VIDEO_CS_SRGB:
+			pri = AVCOL_PRI_BT709;
+			trc = AVCOL_TRC_IEC61966_2_1;
+			spc = AVCOL_SPC_BT709;
+			break;
+		case VIDEO_CS_2100_PQ:
+			pri = AVCOL_PRI_BT2020;
+			trc = AVCOL_TRC_SMPTE2084;
+			spc = AVCOL_SPC_BT2020_NCL;
+			break;
+		case VIDEO_CS_2100_HLG:
+			pri = AVCOL_PRI_BT2020;
+			trc = AVCOL_TRC_ARIB_STD_B67;
+			spc = AVCOL_SPC_BT2020_NCL;
+		}
+
+		range = (info->range == VIDEO_RANGE_FULL) ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+		chroma_location = determine_chroma_location(obs_to_ffmpeg_video_format(info->format), spc);
+	}
 
 	const int max_luminance = (trc == AVCOL_TRC_SMPTE2084) ? (int)obs_get_video_hdr_nominal_peak_level()
 							       : ((trc == AVCOL_TRC_ARIB_STD_B67) ? 1000 : 0);

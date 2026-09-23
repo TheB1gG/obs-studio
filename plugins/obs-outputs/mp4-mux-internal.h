@@ -339,11 +339,22 @@ static inline void get_colour_information(obs_encoder_t *enc, uint16_t *pri, uin
 	enum video_colorspace cs = obs_encoder_get_preferred_color_space(enc);
 	enum video_range_type rg = obs_encoder_get_preferred_range(enc);
 
-	if (fmt != VIDEO_FORMAT_NONE || cs != VIDEO_CS_DEFAULT) {
-		/* Raw RGB components (identity matrix) - same nclx signalling as the BGRA fix. */
-		bool is_rgb_family =
-			(fmt == VIDEO_FORMAT_BGRA) || (fmt == VIDEO_FORMAT_R10L) || (fmt == VIDEO_FORMAT_R10P) ||
-			(fmt == VIDEO_FORMAT_GBRP12);
+	/* Raw RGB components (identity matrix) - same nclx signalling as the BGRA fix. */
+	bool is_rgb_family =
+		(fmt == VIDEO_FORMAT_BGRA) || (fmt == VIDEO_FORMAT_R10L) || (fmt == VIDEO_FORMAT_R10P) ||
+		(fmt == VIDEO_FORMAT_GBRP12) || (fmt == VIDEO_FORMAT_GBR10) || (fmt == VIDEO_FORMAT_GBRA);
+
+	/* Encoders that deliver an identity-RGB texture (e.g. NVENC's GBRA/GBR10) encode raw
+	 * RGB components with no YUV transform, but do not publish a preferred format. Detect
+	 * that from the active delivery texture so the nclx box matches the SPS VUI instead of
+	 * falling back to the (YUV-oriented) base video info, which would write BT.709/limited
+	 * and conflict with the identity-RGB/full-range VUI in the stream. */
+	if (!is_rgb_family && (obs_encoder_video_tex_active(enc, VIDEO_FORMAT_GBR10) ||
+			       obs_encoder_video_tex_active(enc, VIDEO_FORMAT_GBRA))) {
+		is_rgb_family = true;
+	}
+
+	if (fmt != VIDEO_FORMAT_NONE || cs != VIDEO_CS_DEFAULT || is_rgb_family) {
 		preferred_colour_values(cs, is_rgb_family, pri, trc, spc);
 		bool full = is_rgb_family || rg == VIDEO_RANGE_FULL;
 		*full_range = full ? 1 : 0;

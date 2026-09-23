@@ -980,35 +980,48 @@ static bool try_connect(struct ffmpeg_output *output)
 	config.audio_tracks = (int)obs_output_get_mixers(output->output);
 	config.audio_mix_count = get_audio_mix_count(config.audio_tracks);
 
-	config.color_range = voi->range == VIDEO_RANGE_FULL ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
-	config.colorspace = format_is_yuv(voi->format) ? AVCOL_SPC_BT709 : AVCOL_SPC_RGB;
-	switch (voi->colorspace) {
-	case VIDEO_CS_601:
-		config.color_primaries = AVCOL_PRI_SMPTE170M;
-		config.color_trc = AVCOL_TRC_SMPTE170M;
-		config.colorspace = AVCOL_SPC_SMPTE170M;
-		break;
-	case VIDEO_CS_DEFAULT:
-	case VIDEO_CS_709:
-		config.color_primaries = AVCOL_PRI_BT709;
-		config.color_trc = AVCOL_TRC_BT709;
-		config.colorspace = AVCOL_SPC_BT709;
-		break;
-	case VIDEO_CS_SRGB:
-		config.color_primaries = AVCOL_PRI_BT709;
-		config.color_trc = AVCOL_TRC_IEC61966_2_1;
-		config.colorspace = AVCOL_SPC_BT709;
-		break;
-	case VIDEO_CS_2100_PQ:
-		config.color_primaries = AVCOL_PRI_BT2020;
-		config.color_trc = AVCOL_TRC_SMPTE2084;
-		config.colorspace = AVCOL_SPC_BT2020_NCL;
-		break;
-	case VIDEO_CS_2100_HLG:
-		config.color_primaries = AVCOL_PRI_BT2020;
-		config.color_trc = AVCOL_TRC_ARIB_STD_B67;
-		config.colorspace = AVCOL_SPC_BT2020_NCL;
-		break;
+	/* Match the identity-RGB VUI (GBRA/GBR10 texture) so the colr box doesn't conflict with it */
+	obs_encoder_t *video_encoder = obs_output_get_video_encoder(output->output);
+	const bool rgb_identity = video_encoder &&
+			(obs_encoder_video_tex_active(video_encoder, VIDEO_FORMAT_GBRA) ||
+			 obs_encoder_video_tex_active(video_encoder, VIDEO_FORMAT_GBR10));
+
+	if (rgb_identity) {
+		config.color_range = AVCOL_RANGE_JPEG;
+		config.colorspace = AVCOL_SPC_RGB;
+		config.color_primaries = AVCOL_PRI_UNSPECIFIED;
+		config.color_trc = AVCOL_TRC_UNSPECIFIED;
+	} else {
+		config.color_range = voi->range == VIDEO_RANGE_FULL ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+		config.colorspace = format_is_yuv(voi->format) ? AVCOL_SPC_BT709 : AVCOL_SPC_RGB;
+		switch (voi->colorspace) {
+		case VIDEO_CS_601:
+			config.color_primaries = AVCOL_PRI_SMPTE170M;
+			config.color_trc = AVCOL_TRC_SMPTE170M;
+			config.colorspace = AVCOL_SPC_SMPTE170M;
+			break;
+		case VIDEO_CS_DEFAULT:
+		case VIDEO_CS_709:
+			config.color_primaries = AVCOL_PRI_BT709;
+			config.color_trc = AVCOL_TRC_BT709;
+			config.colorspace = AVCOL_SPC_BT709;
+			break;
+		case VIDEO_CS_SRGB:
+			config.color_primaries = AVCOL_PRI_BT709;
+			config.color_trc = AVCOL_TRC_IEC61966_2_1;
+			config.colorspace = AVCOL_SPC_BT709;
+			break;
+		case VIDEO_CS_2100_PQ:
+			config.color_primaries = AVCOL_PRI_BT2020;
+			config.color_trc = AVCOL_TRC_SMPTE2084;
+			config.colorspace = AVCOL_SPC_BT2020_NCL;
+			break;
+		case VIDEO_CS_2100_HLG:
+			config.color_primaries = AVCOL_PRI_BT2020;
+			config.color_trc = AVCOL_TRC_ARIB_STD_B67;
+			config.colorspace = AVCOL_SPC_BT2020_NCL;
+			break;
+		}
 	}
 
 	if (config.format == AV_PIX_FMT_NONE) {
