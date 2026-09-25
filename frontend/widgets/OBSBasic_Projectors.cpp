@@ -20,6 +20,8 @@
 #include "OBSBasic.hpp"
 #include "OBSProjector.hpp"
 
+#include <QScreen>
+
 obs_data_array_t *OBSBasic::SaveProjectors()
 {
 	obs_data_array_t *savedProjectors = obs_data_array_create();

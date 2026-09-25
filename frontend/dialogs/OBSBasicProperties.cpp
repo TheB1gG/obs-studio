@@ -25,6 +25,7 @@
 #include <vertical-scroll-area.hpp>
 
 #include <QPushButton>
+#include <QCloseEvent>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN

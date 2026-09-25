@@ -41,14 +41,12 @@ void *OBSStudioAPI::obs_frontend_get_system_tray()
 
 void OBSStudioAPI::obs_frontend_get_scenes(struct obs_frontend_source_list *sources)
 {
-	for (int i = 0; i < main->ui->scenes->count(); i++) {
-		QListWidgetItem *item = main->ui->scenes->item(i);
-		OBSScene scene = GetOBSRef<OBSScene>(item);
-		obs_source_t *source = obs_scene_get_source(scene);
+	main->ui->scenes->EnumerateScenes([&](const QString &, obs_scene_t *enumScene) {
+		obs_source_t *source = obs_scene_get_source(enumScene);
 
 		if (obs_source_get_ref(source) != nullptr)
 			da_push_back(sources->sources, &source);
-	}
+	});
 }
 
 obs_source_t *OBSStudioAPI::obs_frontend_get_current_scene()

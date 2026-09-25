@@ -317,18 +317,12 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	qRegisterMetaType<obs_hotkey_id>("obs_hotkey_id");
 	qRegisterMetaType<SavedProjectorInfo *>("SavedProjectorInfo *");
 
-	ui->scenes->setAttribute(Qt::WA_MacShowFocusRect, false);
+	ui->scenes->GetTreeView()->setAttribute(Qt::WA_MacShowFocusRect, false);
 	ui->sources->setAttribute(Qt::WA_MacShowFocusRect, false);
 
-	bool sceneGrid = config_get_bool(App()->GetUserConfig(), "BasicWindow", "gridMode");
-	ui->scenes->SetGridMode(sceneGrid);
+	ui->actionSceneListMode->setChecked(true);
 
-	if (sceneGrid)
-		ui->actionSceneGridMode->setChecked(true);
-	else
-		ui->actionSceneListMode->setChecked(true);
-
-	ui->scenes->setItemDelegate(new SceneRenameDelegate(ui->scenes));
+	ui->scenes->GetTreeView()->setItemDelegate(new SceneRenameDelegate(ui->scenes));
 
 	auto displayResize = [this]() {
 		struct obs_video_info ovi;
@@ -390,7 +384,7 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 
 	UpdateTitleBar();
 
-	connect(ui->scenes->itemDelegate(), &QAbstractItemDelegate::closeEditor, this, &OBSBasic::SceneNameEdited);
+	connect(ui->scenes->GetTreeView()->itemDelegate(), &QAbstractItemDelegate::closeEditor, this, &OBSBasic::SceneNameEdited);
 
 	cpuUsageInfo = os_cpu_usage_info_start();
 	cpuUsageTimer = new QTimer(this);
@@ -404,6 +398,37 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	renameScene->setShortcutContext(Qt::WidgetWithChildrenShortcut);
 	connect(renameScene, &QAction::triggered, this, &OBSBasic::EditSceneName);
 	ui->scenesDock->addAction(renameScene);
+
+	// Replace the + toolbar button with a menu button (Add Scene / Add Folder)
+	{
+		QWidget *oldBtn = ui->scenesToolbar->widgetForAction(ui->actionAddScene);
+		if (oldBtn) {
+			ui->scenesToolbar->removeAction(ui->actionAddScene);
+
+			auto *menuBtn = new QToolButton(oldBtn->parentWidget());
+			menuBtn->setIcon(ui->actionAddScene->icon());
+			menuBtn->setToolTip(QTStr("Add Scene or Folder"));
+			menuBtn->setPopupMode(QToolButton::InstantPopup);
+			menuBtn->setProperty("class", "icon-plus");
+
+			auto *addMenu = new QMenu(menuBtn);
+			addMenu->addAction(QTStr("AddScene"), this, &OBSBasic::on_actionAddScene_triggered);
+			addMenu->addAction(QTStr("Add Folder"), [this]() {
+				QString placeholder = ui->scenes->GetNextFolderName();
+				std::string name;
+				if (NameDialog::AskForName(this, QTStr("Add Folder"), QTStr("Folder name:"), name, placeholder)) {
+					if (!name.empty()) {
+						ui->scenes->AddFolder(QString::fromStdString(name));
+						SaveProject();
+					}
+				}
+			});
+			menuBtn->setMenu(addMenu);
+
+			// Insert before the remove button (same position as old + button)
+			ui->scenesToolbar->insertWidget(ui->actionRemoveScene, menuBtn);
+		}
+	}
 
 	renameSource = new QAction(QTStr("Rename"), ui->sourcesDock);
 	renameSource->setShortcutContext(Qt::WidgetWithChildrenShortcut);
@@ -462,6 +487,19 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	SETUP_DOCK(statsDock);
 #undef SETUP_DOCK
 
+	/* Scene grid dock - hidden by default, toggled via View menu or context menu */
+	setupDockAction(ui->sceneGridDock);
+	ui->menuDocks->addAction(ui->sceneGridDock->toggleViewAction());
+	ui->sceneGridDock->setVisible(false);
+
+	connect(ui->sceneGrid, &QListWidget::currentItemChanged, this, [this](QListWidgetItem *current, QListWidgetItem *) {
+		if (current) {
+			obs_scene_t *scene = static_cast<obs_scene_t *>(current->data(Qt::UserRole).value<void *>());
+			if (scene)
+				ui->scenes->SetCurrentScene(scene);
+		}
+	});
+
 	// Register shortcuts for Undo/Redo
 	ui->actionMainUndo->setShortcut(Qt::CTRL | Qt::Key_Z);
 	QList<QKeySequence> shrt;
@@ -505,6 +543,32 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	connect(ui->enablePreviewButton, &QPushButton::clicked, this, &OBSBasic::TogglePreview);
 
 	connect(ui->scenes, &SceneTree::scenesReordered, []() { OBSProjector::UpdateMultiviewProjectors(); });
+	connect(ui->scenes, &SceneTree::sceneSelectionChanged, this, [this]() {
+		obs_scene_t *selScene = ui->scenes->GetCurrentScene();
+		if (selScene) {
+			OBSSource source = obs_scene_get_source(selScene);
+			currentScene = selScene;
+			SetCurrentScene(source.Get());
+
+			if (vcamEnabled && vcamConfig.type == VCamOutputType::PreviewOutput)
+				outputHandler->UpdateVirtualCamOutputSource();
+
+			OnEvent(OBS_FRONTEND_EVENT_PREVIEW_SCENE_CHANGED);
+		} else {
+			currentScene = nullptr;
+		}
+		UpdateContextBar();
+	});
+	connect(ui->scenes, &SceneTree::layoutChanged, this, [this]() { SaveProject(); });
+	connect(ui->scenes, &SceneTree::scenesReordered, this, [this]() {
+		SaveProject();
+		if (ui->sceneGridDock->isVisible())
+			SyncSceneGrid();
+	});
+	connect(ui->scenes, &SceneTree::layoutChanged, this, [this]() {
+		if (ui->sceneGridDock->isVisible())
+			SyncSceneGrid();
+	});
 
 	connect(App(), &OBSApp::StyleChanged, this, [this]() { OnEvent(OBS_FRONTEND_EVENT_THEME_CHANGED); });
 

@@ -82,12 +82,10 @@ OBSSceneItem OBSBasic::GetCurrentSceneItem()
 	return ui->sources->Get(GetTopSelectedSourceItem());
 }
 
-static void RenameListValues(QListWidget *listWidget, const QString &newName, const QString &prevName)
+static void RenameListValues(SceneTree *sceneTree, const QString &newName, const QString &prevName)
 {
-	QList<QListWidgetItem *> items = listWidget->findItems(prevName, Qt::MatchExactly);
-
-	for (int i = 0; i < items.count(); i++)
-		items[i]->setText(newName);
+	if (auto *item = sceneTree->FindSceneItem(prevName))
+		item->setText(newName);
 }
 
 void OBSBasic::RenameSources(OBSSource source, QString newName, QString prevName)
@@ -222,7 +220,7 @@ void OBSBasic::DeactivateAudioSource(OBSSource source)
 bool OBSBasic::QueryRemoveSource(obs_source_t *source)
 {
 	if (obs_source_get_type(source) == OBS_SOURCE_TYPE_SCENE && !obs_source_is_group(source)) {
-		int count = ui->scenes->count();
+		int count = ui->scenes->SceneCount();
 
 		if (count == 1) {
 			OBSMessageBox::information(this, QTStr("FinalScene.Title"), QTStr("FinalScene.Text"));
@@ -747,7 +745,7 @@ void OBSBasic::CreateSourcePopupMenu(int idx, bool preview)
 
 void OBSBasic::on_sources_customContextMenuRequested(const QPoint &pos)
 {
-	if (ui->scenes->count()) {
+	if (ui->scenes->SceneCount()) {
 		QModelIndex idx = ui->sources->indexAt(pos);
 		CreateSourcePopupMenu(idx.row(), false);
 	}

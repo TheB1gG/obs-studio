@@ -4,6 +4,8 @@
 #include <widgets/OBSBasic.hpp>
 
 #include <QPainter>
+#include <QMouseEvent>
+#include <QDropEvent>
 
 #include "moc_SourceTree.cpp"
 

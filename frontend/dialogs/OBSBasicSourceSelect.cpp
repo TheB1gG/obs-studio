@@ -386,18 +386,15 @@ OBSBasicSourceSelect::OBSBasicSourceSelect(OBSBasic *parent, const char *id_, un
 		ui->sourceName->setEnabled(false);
 		ui->buttonBox->button(QDialogButtonBox::Ok)->setEnabled(false);
 
-		int count = main->ui->scenes->count();
-		for (int i = 0; i < count; i++) {
-			QListWidgetItem *item = main->ui->scenes->item(i);
-			OBSScene scene = GetOBSRef<OBSScene>(item);
-			OBSSource sceneSource = obs_scene_get_source(scene);
+		main->ui->scenes->EnumerateScenes([&](const QString &, obs_scene_t *enumScene) {
+			OBSSource sceneSource = obs_scene_get_source(enumScene);
 
 			if (curSceneSource == sceneSource)
-				continue;
+				return;
 
 			const char *name = obs_source_get_name(sceneSource);
 			ui->sourceList->addItem(QT_UTF8(name));
-		}
+		});
 	} else if (strcmp(id_, "group") == 0) {
 		obs_enum_sources(EnumGroups, this);
 	} else {

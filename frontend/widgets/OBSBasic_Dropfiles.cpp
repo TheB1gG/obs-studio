@@ -23,6 +23,10 @@
 
 #include <QFileInfo>
 #include <QMimeData>
+#include <QDragEnterEvent>
+#include <QDragLeaveEvent>
+#include <QDragMoveEvent>
+#include <QDropEvent>
 #ifdef _WIN32
 #include <QSettings>
 #endif

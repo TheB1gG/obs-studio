@@ -26,6 +26,7 @@
 
 #include <QLineEdit>
 #include <QWidgetAction>
+#include <QInputDialog>
 
 #include <vector>
 
@@ -61,11 +62,11 @@ obs_data_array_t *OBSBasic::SaveSceneListOrder()
 {
 	obs_data_array_t *sceneOrder = obs_data_array_create();
 
-	for (int i = 0; i < ui->scenes->count(); i++) {
+	ui->scenes->EnumerateScenes([&sceneOrder](const QString &name, obs_scene_t *) {
 		OBSDataAutoRelease data = obs_data_create();
-		obs_data_set_string(data, "name", QT_TO_UTF8(ui->scenes->item(i)->text()));
+		obs_data_set_string(data, "name", QT_TO_UTF8(name));
 		obs_data_array_push_back(sceneOrder, data);
-	}
+	});
 
 	return sceneOrder;
 }
@@ -87,14 +88,9 @@ static void ReorderItemByName(QListWidget *lw, const char *name, int newIndex)
 
 void OBSBasic::LoadSceneListOrder(obs_data_array_t *array)
 {
-	size_t num = obs_data_array_count(array);
-
-	for (size_t i = 0; i < num; i++) {
-		OBSDataAutoRelease data = obs_data_array_item(array, i);
-		const char *name = obs_data_get_string(data, "name");
-
-		ReorderItemByName(ui->scenes, name, (int)i);
-	}
+	// Scene ordering is now handled by the folder layout JSON (scene_layout field).
+	// This function is kept for backward compatibility but is a no-op.
+	Q_UNUSED(array);
 }
 
 OBSScene OBSBasic::GetCurrentScene()
@@ -107,9 +103,7 @@ void OBSBasic::AddScene(OBSSource source)
 	const char *name = obs_source_get_name(source);
 	obs_scene_t *scene = obs_scene_from_source(source);
 
-	QListWidgetItem *item = new QListWidgetItem(QT_UTF8(name));
-	SetOBSRef(item, OBSScene(scene));
-	ui->scenes->insertItem(ui->scenes->currentRow() + 1, item);
+	ui->scenes->AddScene(QT_UTF8(name), scene);
 
 	obs_hotkey_register_source(
 		source, "OBSBasic.SelectScene", Str("Basic.Hotkeys.SelectScene"),
@@ -133,7 +127,8 @@ void OBSBasic::AddScene(OBSSource source)
 		std::make_shared<OBSSignal>(handler, "refresh", OBSBasic::SceneRefreshed, this),
 	});
 
-	item->setData(static_cast<int>(QtDataRole::OBSSignals), QVariant::fromValue(container));
+	if (auto *item = ui->scenes->FindSceneItem(QT_UTF8(name)))
+		item->setData(QVariant::fromValue(container), static_cast<int>(QtDataRole::OBSSignals));
 
 	/* if the scene already has items (a duplicated scene) add them */
 	auto addSceneItem = [this](obs_sceneitem_t *item) {
@@ -168,24 +163,10 @@ void OBSBasic::RemoveScene(OBSSource source)
 {
 	obs_scene_t *scene = obs_scene_from_source(source);
 
-	QListWidgetItem *sel = nullptr;
-	int count = ui->scenes->count();
+	if (ui->scenes->GetCurrentScene() == scene)
+		ui->sources->Clear();
 
-	for (int i = 0; i < count; i++) {
-		auto item = ui->scenes->item(i);
-		auto cur_scene = GetOBSRef<OBSScene>(item);
-		if (cur_scene != scene)
-			continue;
-
-		sel = item;
-		break;
-	}
-
-	if (sel != nullptr) {
-		if (sel == ui->scenes->currentItem())
-			ui->sources->Clear();
-		delete sel;
-	}
+	ui->scenes->RemoveScene(scene);
 
 	SaveProject();
 
@@ -430,14 +411,7 @@ void OBSBasic::RemoveSelectedScene()
 		OBSScene scene = obs_scene_from_source(scene_source);
 		SetCurrentScene(scene, true);
 
-		/* set original index in list box */
-		ui->scenes->blockSignals(true);
-		int curIndex = ui->scenes->currentRow();
-		QListWidgetItem *item = ui->scenes->takeItem(curIndex);
-		ui->scenes->insertItem(savedIndex, item);
-		ui->scenes->setCurrentRow(savedIndex);
 		currentScene = scene.Get();
-		ui->scenes->blockSignals(false);
 	};
 
 	auto redo = [](const std::string &name) {
@@ -448,7 +422,6 @@ void OBSBasic::RemoveSelectedScene()
 	OBSDataAutoRelease data = obs_data_create();
 	obs_data_set_array(data, "sources_in_deleted_scene", sources_in_deleted_scene);
 	obs_data_set_array(data, "scene_used_in_other_scenes", scene_used_in_other_scenes);
-	obs_data_set_int(data, "index", ui->scenes->currentRow());
 
 	const char *scene_name = obs_source_get_name(source);
 	undo_s.add_action(QTStr("Undo.Delete").arg(scene_name), undo, redo, obs_data_get_json(data), scene_name);
@@ -459,6 +432,8 @@ void OBSBasic::RemoveSelectedScene()
 	RemoveSceneAndReleaseNested(source);
 
 	OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
+	if (ui->sceneGridDock->isVisible())
+		SyncSceneGrid();
 }
 
 void OBSBasic::SceneReordered(void *data, calldata_t *params)
@@ -488,50 +463,144 @@ void OBSBasic::SceneItemAdded(void *data, calldata_t *params)
 	QMetaObject::invokeMethod(window, "AddSceneItem", Q_ARG(OBSSceneItem, OBSSceneItem(item)));
 }
 
-void OBSBasic::on_scenes_currentItemChanged(QListWidgetItem *current, QListWidgetItem *)
+void OBSBasic::on_scenes_currentItemChanged(QListWidgetItem *, QListWidgetItem *)
 {
-	OBSSource source;
-
-	if (current) {
-		OBSScene scene = GetOBSRef<OBSScene>(current);
-		source = obs_scene_get_source(scene);
-
-		currentScene = scene;
-	} else {
-		currentScene = NULL;
-	}
-
-	SetCurrentScene(source);
-
-	if (vcamEnabled && vcamConfig.type == VCamOutputType::PreviewOutput)
-		outputHandler->UpdateVirtualCamOutputSource();
-
-	OnEvent(OBS_FRONTEND_EVENT_PREVIEW_SCENE_CHANGED);
-
-	UpdateContextBar();
+	// Handled by SceneTree::sceneSelectionChanged signal connection in constructor
 }
 
 void OBSBasic::EditSceneName()
 {
 	ui->scenesDock->removeAction(renameScene);
-	QListWidgetItem *item = ui->scenes->currentItem();
-	Qt::ItemFlags flags = item->flags();
-
-	item->setFlags(flags | Qt::ItemIsEditable);
-	ui->scenes->editItem(item);
-	item->setFlags(flags);
+	QTreeView *tv = ui->scenes->GetTreeView();
+	QModelIndex index = tv->currentIndex();
+	if (index.isValid())
+		tv->edit(index);
 }
 
 void OBSBasic::on_scenes_customContextMenuRequested(const QPoint &pos)
 {
-	QListWidgetItem *item = ui->scenes->itemAt(pos);
-
+	QString sceneName = ui->scenes->SceneNameAt(pos);
+	QString folderPath = ui->scenes->FolderPathAt(pos);
+	bool hasScene = !sceneName.isEmpty();
+	bool hasFolder = !folderPath.isEmpty();
+	
 	QMenu popup(this);
 	QMenu order(QTStr("Basic.MainMenu.Edit.Order"), this);
 
 	popup.addAction(QTStr("AddScene") + "...", this, &OBSBasic::on_actionAddScene_triggered);
 
-	if (item) {
+	// Folder actions
+	auto *addFolderAction = popup.addAction(QTStr("Add Folder"), this, [this, pos]() {
+		QString placeholder = ui->scenes->GetNextFolderName();
+		std::string name;
+		if (NameDialog::AskForName(this, QTStr("AddFolder"), QTStr("FolderName"), name, placeholder)) {
+			if (!name.empty()) {
+				QString parentPath = ui->scenes->FolderPathAt(pos);
+				ui->scenes->AddFolder(QString::fromStdString(name), parentPath);
+				SaveProject();
+				OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
+			}
+		}
+	});
+	addFolderAction->setEnabled(true);
+
+	if (hasFolder) {
+		popup.addAction(QTStr("RenameFolder"), this, [this, folderPath]() {
+			bool ok = false;
+			QString name = QInputDialog::getText(this, QTStr("RenameFolder"), QTStr("FolderName"),
+			                                     QLineEdit::Normal, QString(), &ok);
+			if (ok && !name.isEmpty()) {
+				ui->scenes->RenameFolder(folderPath, name);
+				SaveProject();
+				OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
+			}
+		});
+		popup.addAction(QTStr("DeleteFolder"), this, [this, folderPath]() {
+			blog(LOG_INFO, "[OBSBasic] DeleteFolder lambda entered, path=%s", folderPath.toUtf8().constData());
+			QMessageBox msgBox(this);
+			msgBox.setWindowTitle(QTStr("DeleteFolder"));
+			msgBox.setText(QTStr("Delete this folder?"));
+			msgBox.setIcon(QMessageBox::Question);
+
+			auto *keepBtn = msgBox.addButton(QTStr("Delete Folder Only"), QMessageBox::AcceptRole);
+			auto *deleteBtn = msgBox.addButton(QTStr("Delete Folder and Scenes"), QMessageBox::DestructiveRole);
+			msgBox.addButton(QMessageBox::Cancel);
+
+			msgBox.exec();
+			blog(LOG_INFO, "[OBSBasic] DeleteFolder dialog closed, clickedButton=%p keepBtn=%p deleteBtn=%p",
+			      (void *)msgBox.clickedButton(), (void *)keepBtn, (void *)deleteBtn);
+
+			if (msgBox.clickedButton() == keepBtn) {
+				ui->scenes->RemoveFolder(folderPath);
+				SaveProject();
+				OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
+			} else if (msgBox.clickedButton() == deleteBtn) {
+				ui->scenes->RemoveFolderAndScenes(folderPath);
+				SaveProject();
+				OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
+			}
+		});
+
+		// Sort submenu (heap-allocated like perSceneTransitionMenu)
+		SceneSortMode currentMode = ui->scenes->GetFolderSortModeByPath(folderPath);
+		auto *sortMenu = new QMenu("Sort");
+
+		auto addSortAction = [this, sortMenu, folderPath](const QString &text, SceneSortMode mode, SceneSortMode current) {
+			auto *action = sortMenu->addAction(text);
+			action->setCheckable(true);
+			action->setChecked(mode == current);
+			connect(action, &QAction::triggered, this, [this, folderPath, mode]() {
+				ui->scenes->SetFolderSortModeByPath(folderPath, mode);
+				SaveProject();
+				OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
+			});
+		};
+
+		addSortAction("No Order", SceneSortMode::SortNone, currentMode);
+		addSortAction("A to Z", SceneSortMode::SortAZ, currentMode);
+		addSortAction("Z to A", SceneSortMode::SortZA, currentMode);
+		addSortAction("By Last Used", SceneSortMode::SortByLastUsed, currentMode);
+		popup.addMenu(sortMenu);
+
+		// Display mode submenu
+		FolderDisplayMode currentDisplay = ui->scenes->GetFolderDisplayModeByPath(folderPath);
+		auto *displayMenu = new QMenu("Display");
+
+		auto addDisplayAction = [this, displayMenu, folderPath](const QString &text, FolderDisplayMode mode, FolderDisplayMode current) {
+			auto *action = displayMenu->addAction(text);
+			action->setCheckable(true);
+			action->setChecked(mode == current);
+			connect(action, &QAction::triggered, this, [this, folderPath, mode]() {
+				ui->scenes->SetFolderDisplayModeByPath(folderPath, mode);
+				SaveProject();
+				OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
+			});
+		};
+
+		addDisplayAction("Expanded", FolderDisplayMode::Expanded, currentDisplay);
+		addDisplayAction("Compact", FolderDisplayMode::Compact, currentDisplay);
+		addDisplayAction("Collapsed", FolderDisplayMode::Collapsed, currentDisplay);
+
+		// "Set Visible Count..." only shown when in Compact mode
+		if (currentDisplay == FolderDisplayMode::Compact) {
+			displayMenu->addSeparator();
+			int currentLimit = 3; // Will be set properly below
+			auto *limitAction = displayMenu->addAction("Set Visible Count...");
+			connect(limitAction, &QAction::triggered, this, [this, folderPath]() {
+				bool ok = false;
+				int val = QInputDialog::getInt(this, "Compact View", "Number of scenes to show:",
+				                               3, 1, 99, 1, &ok);
+				if (ok) {
+					ui->scenes->SetCompactLimitByPath(folderPath, val);
+					SaveProject();
+				}
+			});
+		}
+
+		popup.addMenu(displayMenu);
+	}
+
+	if (hasScene) {
 		QAction *copyFilters = new QAction(QTStr("Copy.Filters"), this);
 		copyFilters->setEnabled(false);
 		connect(copyFilters, &QAction::triggered, this, &OBSBasic::SceneCopyFilters);
@@ -544,6 +613,16 @@ void OBSBasic::on_scenes_customContextMenuRequested(const QPoint &pos)
 		popup.addAction(copyFilters);
 		popup.addAction(pasteFilters);
 		popup.addSeparator();
+
+		// Pin/Unpin action
+		auto *pinAction = popup.addAction("Pin Scene");
+		connect(pinAction, &QAction::triggered, this, [this, sceneName]() {
+			ui->scenes->ToggleScenePinByName(sceneName);
+			SaveProject();
+			OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
+		});
+		popup.addSeparator();
+
 		popup.addAction(renameScene);
 		popup.addAction(ui->actionRemoveScene);
 		popup.addSeparator();
@@ -603,38 +682,32 @@ void OBSBasic::on_scenes_customContextMenuRequested(const QPoint &pos)
 
 	popup.addSeparator();
 
-	bool grid = ui->scenes->GetGridMode();
-
-	QAction *gridAction = new QAction(grid ? QTStr("Basic.Main.ListMode") : QTStr("Basic.Main.GridMode"), this);
-	connect(gridAction, &QAction::triggered, this, &OBSBasic::GridActionClicked);
-	popup.addAction(gridAction);
+	auto *expandAllAction = popup.addAction(QTStr("ExpandAll"), this, [this]() {
+		ui->scenes->ExpandAll();
+	});
+	auto *collapseAllAction = popup.addAction(QTStr("CollapseAll"), this, [this]() {
+		ui->scenes->CollapseAll();
+	});
 
 	popup.exec(QCursor::pos());
 }
 
 void OBSBasic::on_actionSceneListMode_triggered()
 {
-	ui->scenes->SetGridMode(false);
-	config_set_bool(App()->GetUserConfig(), "BasicWindow", "gridMode", false);
+	ui->sceneGridDock->setVisible(false);
 }
 
 void OBSBasic::on_actionSceneGridMode_triggered()
 {
-	ui->scenes->SetGridMode(true);
-	config_set_bool(App()->GetUserConfig(), "BasicWindow", "gridMode", true);
+	ui->sceneGridDock->setVisible(true);
+	SyncSceneGrid();
 }
 
 void OBSBasic::GridActionClicked()
 {
-	bool gridMode = !ui->scenes->GetGridMode();
-	ui->scenes->SetGridMode(gridMode);
-
-	if (gridMode)
-		ui->actionSceneGridMode->setChecked(true);
-	else
-		ui->actionSceneListMode->setChecked(true);
-
-	config_set_bool(App()->GetUserConfig(), "BasicWindow", "gridMode", gridMode);
+	ui->sceneGridDock->setVisible(!ui->sceneGridDock->isVisible());
+	if (ui->sceneGridDock->isVisible())
+		SyncSceneGrid();
 }
 
 void OBSBasic::on_actionAddScene_triggered()
@@ -685,53 +758,89 @@ void OBSBasic::on_actionAddScene_triggered()
 		OBSSceneAutoRelease scene = obs_scene_create(name.c_str());
 		obs_source_t *scene_source = obs_scene_get_source(scene);
 		SetCurrentScene(scene_source);
+		if (ui->sceneGridDock->isVisible())
+			SyncSceneGrid();
 	}
 }
 
 void OBSBasic::on_actionRemoveScene_triggered()
 {
+	// Check if a folder is selected — if so, show folder delete dialog
+	QString folderPath = ui->scenes->GetSelectedFolderPath();
+	if (!folderPath.isEmpty()) {
+		QMessageBox msgBox(this);
+		msgBox.setWindowTitle(QTStr("DeleteFolder"));
+		msgBox.setText(QTStr("Delete this folder?"));
+		msgBox.setIcon(QMessageBox::Question);
+
+		auto *keepBtn = msgBox.addButton(QTStr("Delete Folder Only"), QMessageBox::AcceptRole);
+		auto *deleteBtn = msgBox.addButton(QTStr("Delete Folder and Scenes"), QMessageBox::DestructiveRole);
+		msgBox.addButton(QMessageBox::Cancel);
+
+		msgBox.exec();
+
+		if (msgBox.clickedButton() == keepBtn) {
+			ui->scenes->RemoveFolder(folderPath);
+			SaveProject();
+			OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
+		} else if (msgBox.clickedButton() == deleteBtn) {
+			ui->scenes->RemoveFolderAndScenes(folderPath);
+			SaveProject();
+			OnEvent(OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED);
+		}
+		return;
+	}
+
+	// Otherwise, remove the selected scene (existing behavior)
 	RemoveSelectedScene();
 }
 
 void OBSBasic::ChangeSceneIndex(bool relative, int offset, int invalidIdx)
 {
-	int idx = ui->scenes->currentRow();
-	if (idx == -1 || idx == invalidIdx)
-		return;
-
-	ui->scenes->blockSignals(true);
-	QListWidgetItem *item = ui->scenes->takeItem(idx);
-
-	if (!relative)
-		idx = 0;
-
-	ui->scenes->insertItem(idx + offset, item);
-	ui->scenes->setCurrentRow(idx + offset);
-	item->setSelected(true);
-	currentScene = GetOBSRef<OBSScene>(item).Get();
-	ui->scenes->blockSignals(false);
-
-	OBSProjector::UpdateMultiviewProjectors();
+	Q_UNUSED(relative);
+	Q_UNUSED(offset);
+	Q_UNUSED(invalidIdx);
+	// Handled by the new tree-based move functions below
 }
 
 void OBSBasic::on_actionSceneUp_triggered()
 {
-	ChangeSceneIndex(true, -1, 0);
+	obs_scene_t *scene = ui->scenes->GetCurrentScene();
+	if (scene) {
+		ui->scenes->MoveSceneUp(scene);
+		SaveProject();
+		OBSProjector::UpdateMultiviewProjectors();
+	}
 }
 
 void OBSBasic::on_actionSceneDown_triggered()
 {
-	ChangeSceneIndex(true, 1, ui->scenes->count() - 1);
+	obs_scene_t *scene = ui->scenes->GetCurrentScene();
+	if (scene) {
+		ui->scenes->MoveSceneDown(scene);
+		SaveProject();
+		OBSProjector::UpdateMultiviewProjectors();
+	}
 }
 
 void OBSBasic::MoveSceneToTop()
 {
-	ChangeSceneIndex(false, 0, 0);
+	obs_scene_t *scene = ui->scenes->GetCurrentScene();
+	if (scene) {
+		ui->scenes->MoveSceneToTop(scene);
+		SaveProject();
+		OBSProjector::UpdateMultiviewProjectors();
+	}
 }
 
 void OBSBasic::MoveSceneToBottom()
 {
-	ChangeSceneIndex(false, ui->scenes->count() - 1, ui->scenes->count() - 1);
+	obs_scene_t *scene = ui->scenes->GetCurrentScene();
+	if (scene) {
+		ui->scenes->MoveSceneToBottom(scene);
+		SaveProject();
+		OBSProjector::UpdateMultiviewProjectors();
+	}
 }
 
 void OBSBasic::EditSceneItemName()
@@ -854,14 +963,17 @@ void OBSBasic::MoveSceneItem(enum obs_order_movement movement, const QString &ac
 	CreateSceneUndoRedoAction(action_name.arg(source_name, scene_name), undo_data, redo_data);
 }
 
-static void RenameListItem(OBSBasic *parent, QListWidget *listWidget, obs_source_t *source, const string &name)
+static void RenameListItem(OBSBasic *parent, SceneTree *sceneTree, obs_source_t *source, const string &name)
 {
 	const char *prevName = obs_source_get_name(source);
 	if (name == prevName)
 		return;
 
 	OBSSourceAutoRelease foundSource = obs_get_source_by_name(name.c_str());
-	QListWidgetItem *listItem = listWidget->currentItem();
+	QStandardItem *listItem = sceneTree->FindSceneItem(QT_UTF8(prevName));
+
+	if (!listItem)
+		return;
 
 	if (foundSource || name.empty()) {
 		listItem->setText(QT_UTF8(prevName));
@@ -984,4 +1096,34 @@ void OBSBasic::on_actionSceneFilters_triggered()
 
 	if (sceneSource)
 		OpenFilters(sceneSource);
+}
+
+void OBSBasic::SyncSceneGrid()
+{
+	ui->sceneGrid->clear();
+
+	auto *grid = ui->sceneGrid;
+	QList<QPair<QString, obs_scene_t *>> scenes;
+
+	ui->scenes->EnumerateScenes([&scenes](const QString &name, obs_scene_t *scene) {
+		scenes.append({name, scene});
+		return true;
+	});
+
+	for (const auto &pair : scenes) {
+		auto *item = new QListWidgetItem(pair.first, grid);
+		item->setData(Qt::UserRole, QVariant::fromValue<void *>(pair.second));
+	}
+
+	// Sync current selection
+	obs_scene_t *current = ui->scenes->GetCurrentScene();
+	if (current) {
+		for (int i = 0; i < grid->count(); i++) {
+			auto *item = grid->item(i);
+			if (static_cast<obs_scene_t *>(item->data(Qt::UserRole).value<void *>()) == current) {
+				grid->setCurrentItem(item);
+				break;
+			}
+		}
+	}
 }

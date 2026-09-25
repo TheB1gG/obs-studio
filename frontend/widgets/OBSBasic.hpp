@@ -27,6 +27,16 @@
 #include <utility/VCamConfig.hpp>
 #include <utility/platform.hpp>
 #include <utility/undo_stack.hpp>
+#include <QListWidget>
+#include <QCloseEvent>
+#include <QMouseEvent>
+#include <QKeyEvent>
+#include <QWheelEvent>
+#include <QDropEvent>
+#include <QDragEnterEvent>
+#include <QDragLeaveEvent>
+#include <QDragMoveEvent>
+#include <QScreen>
 
 #include <obs-frontend-internal.hpp>
 #include <obs.hpp>
@@ -1273,6 +1283,7 @@ private slots:
 	void GridActionClicked();
 	void on_actionSceneListMode_triggered();
 	void on_actionSceneGridMode_triggered();
+	void SyncSceneGrid();
 	void on_actionAddScene_triggered();
 	void on_actionRemoveScene_triggered();
 	void on_actionSceneUp_triggered();

@@ -614,24 +614,18 @@ void OBSBasic::SetCurrentScene(OBSSource scene, bool force)
 	}
 
 	if (obs_scene_get_source(GetCurrentScene()) != scene) {
-		for (int i = 0; i < ui->scenes->count(); i++) {
-			QListWidgetItem *item = ui->scenes->item(i);
-			OBSScene itemScene = GetOBSRef<OBSScene>(item);
-			obs_source_t *source = obs_scene_get_source(itemScene);
-
+		ui->scenes->EnumerateScenes([&](const QString &, obs_scene_t *enumScene) {
+			obs_source_t *source = obs_scene_get_source(enumScene);
 			if (source == scene) {
-				ui->scenes->blockSignals(true);
-				currentScene = itemScene.Get();
-				ui->scenes->setCurrentItem(item);
-				ui->scenes->blockSignals(false);
+				currentScene = enumScene;
+				ui->scenes->SetCurrentScene(enumScene);
 
 				if (vcamEnabled && vcamConfig.type == VCamOutputType::PreviewOutput)
 					outputHandler->UpdateVirtualCamOutputSource();
 
 				OnEvent(OBS_FRONTEND_EVENT_PREVIEW_SCENE_CHANGED);
-				break;
 			}
-		}
+		});
 	}
 
 	UpdateContextBar(true);

@@ -4,6 +4,7 @@
 
 #include <QCheckBox>
 #include <QMessageBox>
+#include <QCloseEvent>
 
 #include "moc_OBSDock.cpp"
 

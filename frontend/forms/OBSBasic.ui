@@ -1011,32 +1011,6 @@
             <verstretch>0</verstretch>
            </sizepolicy>
           </property>
-          <property name="contextMenuPolicy">
-           <enum>Qt::CustomContextMenu</enum>
-          </property>
-          <property name="frameShape">
-           <enum>QFrame::NoFrame</enum>
-          </property>
-          <property name="frameShadow">
-           <enum>QFrame::Plain</enum>
-          </property>
-          <property name="showDropIndicator" stdset="0">
-           <bool>true</bool>
-          </property>
-          <property name="dragEnabled">
-           <bool>true</bool>
-          </property>
-          <property name="dragDropMode">
-           <enum>QAbstractItemView::InternalMove</enum>
-          </property>
-          <property name="defaultDropAction">
-           <enum>Qt::TargetMoveAction</enum>
-          </property>
-          <!-- Spacing must be 0 due to QTBUG-106395 -->
-          <property name="spacing">
-           <number>0</number>
-          </property>
-          <addaction name="actionRemoveScene"/>
          </widget>
         </item>
         <item>
@@ -1080,6 +1054,112 @@
            </size>
           </property>
          </spacer>
+        </item>
+       </layout>
+      </widget>
+     </item>
+    </layout>
+   </widget>
+  </widget>
+  <widget class="OBSDock" name="sceneGridDock">
+   <property name="features">
+    <set>QDockWidget::DockWidgetClosable|QDockWidget::DockWidgetFloatable|QDockWidget::DockWidgetMovable</set>
+   </property>
+   <property name="windowTitle">
+    <string>Basic.Main.SceneGrid</string>
+   </property>
+   <attribute name="dockWidgetArea">
+    <number>8</number>
+   </attribute>
+   <widget class="QWidget" name="sceneGridDockContents">
+    <layout class="QVBoxLayout" name="sceneGridDockLayout">
+     <property name="spacing">
+      <number>0</number>
+     </property>
+     <property name="leftMargin">
+      <number>1</number>
+     </property>
+     <property name="topMargin">
+      <number>0</number>
+     </property>
+     <property name="rightMargin">
+      <number>1</number>
+     </property>
+     <property name="bottomMargin">
+      <number>1</number>
+     </property>
+     <item>
+      <widget class="QFrame" name="sceneGridFrame">
+       <layout class="QVBoxLayout" name="sceneGridLayout">
+        <property name="spacing">
+         <number>0</number>
+        </property>
+        <property name="leftMargin">
+         <number>0</number>
+        </property>
+        <property name="topMargin">
+         <number>0</number>
+        </property>
+        <property name="rightMargin">
+         <number>0</number>
+        </property>
+        <property name="bottomMargin">
+         <number>0</number>
+        </property>
+        <item>
+         <widget class="QListWidget" name="sceneGrid">
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+            <horstretch>0</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+          <property name="viewMode">
+           <enum>QListWidget::IconMode</enum>
+          </property>
+          <property name="iconSize">
+           <size>
+            <width>48</width>
+            <height>48</height>
+           </size>
+          </property>
+          <property name="resizeMode">
+           <enum>QListWidget::Adjust</enum>
+          </property>
+          <property name="movement">
+           <enum>QListWidget::Static</enum>
+          </property>
+          <property name="dragDropMode">
+           <enum>QAbstractItemView::NoDragDrop</enum>
+          </property>
+          <property name="selectionMode">
+           <enum>QAbstractItemView::SingleSelection</enum>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QToolBar" name="sceneGridToolbar">
+          <property name="sizePolicy">
+           <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+            <horstretch>0</horstretch>
+            <verstretch>0</verstretch>
+           </sizepolicy>
+          </property>
+          <property name="iconSize">
+           <size>
+            <width>16</width>
+            <height>16</height>
+           </size>
+          </property>
+          <property name="floatable">
+           <bool>false</bool>
+          </property>
+          <addaction name="actionAddScene"/>
+          <addaction name="actionRemoveScene"/>
+          <addaction name="separator"/>
+          <addaction name="actionSceneUp"/>
+          <addaction name="actionSceneDown"/>
+         </widget>
         </item>
        </layout>
       </widget>
@@ -1670,7 +1750,7 @@
     <string>Remove</string>
    </property>
    <property name="toolTip">
-    <string>RemoveScene</string>
+    <string>RemoveSelectedItem</string>
    </property>
    <property name="shortcut">
     <string>Del</string>
@@ -2401,9 +2481,10 @@
    <header>components/SourceTree.hpp</header>
   </customwidget>
   <customwidget>
-   <class>SceneTree</class>
-   <extends>QListWidget</extends>
-   <header>components/SceneTree.hpp</header>
+    <class>SceneTree</class>
+    <extends>QWidget</extends>
+    <header>components/SceneTree.hpp</header>
+    <container>1</container>
   </customwidget>
   <customwidget>
    <class>OBSDock</class>

@@ -898,6 +898,10 @@ void OBSBasic::Save(SceneCollection &collection)
 	obs_data_set_double(saveData, "scaling_off_x", ui->preview->GetScrollX());
 	obs_data_set_double(saveData, "scaling_off_y", ui->preview->GetScrollY());
 
+	// Save scene folder layout (per-profile persistence)
+	QString layoutJson = ui->scenes->SaveLayout();
+	obs_data_set_string(saveData, "scene_layout", layoutJson.toUtf8().constData());
+
 	if (vcamEnabled) {
 		OBSDataAutoRelease obj = obs_data_create();
 
@@ -1077,17 +1081,14 @@ void OBSBasic::LogScenes()
 	blog(LOG_INFO, "------------------------------------------------");
 	blog(LOG_INFO, "Loaded scenes:");
 
-	for (int i = 0; i < ui->scenes->count(); i++) {
-		QListWidgetItem *item = ui->scenes->item(i);
-		OBSScene scene = GetOBSRef<OBSScene>(item);
-
+	ui->scenes->EnumerateScenes([](const QString &name, obs_scene_t *scene) {
 		obs_source_t *source = obs_scene_get_source(scene);
-		const char *name = obs_source_get_name(source);
+		const char *name_c = obs_source_get_name(source);
 
-		blog(LOG_INFO, "- scene '%s':", name);
+		blog(LOG_INFO, "- scene '%s':", name_c);
 		obs_scene_enum_items(scene, LogSceneItem, (void *)(intptr_t)1);
 		obs_source_enum_filters(source, LogFilter, (void *)(intptr_t)1);
-	}
+	});
 
 	blog(LOG_INFO, "------------------------------------------------");
 }
@@ -1302,6 +1303,12 @@ void OBSBasic::LoadData(obs_data_t *data, SceneCollection &collection)
 	if (sceneOrder)
 		LoadSceneListOrder(sceneOrder);
 
+	// Load folder layout (per-profile persistence)
+	const char *layoutJson = obs_data_get_string(data, "scene_layout");
+	if (layoutJson && *layoutJson) {
+		ui->scenes->LoadLayout(QT_UTF8(layoutJson));
+	}
+
 	curTransition = FindTransition(transitionName);
 	if (!curTransition)
 		curTransition = fadeTransition;
@@ -1498,7 +1505,7 @@ void OBSBasic::ClearSceneData()
 	CloseDialogs();
 
 	ClearVolumeControls();
-	ClearListItems(ui->scenes);
+	ui->scenes->Clear();
 	ui->sources->Clear();
 	ClearQuickTransitions();
 	ui->transitions->clear();
