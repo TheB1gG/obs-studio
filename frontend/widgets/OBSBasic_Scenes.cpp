@@ -361,7 +361,6 @@ void OBSBasic::RemoveSelectedScene()
 		OBSDataArrayAutoRelease sources_in_deleted_scene = obs_data_get_array(base, "sources_in_deleted_scene");
 		OBSDataArrayAutoRelease scene_used_in_other_scenes =
 			obs_data_get_array(base, "scene_used_in_other_scenes");
-		int savedIndex = (int)obs_data_get_int(base, "index");
 		std::vector<OBSSource> sources;
 
 		/* create missing sources */
@@ -584,7 +583,6 @@ void OBSBasic::on_scenes_customContextMenuRequested(const QPoint &pos)
 		// "Set Visible Count..." only shown when in Compact mode
 		if (currentDisplay == FolderDisplayMode::Compact) {
 			displayMenu->addSeparator();
-			int currentLimit = 3; // Will be set properly below
 			auto *limitAction = displayMenu->addAction("Set Visible Count...");
 			connect(limitAction, &QAction::triggered, this, [this, folderPath]() {
 				bool ok = false;
@@ -682,10 +680,10 @@ void OBSBasic::on_scenes_customContextMenuRequested(const QPoint &pos)
 
 	popup.addSeparator();
 
-	auto *expandAllAction = popup.addAction(QTStr("ExpandAll"), this, [this]() {
+	popup.addAction(QTStr("ExpandAll"), this, [this]() {
 		ui->scenes->ExpandAll();
 	});
-	auto *collapseAllAction = popup.addAction(QTStr("CollapseAll"), this, [this]() {
+	popup.addAction(QTStr("CollapseAll"), this, [this]() {
 		ui->scenes->CollapseAll();
 	});
 

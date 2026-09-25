@@ -1178,7 +1178,7 @@ void SceneTree::LoadLayout(const QString &json)
 	// Step 3: Rebuild from JSON using collected scene data (no re-parenting).
 	std::function<void(const QJsonArray &, QStandardItem *)> load =
 		[&](const QJsonArray &arr, QStandardItem *parent) {
-			for (const auto &val : arr) {
+			for (const auto val : arr) {
 				QJsonObject obj = val.toObject();
 				QString type = obj["type"].toString();
 				QString name = obj["name"].toString();

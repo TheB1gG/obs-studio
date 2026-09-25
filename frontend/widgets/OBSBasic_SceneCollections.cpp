@@ -1081,7 +1081,7 @@ void OBSBasic::LogScenes()
 	blog(LOG_INFO, "------------------------------------------------");
 	blog(LOG_INFO, "Loaded scenes:");
 
-	ui->scenes->EnumerateScenes([](const QString &name, obs_scene_t *scene) {
+	ui->scenes->EnumerateScenes([](const QString &, obs_scene_t *scene) {
 		obs_source_t *source = obs_scene_get_source(scene);
 		const char *name_c = obs_source_get_name(source);
 

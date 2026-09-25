@@ -232,7 +232,7 @@ int qsv_encoder_reconfig(qsv_t *pContext, qsv_param_t *pParams)
 	return true;
 }
 
-int qsv_encoder_reset_full(qsv_t *pContext, qsv_param_t *pParams, enum qsv_codec codec)
+int qsv_encoder_reset_full(qsv_t *pContext, qsv_param_t *pParams, enum qsv_codec)
 {
 	QSV_Encoder_Internal *pEncoder = (QSV_Encoder_Internal *)pContext;
 	mfxStatus sts = pEncoder->Resize(pParams);
