@@ -739,6 +739,9 @@ void SceneTree::RemoveScene(obs_scene_t *scene)
 		return;
 
 	const char *name = obs_source_get_name(obs_scene_get_source(scene));
+	if (!name)
+		return;
+
 	auto *item = FindSceneItem(QString::fromUtf8(name));
 	if (!item)
 		return;
@@ -747,9 +750,12 @@ void SceneTree::RemoveScene(obs_scene_t *scene)
 		currentScene = nullptr;
 
 	auto *parent = item->parent();
-	if (parent)
+	if (parent) {
 		parent->removeRow(item->row());
-	delete item;
+	} else {
+		// Top-level item: parent() is null for children of the invisible root.
+		model->removeRow(item->row(), QModelIndex());
+	}
 }
 
 void SceneTree::SetCurrentScene(obs_scene_t *scene)
@@ -1153,9 +1159,13 @@ void SceneTree::LoadLayout(const QString &json)
 
 	auto *root = model->invisibleRootItem();
 
-	// Step 1: Collect scene data (name + obs_scene_t*) from items already in the tree.
-	// These were added by SourceCreated during obs_load_sources.
+	// Step 1: Collect scene data (name + obs_scene_t*) and signal handler data
+	// from items already in the tree. These were added by SourceCreated during
+	// obs_load_sources. We must preserve the signal handlers (item_add, reorder,
+	// refresh) because they are stored in the QStandardItem's data and would be
+	// lost when we clear and rebuild the tree below.
 	QMap<QString, obs_scene_t *> sceneData;
+	QMap<QString, QVariant> signalData;
 	std::function<void(const QStandardItem *)> collect = [&](const QStandardItem *parent) {
 		for (int i = 0; i < parent->rowCount(); i++) {
 			auto *child = parent->child(i, 0);
@@ -1165,6 +1175,9 @@ void SceneTree::LoadLayout(const QString &json)
 				obs_scene_t *scene = static_cast<obs_scene_t *>(
 					child->data(SceneObsRefRole).value<void *>());
 				sceneData[child->text()] = scene;
+				QVariant sigVar = child->data(static_cast<int>(Qt::UserRole + 1)); // QtDataRole::OBSSignals
+				if (sigVar.isValid())
+					signalData[child->text()] = sigVar;
 			} else if (IsFolderItem(child)) {
 				collect(child);
 			}
@@ -1221,6 +1234,27 @@ void SceneTree::LoadLayout(const QString &json)
 			auto *item = CreateSceneItem(it.key(), it.value());
 			root->appendRow(item);
 		}
+	}
+
+	// Step 5: Re-apply preserved signal handler data to the new scene items.
+	// Without this, the "item_add"/"reorder"/"refresh" handlers would be lost
+	// and the sources dock would not update when sources are added/removed.
+	if (!signalData.isEmpty()) {
+		std::function<void(QStandardItem *)> restore = [&](QStandardItem *parent) {
+			for (int i = 0; i < parent->rowCount(); i++) {
+				auto *child = parent->child(i, 0);
+				if (!child)
+					continue;
+				if (IsSceneItem(child)) {
+					auto sigIt = signalData.find(child->text());
+					if (sigIt != signalData.end())
+						child->setData(sigIt.value(), static_cast<int>(Qt::UserRole + 1));
+				} else if (IsFolderItem(child)) {
+					restore(child);
+				}
+			}
+		};
+		restore(root);
 	}
 
 	isSyncingExpand = true;
@@ -1299,7 +1333,9 @@ void SceneTree::SetFilterText(const QString &text)
 
 void SceneTree::onItemSelectionChanged()
 {
-	if (isSorting)
+	// Ignore selection changes caused by search filtering or sorting — the
+	// active scene must only change when the user explicitly selects a scene.
+	if (isSorting || isFiltering)
 		return;
 
 	QModelIndex proxyIndex = treeView->currentIndex();
@@ -1608,10 +1644,14 @@ void SceneTree::ToggleScenePinByName(const QString &name)
 
 void SceneTree::onSearchTextChanged(const QString &text)
 {
+	// Guard so the incidental current-index changes that happen while rows are
+	// hidden/shown by the filter do not switch the active scene.
+	isFiltering = true;
 	proxyModel->setFilterFixedString(text);
 	isSyncingExpand = true;
 	treeView->expandAll();
 	isSyncingExpand = false;
+	isFiltering = false;
 }
 
 // --- Folder icons ----------------------------------------------------------------

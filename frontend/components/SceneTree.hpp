@@ -225,6 +225,9 @@ private:
 	int lastUsedCounter = 0;
 	bool isSorting = false;
 	bool isSyncingExpand = false;
+	// Set while the search filter is being applied so that the incidental
+	// current-index changes (rows hidden/shown) do not switch the active scene.
+	bool isFiltering = false;
 
 	// Internal helpers
 	QStandardItem *CreateFolderItem(const QString &name);

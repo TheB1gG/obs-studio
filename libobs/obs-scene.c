@@ -1701,6 +1701,11 @@ static bool scene_audio_render_internal(struct obs_scene *scene, struct obs_scen
 			continue;
 		}
 
+		if (source->audio_is_duplicated) {
+			item = item->next;
+			continue;
+		}
+
 		source_ts = obs_source_get_audio_timestamp(source);
 		if (!source_ts) {
 			item = item->next;

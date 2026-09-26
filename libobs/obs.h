@@ -1136,6 +1136,9 @@ EXPORT void obs_source_set_volume(obs_source_t *source, float volume);
 /** Gets the user volume for a source that has audio output */
 EXPORT float obs_source_get_volume(const obs_source_t *source);
 
+/* Signals the deduplication logic when an Audio Output Capture source's device changes. Pass NULL to clear. */
+EXPORT void obs_source_audio_output_capture_device_changed(obs_source_t *source, const char *device_id);
+
 /* Gets speaker layout of a source */
 EXPORT enum speaker_layout obs_source_get_speaker_layout(obs_source_t *source);
 

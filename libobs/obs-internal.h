@@ -408,6 +408,8 @@ struct obs_core_audio {
 
 	pthread_mutex_t task_mutex;
 	struct deque tasks;
+
+	struct obs_source *monitoring_duplicating_source;
 };
 
 /* user sources, output channels, and displays */
@@ -828,6 +830,8 @@ struct obs_source {
 	int64_t sync_offset;
 	int64_t last_sync_offset;
 	float balance;
+	/* audio_is_duplicated: tracks whether a source appears multiple times in the audio tree during this tick */
+	bool audio_is_duplicated;
 
 	/* async video data */
 	gs_texture_t *async_textures[MAX_AV_PLANES];

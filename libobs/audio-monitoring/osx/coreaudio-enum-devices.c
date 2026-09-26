@@ -104,7 +104,7 @@ static bool alloc_default_id(void *data, const char *name, const char *id)
 	return false;
 }
 
-static void get_default_id(char **p_id)
+void get_desktop_default_id(char **p_id)
 {
 	AudioObjectPropertyAddress addr = {kAudioHardwarePropertyDefaultSystemOutputDevice,
 					   kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
@@ -152,11 +152,11 @@ bool devices_match(const char *id1, const char *id2)
 		return false;
 
 	if (strcmp(id1, "default") == 0) {
-		get_default_id(&default_id);
+		get_desktop_default_id(&default_id);
 		id1 = default_id;
 	}
 	if (strcmp(id2, "default") == 0) {
-		get_default_id(&default_id);
+		get_desktop_default_id(&default_id);
 		id2 = default_id;
 	}
 
