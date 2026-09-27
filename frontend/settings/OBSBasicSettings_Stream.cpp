@@ -167,6 +167,11 @@ void OBSBasicSettings::LoadStream1Settings()
 	ui->multitrackVideoStreamDumpEnable->setChecked(
 		config_get_bool(main->Config(), "Stream1", "MultitrackVideoStreamDumpEnabled"));
 
+	ui->multitrackVideoOverlayCorner->setCurrentIndex(
+		(int)config_get_int(main->Config(), "Stream1", "MultitrackVideoDebugOverlay"));
+	ui->multitrackVideoOverlaySize->setCurrentIndex(
+		(int)config_get_int(main->Config(), "Stream1", "MultitrackVideoOverlaySize"));
+
 	ui->multitrackVideoConfigOverrideEnable->setChecked(
 		config_get_bool(main->Config(), "Stream1", "MultitrackVideoConfigOverrideEnabled"));
 	if (config_has_user_value(main->Config(), "Stream1", "MultitrackVideoConfigOverride"))
@@ -373,6 +378,10 @@ void OBSBasicSettings::SaveStream1Settings()
 	SaveCheckBox(ui->multitrackVideoMaximumVideoTracksAuto, "Stream1", "MultitrackVideoMaximumVideoTracksAuto");
 	SaveSpinBox(ui->multitrackVideoMaximumVideoTracks, "Stream1", "MultitrackVideoMaximumVideoTracks");
 	SaveCheckBox(ui->multitrackVideoStreamDumpEnable, "Stream1", "MultitrackVideoStreamDumpEnabled");
+	config_set_int(main->Config(), "Stream1", "MultitrackVideoDebugOverlay",
+		    ui->multitrackVideoOverlayCorner->currentIndex());
+	config_set_int(main->Config(), "Stream1", "MultitrackVideoOverlaySize",
+		    ui->multitrackVideoOverlaySize->currentIndex());
 	SaveCheckBox(ui->multitrackVideoConfigOverrideEnable, "Stream1", "MultitrackVideoConfigOverrideEnabled");
 	SaveText(ui->multitrackVideoConfigOverride, "Stream1", "MultitrackVideoConfigOverride");
 	{
@@ -399,6 +408,16 @@ void OBSBasicSettings::SaveStream1Settings()
 					 QString("The config override could not be applied to the running stream: %1\n")
 							.arg(QString::fromStdString(reason)));
 		}
+	}
+
+	// Apply the debug overlay setting live if streaming
+	if (!loading && obs_frontend_streaming_active()) {
+		int overlay_val = ui->multitrackVideoOverlayCorner->currentIndex();
+		int overlay_size = ui->multitrackVideoOverlaySize->currentIndex();
+		if (overlay_val > 0)
+			main->SetMultitrackDebugOverlay(true, overlay_val - 1, overlay_size);
+		else
+			main->SetMultitrackDebugOverlay(false, 0, overlay_size);
 	}
 
 	if (oldMultitrackVideoSetting != ui->enableMultitrackVideo->isChecked())

@@ -44,6 +44,7 @@ target_sources(
     audio-monitoring/win32/wasapi-output.c
     audio-monitoring/win32/wasapi-output.h
     libobs.rc
+    obs-debug-overlay-text.cpp
     obs-win-crash-handler.c
     obs-windows.c
     util/pipe-windows.c
@@ -69,7 +70,7 @@ set_source_files_properties(
 
 target_link_libraries(
   libobs
-  PRIVATE Avrt Dwmapi Dxgi winmm Rpcrt4 OBS::obfuscate OBS::winhandle OBS::COMutils
+  PRIVATE Avrt Dwmapi Dxgi winmm Rpcrt4 Gdiplus OBS::obfuscate OBS::winhandle OBS::COMutils
   PUBLIC OBS::w32-pthreads
 )
 

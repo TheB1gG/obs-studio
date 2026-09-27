@@ -1212,6 +1212,8 @@ static void obs_free_render_textures(struct obs_core_video_mix *video)
 	video->render_texture = NULL;
 	video->output_texture = NULL;
 
+	obs_debug_overlay_free(video);
+
 	gs_leave_context();
 }
 

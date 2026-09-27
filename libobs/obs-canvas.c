@@ -585,3 +585,15 @@ void obs_canvas_render(obs_canvas_t *canvas)
 {
 	obs_view_render(&canvas->view);
 }
+
+void obs_canvas_set_debug_overlay(obs_canvas_t *canvas, bool enabled, int corner, int size)
+{
+	(void)canvas;
+
+	/* Global flag: applies to ALL mixes including encoder-only mixes, so each
+	 * rendition shows its own output resolution. Safe to write from any
+	 * thread - the render thread reads it each frame (worst case one-frame delay). */
+	obs_debug_overlay_set_active(enabled);
+	obs_debug_overlay_set_corner(corner);
+	obs_debug_overlay_set_size(size);
+}

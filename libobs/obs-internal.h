@@ -329,10 +329,23 @@ struct obs_core_video_mix {
 	long encoder_refs;
 
 	bool mix_audio;
+
+	/* Debug overlay (resolution + FPS burned into output) */
+	gs_texture_t *debug_overlay_texture;
+	uint32_t debug_overlay_width;
+	uint32_t debug_overlay_height;
+	uint32_t debug_overlay_fps_num;
+	uint32_t debug_overlay_fps_den;
 };
 
 extern struct obs_core_video_mix *obs_create_video_mix(struct obs_video_info *ovi);
 extern void obs_free_video_mix(struct obs_core_video_mix *video);
+extern void obs_debug_overlay_draw(struct obs_core_video_mix *mix);
+extern void obs_debug_overlay_free(struct obs_core_video_mix *mix);
+extern void obs_debug_overlay_set_active(bool active);
+extern bool obs_debug_overlay_is_active(void);
+extern void obs_debug_overlay_set_corner(int corner);
+extern void obs_debug_overlay_set_size(int size);
 
 struct obs_core_video {
 	graphics_t *graphics;

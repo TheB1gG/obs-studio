@@ -1399,6 +1399,9 @@ public slots:
 	// (EnableMultitrackVideo) is enabled, and restores the highlighted toggle (the persisted active source).
 	void UpdateConfigOverridePresetDock();
 
+	// Toggles the burned-in resolution debug overlay on all active multitrack canvases.
+	void SetMultitrackDebugOverlay(bool enabled, int corner, int size);
+
 private slots:
 	/* Stream action (start/stop) slot */
 	void StreamActionTriggered();

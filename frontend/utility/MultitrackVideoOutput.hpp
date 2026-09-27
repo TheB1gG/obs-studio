@@ -55,6 +55,10 @@ public:
 	bool RestartOnError() { return restart_on_error; }
 	void SetRestartOnError(bool enabled) { restart_on_error = enabled; }
 
+	// Toggles the burned-in resolution/FPS debug overlay on all active canvases.
+	// Safe to call at any time (no-op if no stream is active).
+	void SetDebugOverlay(bool enabled, int corner, int size);
+
 private:
 	struct OBSOutputObjects {
 		OBSOutputAutoRelease output_;

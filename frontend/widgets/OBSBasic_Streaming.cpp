@@ -515,6 +515,12 @@ bool OBSBasic::ApplyMultitrackConfigOverride(const std::string &json, std::strin
 	return outputHandler->multitrackVideo->ApplyConfigOverride(json, failure_reason);
 }
 
+void OBSBasic::SetMultitrackDebugOverlay(bool enabled, int corner, int size)
+{
+	if (outputHandler && outputHandler->multitrackVideo)
+		outputHandler->multitrackVideo->SetDebugOverlay(enabled, corner, size);
+}
+
 extern std::string DeserializeConfigText(const char *value);
 
 void OBSBasic::ApplyMultitrackConfigOverridePreset(int index)

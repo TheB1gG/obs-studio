@@ -394,6 +394,8 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->multitrackVideoMaximumVideoTracksAuto, CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoMaximumVideoTracks,     SCROLL_CHANGED, STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoStreamDumpEnable,            CHECK_CHANGED,  STREAM1_CHANGED);
+	HookWidget(ui->multitrackVideoOverlayCorner,              COMBO_CHANGED,  STREAM1_CHANGED);
+	HookWidget(ui->multitrackVideoOverlaySize,               COMBO_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoConfigOverrideEnable,        CHECK_CHANGED,  STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoConfigOverride,              TEXT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoConfigOverridePreset1,       TEXT_CHANGED,   STREAM1_CHANGED);
@@ -5754,6 +5756,9 @@ void OBSBasicSettings::UpdateMultitrackVideo()
 	ui->multitrackVideoAdditionalCanvas->setEnabled(toggle_available && ui->enableMultitrackVideo->isChecked());
 
 	ui->multitrackVideoStreamDumpEnable->setVisible(available && MultitrackVideoDeveloperModeEnabled());
+	ui->multitrackVideoOverlayCornerLabel->setVisible(available);
+	ui->multitrackVideoOverlayCorner->setVisible(available);
+	ui->multitrackVideoOverlaySize->setVisible(available);
 	ui->multitrackVideoConfigOverrideEnable->setVisible(available && MultitrackVideoDeveloperModeEnabled());
 	ui->multitrackVideoConfigOverrideLabel->setVisible(available && MultitrackVideoDeveloperModeEnabled());
 	ui->multitrackVideoConfigOverride->setVisible(available && MultitrackVideoDeveloperModeEnabled());
@@ -5764,6 +5769,10 @@ void OBSBasicSettings::UpdateMultitrackVideo()
 					   ui->multitrackVideoConfigOverrideEnable->isChecked();
 
 	ui->multitrackVideoStreamDumpEnable->setEnabled(toggle_available && ui->enableMultitrackVideo->isChecked());
+	// The debug overlay can be toggled live while streaming, so it only requires multitrack to be enabled.
+	ui->multitrackVideoOverlayCornerLabel->setEnabled(available && ui->enableMultitrackVideo->isChecked());
+	ui->multitrackVideoOverlayCorner->setEnabled(available && ui->enableMultitrackVideo->isChecked());
+	ui->multitrackVideoOverlaySize->setEnabled(available && ui->enableMultitrackVideo->isChecked());
 	ui->multitrackVideoConfigOverrideEnable->setEnabled(toggle_available && ui->enableMultitrackVideo->isChecked());
 	ui->multitrackVideoConfigOverrideLabel->setEnabled(override_live_editable);
 	ui->multitrackVideoConfigOverride->setEnabled(override_live_editable);

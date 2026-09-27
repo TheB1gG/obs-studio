@@ -542,6 +542,12 @@ std::shared_future<void> BasicOutputHandler::SetupMultitrackVideo(obs_service_t 
 
 		multitrackVideoActive = true;
 
+		// Apply the debug overlay setting if it was enabled in settings
+		int overlay_corner = (int)config_get_int(main->Config(), "Stream1", "MultitrackVideoDebugOverlay");
+		if (overlay_corner > 0)
+			multitrackVideo->SetDebugOverlay(true, overlay_corner - 1,
+				(int)config_get_int(main->Config(), "Stream1", "MultitrackVideoOverlaySize"));
+
 		auto signal_handler = multitrackVideo->StreamingSignalHandler();
 
 		streamDelayStarting.Connect(signal_handler, "starting", OBSStreamStarting, this);

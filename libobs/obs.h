@@ -2657,6 +2657,10 @@ EXPORT video_t *obs_canvas_get_video(const obs_canvas_t *canvas);
 EXPORT bool obs_canvas_get_video_info(const obs_canvas_t *canvas, struct obs_video_info *ovi);
 /** Renders the sources of this canvas's view context */
 EXPORT void obs_canvas_render(obs_canvas_t *canvas);
+/** Enables or disables a debug overlay (resolution) burned into the canvas output.
+ * corner: 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
+ * size: 0=very small, 1=small, 2=medium, 3=large, 4=very large */
+EXPORT void obs_canvas_set_debug_overlay(obs_canvas_t *canvas, bool enabled, int corner, int size);
 
 #ifdef __cplusplus
 }

@@ -214,6 +214,9 @@ static inline void render_main_texture(struct obs_core_video_mix *video)
 		obs_view_render(video->view);
 	}
 
+	if (obs_debug_overlay_is_active())
+		obs_debug_overlay_draw(video);
+
 	video->texture_rendered = true;
 
 	pthread_mutex_lock(&obs->data.draw_callbacks_mutex);

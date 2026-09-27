@@ -43,6 +43,7 @@ target_sources(
     obs-data.c
     obs-data.h
     obs-defs.h
+    obs-debug-overlay.c
     obs-display.c
     obs-encoder.c
     obs-encoder.h

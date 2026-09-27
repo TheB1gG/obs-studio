@@ -1369,6 +1369,25 @@ std::optional<MultitrackVideoOutput::OBSOutputObjects> MultitrackVideoOutput::ta
 	return val;
 }
 
+void MultitrackVideoOutput::SetDebugOverlay(bool enabled, int corner, int size)
+{
+	{
+		const std::lock_guard<std::mutex> lock{current_mutex};
+		if (current.has_value()) {
+			for (auto &canvas : current->canvases)
+				obs_canvas_set_debug_overlay(canvas, enabled, corner, size);
+		}
+	}
+
+	{
+		const std::lock_guard<std::mutex> lock{current_stream_dump_mutex};
+		if (current_stream_dump.has_value()) {
+			for (auto &canvas : current_stream_dump->canvases)
+				obs_canvas_set_debug_overlay(canvas, enabled, corner, size);
+		}
+	}
+}
+
 void MultitrackVideoOutput::ReleaseOnMainThread(std::optional<OBSOutputObjects> objects)
 {
 
