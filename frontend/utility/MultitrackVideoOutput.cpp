@@ -338,6 +338,21 @@ static OBSEncoderAutoRelease create_video_encoder(DStr &name_buffer, size_t enco
 	}
 	obs_data_set_bool(encoder_settings, "disable_scenecut", true);
 
+	/* Explicitly pin the color format/space/range in the encoder settings when the multitrack config
+	 * specifies them. Without this, the encoder's get_defaults callback (e.g. NVENC HEVC defaulting to
+	 * P010) sets a default "color_format" that apply_encoder_color_settings() later reads and uses to
+	 * override the preferred format set by adjust_video_encoder_scaling(). Setting an explicit value here
+	 * takes precedence over get_defaults since obs_data_set_default_string only fills in missing keys. */
+	if (encoder_config.format) {
+		obs_data_set_string(encoder_settings, "color_format", get_video_format_name(*encoder_config.format));
+	}
+	if (encoder_config.colorspace) {
+		obs_data_set_int(encoder_settings, "color_space", *encoder_config.colorspace);
+	}
+	if (encoder_config.range) {
+		obs_data_set_int(encoder_settings, "color_range", *encoder_config.range);
+	}
+
 	OBSEncoderAutoRelease video_encoder =
 		obs_video_encoder_create(encoder_type, name_buffer, encoder_settings, nullptr);
 	if (!video_encoder) {
