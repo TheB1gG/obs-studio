@@ -104,6 +104,16 @@ struct nvenc_data {
 	bool reconfig_pending;
 	int64_t frames_since_idr; /* submitted frames since last observed IDR packet */
 
+	/* ABR governor (ABR mode only): runs NVENC in QVBR (averageBitRate=0) so the
+	 * driver's sustained-rate cap of min(maxBitRate, 2*averageBitRate) doesn't
+	 * apply, then adapts maxBitRate at runtime so the long-term average tracks
+	 * props.bitrate. See abr_gov_update() / abr_gov_apply() in nvenc.c. */
+	bool     abr_active;    /* ABR mode selected (gates the governor) */
+	double   abr_total_bits;  /* cumulative encoded bits (integral of output rate) */
+	double   abr_total_time;  /* cumulative stream seconds */
+	double   abr_acc_time;    /* stream seconds accumulated since last adjustment */
+	uint32_t abr_max_rate;    /* currently applied maxBitRate (bps) */
+
 	/* Live RESOLUTION changes cannot be staged the same way: libobs  */
 	/* starts delivering frames at the new size on the very next tick,*/
 	/* so the NVENC session is resized immediately (forced mid-GOP    */

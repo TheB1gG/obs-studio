@@ -92,13 +92,14 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs
 	const char *rc = obs_data_get_string(settings, "rate_control");
 	bool cqp = strcmp(rc, "CQP") == 0;
 	bool vbr = strcmp(rc, "VBR") == 0;
+	bool abr = strcmp(rc, "ABR") == 0;
 	bool cqvbr = strcmp(rc, "CQVBR") == 0;
 	bool lossless = strcmp(rc, "lossless") == 0;
 
 	p = obs_properties_get(ppts, "bitrate");
 	obs_property_set_visible(p, !cqp && !lossless && !cqvbr);
 	p = obs_properties_get(ppts, "max_bitrate");
-	obs_property_set_visible(p, vbr || cqvbr);
+	obs_property_set_visible(p, vbr || cqvbr || abr);
 	p = obs_properties_get(ppts, "target_quality");
 	obs_property_set_visible(p, cqvbr);
 	p = obs_properties_get(ppts, "cqp");
@@ -125,6 +126,7 @@ obs_properties_t *nvenc_properties_internal(enum codec_type codec)
 	obs_property_list_add_string(p, obs_module_text("CBR"), "CBR");
 	obs_property_list_add_string(p, obs_module_text("CQP"), "CQP");
 	obs_property_list_add_string(p, obs_module_text("VBR"), "VBR");
+	obs_property_list_add_string(p, obs_module_text("ABR"), "ABR");
 	obs_property_list_add_string(p, obs_module_text("CQVBR"), "CQVBR");
 	if (caps->lossless) {
 		obs_property_list_add_string(p, obs_module_text("Lossless"), "lossless");

@@ -7,6 +7,12 @@
 
 #define EXTRA_BUFFERS 5
 
+/* ABR (Adaptive Bitrate) mode: QVBR quality aim. 1 = best-quality target that is
+ * valid across H.264/HEVC (range 0-51) and AV1 (where 0 means "automatic", so 1 is
+ * the true best-quality setting). The ABR governor adapts maxBitRate to track the
+ * user's target bitrate, so this only sets how aggressively the encoder spends bits. */
+#define ABR_TARGET_QUALITY 1
+
 #ifndef _WIN32
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #define max(a, b) (((a) > (b)) ? (a) : (b))
@@ -109,9 +115,12 @@ static inline int nv_get_cap(struct nvenc_data *enc, NV_ENC_CAPS cap)
 static const char *nvenc_rc_mode_name(NV_ENC_PARAMS_RC_MODE mode)
 {
 	switch (mode) {
-	case NV_ENC_PARAMS_RC_CBR:     return "CBR";
-	case NV_ENC_PARAMS_RC_VBR:     return "VBR";
-	case NV_ENC_PARAMS_RC_CONSTQP: return "CQP";
+	case NV_ENC_PARAMS_RC_CBR:
+		return "CBR";
+	case NV_ENC_PARAMS_RC_VBR:
+		return "VBR";
+	case NV_ENC_PARAMS_RC_CONSTQP:
+		return "CQP";
 	}
 
 	return "unknown";
@@ -124,10 +133,10 @@ static const char *nvenc_rc_mode_name(NV_ENC_PARAMS_RC_MODE mode)
 static bool apply_nvenc_reconfigure(struct nvenc_data *enc)
 {
 	NV_ENC_RECONFIGURE_PARAMS params = {0};
-	params.version            = NV_ENC_RECONFIGURE_PARAMS_VER;
+	params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
 	params.reInitEncodeParams = enc->params; // carries enc->config (encodeConfig)
-	params.resetEncoder       = 1;          // resets rate-control state - requires IDR
-	params.forceIDR           = 1;
+	params.resetEncoder = 1;                 // resets rate-control state - requires IDR
+	params.forceIDR = 1;
 
 	if (NV_FAILED(nv.nvEncReconfigureEncoder(enc->session, &params))) {
 		return false; // encoder keeps its previous mode/state
@@ -139,7 +148,7 @@ static bool apply_nvenc_reconfigure(struct nvenc_data *enc)
 	enc->buffers_queued = 0;
 	deque_free(&enc->dts_list);
 	deque_init(&enc->dts_list);
-	enc->cur_bitstream  = enc->next_bitstream;
+	enc->cur_bitstream = enc->next_bitstream;
 
 	/* Re-arm sequence-parameter capture: the next locked frame is the   */
 	/* forced IDR of the reconfigured session, and get_encoded_packet()  */
@@ -150,6 +159,107 @@ static bool apply_nvenc_reconfigure(struct nvenc_data *enc)
 	enc->first_packet = true;
 
 	return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* ABR (Adaptive Bitrate) governor                                            */
+/*                                                                           */
+/* ABR mode runs NVENC in QVBR (rateControlMode=VBR, averageBitRate=0,        */
+/* targetQuality set) so the driver's sustained-rate cap of                    */
+/* min(maxBitRate, 2*averageBitRate) does not apply. The governor below then   */
+/* adapts maxBitRate at runtime (NV_ENC_RECONFIGURE_ENCODER, no reset/IDR)     */
+/* so the long-term average converges to props.bitrate: complex scenes may     */
+/* spend up to the cap, easy scenes stay low, and the average tracks target.   */
+
+static void abr_gov_apply(struct nvenc_data *enc, uint32_t new_max_bps)
+{
+	NV_ENC_RECONFIGURE_PARAMS params = {0};
+	params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+	params.reInitEncodeParams = enc->params; // carries enc->config (encodeConfig)
+	params.resetEncoder = 0;                 /* no reset: no IDR churn, no queue rewind */
+	params.forceIDR = 0;
+
+	const uint32_t old = enc->config.rcParams.maxBitRate;
+	enc->config.rcParams.maxBitRate = new_max_bps;
+
+	if (NV_FAILED(nv.nvEncReconfigureEncoder(enc->session, &params))) {
+		enc->config.rcParams.maxBitRate = old; // revert: driver kept previous value
+		warn("ABR governor: reconfigure failed, keeping previous max bitrate");
+		return;
+	}
+
+	enc->abr_max_rate = new_max_bps;
+}
+
+static void abr_gov_update(struct nvenc_data *enc, uint32_t frame_size_bytes)
+{
+	if (!enc->abr_active)
+		return;
+
+	const int64_t target_bps = enc->props.bitrate * 1000;
+	if (target_bps <= 0)
+		return;
+
+	const struct video_output_info *voi = video_output_get_info(obs_encoder_video(enc->encoder));
+	if (voi->fps_num == 0)
+		return;
+
+	/* Nominal per-frame duration in seconds (constant-FPS video output). */
+	const double dt = (double)voi->fps_den / voi->fps_num;
+	if (dt <= 0.0)
+		return;
+
+	/* x264-style integral control: track the CUMULATIVE output (total bits used)
+	 * against the target rate. The long-term average = total_bits / total_time is
+	 * exactly what a file's reported bitrate reflects, so driving the cap from it
+	 * makes that average converge to props.bitrate. (An EMA of the instantaneous
+	 * rate instead tracks recent complexity and misfires on complex bursts.) */
+	enc->abr_total_bits += (double)frame_size_bytes * 8.0;
+	enc->abr_total_time += dt;
+	enc->abr_acc_time += dt;
+
+	if (enc->abr_acc_time < 1.0) /* at most one governor tick per second */
+		return;
+	enc->abr_acc_time = 0.0;
+
+	const double cum_avg = enc->abr_total_time > 0.0 ? enc->abr_total_bits / enc->abr_total_time : 0.0;
+
+	if (!enc->can_change_bitrate)
+		return; /* cannot adjust maxBitRate at runtime on this driver */
+
+	if (enc->abr_total_time < 2.0) /* need a little history before deciding */
+		return;
+
+	const uint32_t ceiling =
+		(uint32_t)((enc->props.max_bitrate > 0 ? enc->props.max_bitrate : enc->props.bitrate) * 1000);
+
+	double ratio;
+	uint32_t new_max;
+
+	if (cum_avg > target_bps * 1.05) {
+		/* cumulative average above target: taper the cap down toward target */
+		ratio = (double)target_bps / cum_avg;
+		if (ratio < 0.8)
+			ratio = 0.8;
+		new_max = (uint32_t)(enc->abr_max_rate * ratio);
+		if (new_max < (uint32_t)target_bps)
+			new_max = (uint32_t)target_bps;
+	} else if (cum_avg > 1.0 && cum_avg < target_bps * 0.95) {
+		/* cumulative average below target: restore headroom up to the ceiling */
+		ratio = (double)target_bps / cum_avg;
+		if (ratio > 2.0)
+			ratio = 2.0;
+		new_max = (uint32_t)(enc->abr_max_rate * ratio);
+		if (new_max > ceiling)
+			new_max = ceiling;
+	} else {
+		return; /* within +/-5% dead band: keep current cap */
+	}
+
+	if (new_max == 0 || new_max == enc->abr_max_rate)
+		return;
+
+	abr_gov_apply(enc, new_max);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -182,12 +292,12 @@ static bool apply_nvenc_resize(struct nvenc_data *enc, uint32_t w, uint32_t h)
 	info("applying live resolution change: %ux%u -> %ux%u (forced IDR this frame)", enc->cx, enc->cy, w, h);
 
 	/* Session parameters for the reconfigure below. */
-	enc->params.encodeWidth  = w;
+	enc->params.encodeWidth = w;
 	enc->params.encodeHeight = h;
-	enc->params.darWidth     = w;
-	enc->params.darHeight    = h;
-	enc->cx                  = w;
-	enc->cy                  = h;
+	enc->params.darWidth = w;
+	enc->params.darHeight = h;
+	enc->cx = w;
+	enc->cy = h;
 
 #ifdef _WIN32
 	if (!enc->non_texture) {
@@ -205,7 +315,7 @@ static bool apply_nvenc_resize(struct nvenc_data *enc, uint32_t w, uint32_t h)
 
 #ifdef _WIN32
 	if (!enc->non_texture) {
-		enc->textures.num = 0; // reuse reserved storage, re-init refills entries
+		enc->textures.num = 0;         // reuse reserved storage, re-init refills entries
 		if (!d3d11_init_textures(enc)) // register new-size resources on the resized session
 			return false;
 	} else
@@ -251,19 +361,22 @@ bool nvenc_maybe_resize(struct nvenc_data *enc)
 	}
 
 	const int64_t s = g - ((int64_t)enc->output_delay - 1); /* counter position of a shared keyframe tick */
-	const int64_t o = enc->frames_since_idr;                /* submissions since last observed IDR (pre-increment) */
-	const int64_t p = o + 1;                                /* this submission's position in the cycle [1..g] */
+	const int64_t o = enc->frames_since_idr; /* submissions since last observed IDR (pre-increment) */
+	const int64_t p = o + 1;                 /* this submission's position in the cycle [1..g] */
 
 	int64_t delta; // submissions after THIS one until the next shared keyframe tick (0 = this frame)
-	if (p < s)      delta = s - p;         /* grid point later in this observation cycle */
-	else if (p > s) delta = g - (p - s);  /* already past it, wraps to the next cycle */
-	else            delta = 0;            /* this frame is itself a shared keyframe tick */
+	if (p < s)
+		delta = s - p; /* grid point later in this observation cycle */
+	else if (p > s)
+		delta = g - (p - s); /* already past it, wraps to the next cycle */
+	else
+		delta = 0; /* this frame is itself a shared keyframe tick */
 
 	if (delta == 0) {
 		info("resize landed exactly on a shared keyframe boundary - alignment preserved");
 		enc->reconfig_pending = false; /* any staged RC change already rode on this reset */
 	} else {
-		enc->align_pending   = true;
+		enc->align_pending = true;
 		enc->align_remaining = delta + 1; /* pre-decremented in encode_base() starting with this frame */
 		info("staged resize realignment - forcing keyframe at next shared boundary "
 		     "(%lld frames, gopLength=%d output_delay=%d)",
@@ -277,17 +390,18 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 {
 	struct nvenc_data *enc = data;
 
-	int64_t bitrate     = obs_data_get_int(settings, "bitrate");
+	int64_t bitrate = obs_data_get_int(settings, "bitrate");
 	int64_t max_bitrate = obs_data_get_int(settings, "max_bitrate");
 	const char *rc_name = obs_data_get_string(settings, "rate_control");
 
 	NV_ENC_CONFIG *config = &enc->config;
 
-	bool cqp    = astrcmpi(rc_name, "CQP") == 0;
-	bool vbr    = astrcmpi(rc_name, "VBR") == 0;
+	bool cqp = astrcmpi(rc_name, "CQP") == 0;
+	bool vbr = astrcmpi(rc_name, "VBR") == 0;
+	bool abr = astrcmpi(rc_name, "ABR") == 0;
 	bool cq_vbr = astrcmpi(rc_name, "CQVBR") == 0;
 	int64_t cqp_val = obs_data_get_int(settings, "cqp");
-	int64_t tq_val  = obs_data_get_int(settings, "target_quality");
+	int64_t tq_val = obs_data_get_int(settings, "target_quality");
 
 	/* Lossless encoders use LOSSLESS tuning which is fixed at session init - */
 	/* switching away from (or to) it requires a full restart.                */
@@ -309,7 +423,7 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 
 	if (cqp) {
 		desired_mode = NV_ENC_PARAMS_RC_CONSTQP;
-	} else if (vbr || cq_vbr) {
+	} else if (vbr || cq_vbr || abr) {
 		desired_mode = NV_ENC_PARAMS_RC_VBR;
 	} else if (astrcmpi(rc_name, "CBR") == 0) {
 		desired_mode = NV_ENC_PARAMS_RC_CBR;
@@ -317,18 +431,19 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 
 	const int64_t cqp_scaled = enc->codec == CODEC_AV1 ? cqp_val * 4 : cqp_val;
 
-	/* CQVBR runs in VBR mode with averageBitRate = 0 */
-	bool cq_state = config->rcParams.rateControlMode == NV_ENC_PARAMS_RC_VBR &&
-			config->rcParams.averageBitRate == 0;
+	/* CQVBR and ABR both run in VBR mode with averageBitRate = 0; enc->abr_active
+	 * distinguishes which one we're currently in. */
+	bool qvbr_config = config->rcParams.rateControlMode == NV_ENC_PARAMS_RC_VBR &&
+			   config->rcParams.averageBitRate == 0;
+	bool cq_state = qvbr_config && !enc->abr_active; /* currently CQVBR (not ABR) */
 
-	bool rc_changed = desired_mode != config->rcParams.rateControlMode ||
-			(cq_vbr != cq_state) ||
-			(desired_mode == NV_ENC_PARAMS_RC_CONSTQP &&
-			 (int64_t)config->rcParams.constQP.qpIntra != cqp_scaled) ||
-			(cq_vbr && config->rcParams.targetQuality != (uint8_t)tq_val);
+	bool rc_changed =
+		desired_mode != config->rcParams.rateControlMode || (cq_vbr != cq_state) || (abr != enc->abr_active) ||
+		(desired_mode == NV_ENC_PARAMS_RC_CONSTQP && (int64_t)config->rcParams.constQP.qpIntra != cqp_scaled) ||
+		(cq_vbr && config->rcParams.targetQuality != (uint8_t)tq_val);
 
 	bool br_changed = enc->can_change_bitrate &&
-			(enc->props.bitrate != bitrate || enc->props.max_bitrate != max_bitrate);
+			  (enc->props.bitrate != bitrate || enc->props.max_bitrate != max_bitrate);
 
 	/* Detect effective FPS change (e.g. frame rate divisor changed live). NVENC's CBR
 	 * rate controller uses frameRateNum/Den to calculate per-frame bit budgets, so it
@@ -341,19 +456,19 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 	struct dstr change_desc = {0};
 	if (fps_changed) {
 		dstr_catf(&change_desc, "%gFPS (%u/%u) -> %gFPS (%u/%u)",
-		         (double)enc->params.frameRateNum / enc->params.frameRateDen,
-		         enc->params.frameRateNum, enc->params.frameRateDen,
-		         (double)fps_num / fps_den, fps_num, fps_den);
+			  (double)enc->params.frameRateNum / enc->params.frameRateDen, enc->params.frameRateNum,
+			  enc->params.frameRateDen, (double)fps_num / fps_den, fps_num, fps_den);
 		enc->params.frameRateNum = fps_num;
 		enc->params.frameRateDen = fps_den;
 	}
 	if (br_changed) {
-		if (change_desc.array) dstr_cat(&change_desc, ", ");
-		dstr_catf(&change_desc, "bitrate %lld -> %lld",
-		         (long long)enc->props.bitrate, (long long)bitrate);
+		if (change_desc.array)
+			dstr_cat(&change_desc, ", ");
+		dstr_catf(&change_desc, "bitrate %lld -> %lld", (long long)enc->props.bitrate, (long long)bitrate);
 	}
 	if (rc_changed) {
-		if (change_desc.array) dstr_cat(&change_desc, ", ");
+		if (change_desc.array)
+			dstr_cat(&change_desc, ", ");
 		dstr_catf(&change_desc, "RC %s", rc_name ? rc_name : "?");
 	}
 
@@ -367,19 +482,31 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 		     nvenc_rc_mode_name(config->rcParams.rateControlMode), nvenc_rc_mode_name(desired_mode));
 
 		config->rcParams.rateControlMode = desired_mode;
-		config->rcParams.averageBitRate  = (uint32_t)bitrate * 1000;
-		config->rcParams.maxBitRate      = (vbr || cq_vbr) ? (uint32_t)max_bitrate * 1000 : (uint32_t)bitrate * 1000;
-		config->rcParams.vbvBufferSize   = (uint32_t)bitrate * 1000;
+		config->rcParams.averageBitRate = (uint32_t)bitrate * 1000;
+		config->rcParams.maxBitRate = (vbr || cq_vbr) ? (uint32_t)max_bitrate * 1000 : (uint32_t)bitrate * 1000;
+		config->rcParams.vbvBufferSize = (uint32_t)bitrate * 1000;
 
 		if (cqp) {
 			config->rcParams.constQP.qpInterP = (uint32_t)cqp_scaled;
 			config->rcParams.constQP.qpInterB = (uint32_t)cqp_scaled;
-			config->rcParams.constQP.qpIntra  = (uint32_t)cqp_scaled;
+			config->rcParams.constQP.qpIntra = (uint32_t)cqp_scaled;
 		} else if (cq_vbr) {
-			config->rcParams.targetQuality   = (uint8_t)tq_val;
-			config->rcParams.averageBitRate  = 0;
-			config->rcParams.vbvBufferSize   = 0;
+			config->rcParams.targetQuality = (uint8_t)tq_val;
+			config->rcParams.averageBitRate = 0;
+			config->rcParams.vbvBufferSize = 0;
+		} else if (abr) {
+			config->rcParams.targetQuality = ABR_TARGET_QUALITY;
+			config->rcParams.averageBitRate = 0;
+			config->rcParams.vbvBufferSize = 0;
+			/* Open at the target (mirror init_encoder_base): governor raises toward max. */
+			config->rcParams.maxBitRate = (uint32_t)bitrate * 1000;
+			enc->abr_total_bits = 0.0; /* restart cumulative tracking */
+			enc->abr_total_time = 0.0;
+			enc->abr_acc_time = 0.0;
+			enc->abr_max_rate = config->rcParams.maxBitRate;
 		}
+
+		enc->abr_active = abr; /* track ABR state for governor + future change detection */
 
 		/* Two-pass state is not safe to carry across an RC-regime change */
 		config->rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
@@ -390,17 +517,18 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 				desired_mode == NV_ENC_PARAMS_RC_CBR ? 1 : 0;
 		}
 
-		enc->can_change_bitrate = cqp ? false
-					      : nv_get_cap(enc, NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE);
+		enc->can_change_bitrate = cqp ? false : nv_get_cap(enc, NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE);
 	} else if (br_changed) {
-		info("changing bitrate from %lld to %lld while streaming", (long long)enc->props.bitrate, (long long)bitrate);
+		info("changing bitrate from %lld to %lld while streaming", (long long)enc->props.bitrate,
+		     (long long)bitrate);
 
 		bool is_vbr = config->rcParams.rateControlMode == NV_ENC_PARAMS_RC_VBR;
-		config->rcParams.averageBitRate = (uint32_t)bitrate * 1000;
-		config->rcParams.maxBitRate     = is_vbr ? (uint32_t)max_bitrate * 1000 : (uint32_t)bitrate * 1000;
+		if (!enc->abr_active)
+			config->rcParams.averageBitRate = (uint32_t)bitrate * 1000; /* ABR keeps averageBitRate=0 */
+		config->rcParams.maxBitRate = is_vbr ? (uint32_t)max_bitrate * 1000 : (uint32_t)bitrate * 1000;
 	}
 
-	enc->props.bitrate     = bitrate;
+	enc->props.bitrate = bitrate;
 	enc->props.max_bitrate = max_bitrate;
 	if (cqp) {
 		enc->props.cqp = cqp_val;
@@ -420,8 +548,7 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 	}
 
 	info("staged reconfigure [%s] - applying at next keyframe (%u frames, boundary=%lld counter_now=%lld)",
-	     change_desc.array ? change_desc.array : "(none)",
-	     (unsigned int)enc->config.gopLength,
+	     change_desc.array ? change_desc.array : "(none)", (unsigned int)enc->config.gopLength,
 	     (long long)((int64_t)enc->config.gopLength - ((int64_t)enc->output_delay - 1)),
 	     (long long)enc->frames_since_idr);
 	dstr_free(&change_desc);
@@ -578,6 +705,7 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 
 	bool cqvbr = astrcmpi(enc->props.rate_control, "CQVBR") == 0;
 	bool vbr = cqvbr || astrcmpi(enc->props.rate_control, "VBR") == 0;
+	bool abr = astrcmpi(enc->props.rate_control, "ABR") == 0;
 	bool lossless = strcmp(enc->props.rate_control, "lossless") == 0;
 	bool cqp = strcmp(enc->props.rate_control, "CQP") == 0;
 
@@ -722,13 +850,33 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 		bitrate = 0;
 		max_bitrate = 0;
 
-	} else if (!vbr) { /* CBR by default */
+	} else if (!vbr && !abr) { /* CBR by default (ABR is handled below, not here) */
 		config->rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
 	} else if (cqvbr) {
 		config->rcParams.targetQuality = (uint8_t)enc->props.target_quality;
 		config->rcParams.averageBitRate = 0;
 		config->rcParams.vbvBufferSize = 0;
+	} else if (abr) {
+		/* ABR: QVBR (averageBitRate=0) so the driver's 2x-average cap doesn't apply,
+		 * plus a runtime governor that adapts maxBitRate to track the target bitrate. */
+		config->rcParams.targetQuality = ABR_TARGET_QUALITY;
+		config->rcParams.averageBitRate = 0;
+		config->rcParams.vbvBufferSize = 0;
+		/* Open at the target, not the max: the governor raises the cap toward the
+		 * ceiling as budget allows, so complex content can still burst, but we never
+		 * start the stream pinned at full max (which spikes the initial bitrate). */
+		config->rcParams.maxBitRate = bitrate * 1000;
+		/* Cumulative tracking starts empty; the governor waits ~2 s of history
+		 * before deciding, so the opening keyframe can't skew the average. */
+		enc->abr_total_bits = 0.0;
+		enc->abr_total_time = 0.0;
+		enc->abr_acc_time = 0.0;
+		enc->abr_max_rate = config->rcParams.maxBitRate;
+		if (!enc->can_change_bitrate)
+			warn("ABR: dynamic bitrate change unsupported - running as uncontrolled QVBR (cap frozen at max)");
 	}
+
+	enc->abr_active = abr;
 
 	config->rcParams.multiPass = nv_multipass;
 	config->rcParams.qpMapMode = NV_ENC_QP_MAP_DELTA;
@@ -743,7 +891,7 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 
 	if (bitrate && !cqvbr)
 		dstr_catf(&log, "\tbitrate:      %d\n", bitrate);
-	if (vbr)
+	if (vbr || abr)
 		dstr_catf(&log, "\tmax_bitrate:  %d\n", max_bitrate);
 	if (cqp)
 		dstr_catf(&log, "\tcqp:          %ld\n", enc->props.cqp);
@@ -759,7 +907,8 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 	dstr_catf(&log, "\twidth:        %d\n", enc->cx);
 	dstr_catf(&log, "\theight:       %d\n", enc->cy);
 	dstr_catf(&log, "\tFPS:          %g (%u/%u)\n", obs_encoder_get_effective_fps(enc->encoder),
-	          obs_encoder_get_fps_num(enc->encoder), obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder));
+		  obs_encoder_get_fps_num(enc->encoder),
+		  obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder));
 	dstr_catf(&log, "\tb-frames:     %ld\n", enc->props.bf);
 	dstr_catf(&log, "\tb-ref-mode:   %ld\n", enc->props.bframe_ref_mode);
 	dstr_catf(&log, "\tlookahead:    %s (%d frames)\n", lookahead ? "true" : "false",
@@ -799,18 +948,18 @@ static void nvenc_apply_identity_vui(struct nvenc_data *enc)
 	switch (enc->codec) {
 	case CODEC_H264: {
 		NV_ENC_CONFIG_H264_VUI_PARAMETERS *v = &config->encodeCodecConfig.h264Config.h264VUIParameters;
-		v->videoFullRangeFlag      = 1;
-		v->colourPrimaries         = NV_ENC_VUI_COLOR_PRIMARIES_UNSPECIFIED;
+		v->videoFullRangeFlag = 1;
+		v->colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_UNSPECIFIED;
 		v->transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_UNSPECIFIED;
-		v->colourMatrix            = NV_ENC_VUI_MATRIX_COEFFS_RGB;
+		v->colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_RGB;
 		break;
 	}
 	case CODEC_HEVC: {
 		NV_ENC_CONFIG_HEVC_VUI_PARAMETERS *v = &config->encodeCodecConfig.hevcConfig.hevcVUIParameters;
-		v->videoFullRangeFlag      = 1;
-		v->colourPrimaries         = NV_ENC_VUI_COLOR_PRIMARIES_UNSPECIFIED;
+		v->videoFullRangeFlag = 1;
+		v->colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_UNSPECIFIED;
 		v->transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_UNSPECIFIED;
-		v->colourMatrix            = NV_ENC_VUI_MATRIX_COEFFS_RGB;
+		v->colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_RGB;
 		break;
 	}
 	default:
@@ -918,8 +1067,8 @@ static bool init_encoder_h264(struct nvenc_data *enc, obs_data_t *settings)
 	/* Note: Only supported on Blackwell! */
 	h264_config->inputBitDepth = is_10_bit(enc) ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
 	h264_config->outputBitDepth = memcmp(&config->profileGUID, &NV_ENC_H264_PROFILE_HIGH_10_GUID, sizeof(GUID)) == 0
-				      ? NV_ENC_BIT_DEPTH_10
-				      : NV_ENC_BIT_DEPTH_8;
+					      ? NV_ENC_BIT_DEPTH_10
+					      : NV_ENC_BIT_DEPTH_8;
 #endif
 
 	if (!apply_user_args(enc)) {
@@ -1753,7 +1902,7 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 		/* One reset+IDR at a shared tick re-anchors the GOP phase; any  */
 		/* staged RC change rides on it too. No per-GOP retry - restart  */
 		/* needed on failure.                                            */
-		enc->align_pending    = false;
+		enc->align_pending = false;
 		enc->reconfig_pending = false;
 		if (ok)
 			enc->frames_since_idr = 0;
@@ -1835,6 +1984,9 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 		packet->pts = enc->packet_pts;
 		packet->dts = dts;
 		packet->keyframe = enc->packet_keyframe;
+
+		/* ABR governor: feed the actual encoded size so it can adapt maxBitRate. */
+		abr_gov_update(enc, (uint32_t)enc->packet_data.num);
 	} else {
 		*received_packet = false;
 	}
