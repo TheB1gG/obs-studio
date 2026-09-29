@@ -187,6 +187,18 @@ struct amf_base {
 	bool first_update = true;
 	bool roi_supported = false;
 
+	/* ABR_GOV (PEAK_CONSTRAINED_VBR) + runtime governor. See abr_gov_update(). The governor
+	 * steers TARGET_BITRATE and PEAK_BITRATE together (kept equal) so the driver's
+	 * min(PEAK, 4*TARGET) cap never bites: complex scenes spend up to the user max, easy
+	 * scenes stay low, and the long-term average tracks the configured target. */
+	bool    abr_active = false;     /* ABR_GOV selected: applies the ABR RC config + runs the governor */
+	int64_t abr_target_bps = 0;     /* target bitrate in bits/sec */
+	int64_t abr_max_bps = 0;        /* user max bitrate in bits/sec (governor ceiling) */
+	double  abr_total_bits = 0.0;   /* cumulative encoded bits */
+	double  abr_total_time = 0.0;   /* cumulative stream seconds */
+	double  abr_acc_time = 0.0;     /* stream seconds since last governor tick */
+	int64_t abr_cur_rate_bps = 0;   /* currently applied rate (bps); written to BOTH target and peak */
+
 	inline amf_base(bool fallback) : fallback(fallback) {}
 	virtual ~amf_base() = default;
 	virtual void init() = 0;
@@ -301,6 +313,118 @@ template<typename T> static void set_amf_property(amf_base *enc, const wchar_t *
 #define set_avc_enum(name, value) set_avc_property(enc, name, AMF_VIDEO_ENCODER_##name##_##value)
 #define set_hevc_enum(name, value) set_hevc_property(enc, name, AMF_VIDEO_ENCODER_HEVC_##name##_##value)
 #define set_av1_enum(name, value) set_av1_property(enc, name, AMF_VIDEO_ENCODER_AV1_##name##_##value)
+
+/* ------------------------------------------------------------------------- */
+/* ABR runtime governor                                                      */
+/*                                                                           */
+/* ABR_GOV runs PEAK_CONSTRAINED_VBR with real headroom (PEAK = user max)    */
+/* and adapts PEAK_BITRATE at runtime so the long-term average converges to  */
+/* the target: complex scenes may spend up to the cap, easy scenes stay low. */
+/* Unlike NVENC this uses AMF's *dynamic* bitrate property (SetProperty, no  */
+/* ReInit), so each tick causes no encoder reset and no forced IDR.          */
+
+static void abr_gov_apply(amf_base *enc, int64_t new_rate_bps)
+{
+	/* Steer TARGET and PEAK together (kept equal). With PEAK == TARGET the driver's
+	 * min(PEAK, 4*TARGET) cap collapses to just TARGET, so the applied value is a clean
+	 * ceiling with no hidden 4x behaviour. */
+	if (enc->codec == amf_codec_type::AVC) {
+		set_avc_property(enc, TARGET_BITRATE, new_rate_bps);
+		set_avc_property(enc, PEAK_BITRATE, new_rate_bps);
+	} else if (enc->codec == amf_codec_type::HEVC) {
+		set_hevc_property(enc, TARGET_BITRATE, new_rate_bps);
+		set_hevc_property(enc, PEAK_BITRATE, new_rate_bps);
+	} else {
+		set_av1_property(enc, TARGET_BITRATE, new_rate_bps);
+		set_av1_property(enc, PEAK_BITRATE, new_rate_bps);
+	}
+
+	enc->abr_cur_rate_bps = new_rate_bps;
+}
+
+static void abr_gov_update(amf_base *enc, uint32_t frame_size_bytes)
+{
+	if (!enc->abr_active)
+		return;
+
+	const int64_t target_bps = enc->abr_target_bps;
+	if (target_bps <= 0)
+		return;
+
+	if (enc->fps_num == 0)
+		return;
+	const double dt = (double)enc->fps_den / enc->fps_num;
+	if (dt <= 0.0)
+		return;
+
+	/* x264-style integral control: track the CUMULATIVE output against the
+	 * target rate so the long-term average (total_bits/total_time) converges
+	 * to the target - exactly what a file's reported bitrate reflects. */
+	enc->abr_total_bits += (double)frame_size_bytes * 8.0;
+	enc->abr_total_time += dt;
+	enc->abr_acc_time += dt;
+
+	if (enc->abr_acc_time < 0.5) /* one governor tick every 0.5 s: react faster to overshoot */
+		return;
+	enc->abr_acc_time = 0.0;
+
+	const double cum_avg = enc->abr_total_time > 0.0 ? enc->abr_total_bits / enc->abr_total_time : 0.0;
+
+	if (enc->abr_total_time < 1.0) /* need a little history before deciding */
+		return;
+
+	const int64_t ceiling = enc->abr_max_bps > 0 ? enc->abr_max_bps : target_bps;
+
+	double ratio;
+	int64_t new_rate;
+
+	if (cum_avg > target_bps * 1.03) {
+		/* cumulative average above target: pull the applied rate back toward target.
+		 * Close a large fixed fraction of the remaining gap each tick so a big
+		 * overshoot (e.g. bursting near the ceiling) is corrected in ~2-3 ticks
+		 * instead of tapering slowly; the floor keeps it from ever dropping under
+		 * the target rate. Bump 0.8 toward 1.0 for near-instant convergence. */
+		const double gap = (double)enc->abr_cur_rate_bps - (double)target_bps;
+		new_rate = enc->abr_cur_rate_bps - (int64_t)(gap * 0.8);
+		if (new_rate < target_bps)
+			new_rate = target_bps;
+	} else if (cum_avg > 1.0 && cum_avg < target_bps * 0.97) {
+		/* cumulative average below target: restore headroom up to the ceiling */
+		ratio = (double)target_bps / cum_avg;
+		if (ratio > 2.0)
+			ratio = 2.0;
+		new_rate = (int64_t)(enc->abr_cur_rate_bps * ratio);
+		if (new_rate > ceiling)
+			new_rate = ceiling;
+	} else {
+		return; /* within +/-3% dead band: keep current rate */
+	}
+
+	if (new_rate <= 0 || new_rate == enc->abr_cur_rate_bps)
+		return;
+
+	abr_gov_apply(enc, new_rate);
+}
+
+/* Central place to latch the ABR settings from the OBS settings object. Called
+ * from every codec's init/update before update_data() so the ABR branch and the
+ * governor always see consistent target/ceiling values. */
+static void amf_abr_configure(amf_base *enc, const char *rc_str, int64_t bitrate_kbps, int64_t max_bitrate_kbps)
+{
+	bool abr = (astrcmpi(rc_str, "ABR_GOV") == 0);
+	enc->abr_active = abr;
+	enc->abr_target_bps = abr ? bitrate_kbps * 1000 : 0;
+	enc->abr_max_bps = abr ? max_bitrate_kbps * 1000 : 0;
+	if (abr) {
+		/* restart cumulative tracking on (re)configure */
+		enc->abr_total_bits = 0.0;
+		enc->abr_total_time = 0.0;
+		enc->abr_acc_time = 0.0;
+		/* ABR_GOV starts at the user max so complex content can spend up to the ceiling;
+		 * abr_gov_update() pulls it back toward the target as soon as we overshoot. */
+		enc->abr_cur_rate_bps = enc->abr_max_bps > 0 ? enc->abr_max_bps : enc->abr_target_bps;
+	}
+}
 
 /* ------------------------------------------------------------------------- */
 /* Implementation                                                            */
@@ -614,6 +738,9 @@ static void convert_to_encoder_packet(amf_base *enc, AMFDataPtr &data, encoder_p
 
 	if (enc->dts_offset && enc->codec != amf_codec_type::AV1)
 		packet->dts -= enc->dts_offset;
+
+	/* ABR_GOV: feed the actual encoded size so the governor can adapt the rate. */
+	abr_gov_update(enc, (uint32_t)packet->size);
 }
 
 #ifndef SEC_TO_NSEC
@@ -961,8 +1088,74 @@ static void h264_video_info_fallback(void *, struct video_scale_info *info)
 	case VIDEO_FORMAT_RGBA:
 	case VIDEO_FORMAT_BGRA:
 	case VIDEO_FORMAT_BGRX:
+	case VIDEO_FORMAT_RGBA16F:
 		info->format = VIDEO_FORMAT_RGBA;
 		break;
+	}
+}
+
+/* get_video_info for AMF texture encoders. Used both by the color-format probe
+ * (encoder_accepts_format) and by the delivery path to determine which texture
+ * format the encoder will use. Accepts NV12, P010, and BGRA (repacked to RGBA).
+ * For unrecognized input formats (e.g. the RGBA16F master canvas), defaults to
+ * the codec's preferred YUV format. */
+static void amf_avc_tex_video_info(void *, struct video_scale_info *info)
+{
+	switch (info->format) {
+	case VIDEO_FORMAT_NV12:
+		break;
+	case VIDEO_FORMAT_P010:
+		info->format = VIDEO_FORMAT_NV12; /* H.264 is 8-bit only */
+		break;
+	case VIDEO_FORMAT_BGRA:
+		info->format = VIDEO_FORMAT_RGBA;
+		break;
+	default:
+		info->format = VIDEO_FORMAT_NV12;
+		break;
+	}
+}
+
+static void amf_10bit_tex_video_info(void *, struct video_scale_info *info)
+{
+	switch (info->format) {
+	case VIDEO_FORMAT_NV12:
+		break;
+	case VIDEO_FORMAT_P010:
+		break;
+	case VIDEO_FORMAT_BGRA:
+		info->format = VIDEO_FORMAT_RGBA;
+		break;
+	default:
+		info->format = VIDEO_FORMAT_P010;
+		break;
+	}
+}
+
+/* AMF H.264 (AVC) is 8-bit only; it cannot perform a 10-bit encode. */
+static bool amf_avc_is_color_format_supported(void *type_data, enum video_format format)
+{
+	UNUSED_PARAMETER(type_data);
+	switch (format) {
+	case VIDEO_FORMAT_NV12:
+	case VIDEO_FORMAT_BGRA:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* AMF HEVC/AV1 support 8-bit and 10-bit YUV plus RGB. */
+static bool amf_10bit_is_color_format_supported(void *type_data, enum video_format format)
+{
+	UNUSED_PARAMETER(type_data);
+	switch (format) {
+	case VIDEO_FORMAT_NV12:
+	case VIDEO_FORMAT_P010:
+	case VIDEO_FORMAT_BGRA:
+		return true;
+	default:
+		return false;
 	}
 }
 
@@ -972,6 +1165,7 @@ static void h265_video_info_fallback(void *, struct video_scale_info *info)
 	case VIDEO_FORMAT_RGBA:
 	case VIDEO_FORMAT_BGRA:
 	case VIDEO_FORMAT_BGRX:
+	case VIDEO_FORMAT_RGBA16F:
 		info->format = VIDEO_FORMAT_RGBA;
 		break;
 	case VIDEO_FORMAT_I010:
@@ -987,6 +1181,7 @@ static void av1_video_info_fallback(void *, struct video_scale_info *info)
 	case VIDEO_FORMAT_RGBA:
 	case VIDEO_FORMAT_BGRA:
 	case VIDEO_FORMAT_BGRX:
+	case VIDEO_FORMAT_RGBA16F:
 		info->format = VIDEO_FORMAT_RGBA;
 		break;
 	case VIDEO_FORMAT_I010:
@@ -1006,7 +1201,16 @@ try {
 	struct video_scale_info info;
 	video_t *video = obs_encoder_video(enc->encoder);
 	const struct video_output_info *voi = video_output_get_info(video);
-	info.format = voi->format;
+	if (enc->fallback) {
+		info.format = voi->format;
+	} else {
+		if (obs_encoder_video_tex_active(enc->encoder, VIDEO_FORMAT_NV12))
+			info.format = VIDEO_FORMAT_NV12;
+		else if (obs_encoder_video_tex_active(enc->encoder, VIDEO_FORMAT_P010))
+			info.format = VIDEO_FORMAT_P010;
+		else
+			info.format = VIDEO_FORMAT_RGBA;
+	}
 	info.colorspace = voi->colorspace;
 	info.range = voi->range;
 
@@ -1130,21 +1334,14 @@ static void check_texture_encode_capability(obs_encoder_t *encoder, amf_codec_ty
 	if (obs_encoder_scaling_enabled(encoder) && !obs_encoder_gpu_scaling_enabled(encoder))
 		throw "Encoder scaling is active";
 
-	if (hevc || av1) {
-		if (!obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_NV12) &&
-		    !obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_P010))
-			throw "NV12/P010 textures aren't active";
-	} else if (!obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_NV12)) {
-		throw "NV12 textures aren't active";
-	}
+	if (!obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_NV12) &&
+	    !obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_P010) &&
+	    !obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_RGBA))
+		throw "NV12/P010/RGBA textures aren't active";
 
 	video_t *video = obs_encoder_video(encoder);
 	const struct video_output_info *voi = video_output_get_info(video);
-	switch (voi->format) {
-	case VIDEO_FORMAT_I010:
-	case VIDEO_FORMAT_P010:
-		break;
-	default:
+	if (!obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_P010)) {
 		switch (voi->colorspace) {
 		case VIDEO_CS_2100_PQ:
 		case VIDEO_CS_2100_HLG:
@@ -1167,6 +1364,7 @@ static void amf_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "preset", "quality");
 	obs_data_set_default_string(settings, "profile", "high");
 	obs_data_set_default_int(settings, "bf", 3);
+	obs_data_set_default_int(settings, "max_bitrate", 5000);
 }
 
 static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings)
@@ -1174,11 +1372,14 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs
 	const char *rc = obs_data_get_string(settings, "rate_control");
 	bool cqp = astrcmpi(rc, "CQP") == 0;
 	bool qvbr = astrcmpi(rc, "QVBR") == 0;
+	bool abr = astrcmpi(rc, "ABR_GOV") == 0;
 
 	p = obs_properties_get(ppts, "bitrate");
 	obs_property_set_visible(p, !cqp && !qvbr);
 	p = obs_properties_get(ppts, "cqp");
 	obs_property_set_visible(p, cqp || qvbr);
+	p = obs_properties_get(ppts, "max_bitrate");
+	obs_property_set_visible(p, abr);
 	return true;
 }
 
@@ -1196,10 +1397,14 @@ static obs_properties_t *amf_properties_internal(amf_codec_type codec)
 	obs_property_list_add_string(p, "QVBR", "QVBR");
 	obs_property_list_add_string(p, "HQVBR", "HQVBR");
 	obs_property_list_add_string(p, "HQCBR", "HQCBR");
+	obs_property_list_add_string(p, "ABR", "ABR_GOV");
 
 	obs_property_set_modified_callback(p, rate_control_modified);
 
 	p = obs_properties_add_int(props, "bitrate", obs_module_text("Bitrate"), 50, 100000, 50);
+	obs_property_int_set_suffix(p, " Kbps");
+
+	p = obs_properties_add_int(props, "max_bitrate", obs_module_text("MaxBitrate"), 50, 100000, 50);
 	obs_property_int_set_suffix(p, " Kbps");
 
 	obs_properties_add_int(props, "cqp", obs_module_text("NVENC.CQLevel"), 0,
@@ -1287,6 +1492,8 @@ static inline int get_avc_rate_control(const char *rc_str)
 		return AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR;
 	else if (astrcmpi(rc_str, "vbr") == 0)
 		return AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
+	else if (astrcmpi(rc_str, "abr_gov") == 0)
+		return AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
 	else if (astrcmpi(rc_str, "vbr_lat") == 0)
 		return AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR;
 	else if (astrcmpi(rc_str, "qvbr") == 0)
@@ -1317,6 +1524,27 @@ static inline int get_avc_profile(obs_data_t *settings)
 
 static void amf_avc_update_data(amf_base *enc, int rc, int64_t bitrate, int64_t qp)
 {
+	if (enc->abr_active) {
+		int64_t peak = enc->abr_max_bps > 0 ? enc->abr_max_bps : bitrate;
+
+		/* ABR_GOV: the runtime governor steers TARGET_BITRATE and PEAK_BITRATE
+		 * together (kept equal), so start both at the user max - complex content
+		 * can then spend up to the ceiling while abr_gov_apply() pulls them down
+		 * toward the target on overshoot. Keeping PEAK == TARGET stops the
+		 * driver's min(PEAK, 4*TARGET) cap from biting. */
+		set_avc_property(enc, TARGET_BITRATE, peak);
+		set_avc_property(enc, PEAK_BITRATE, peak);
+
+		set_avc_property(enc, VBV_BUFFER_SIZE, peak / 4); /* ~0.25 s buffer: limits burst headroom */
+		set_avc_property(enc, INITIAL_VBV_BUFFER_FULLNESS, 32); /* start at 50%, not primed to dump */
+		set_avc_property(enc, PRE_ANALYSIS_ENABLE, true); /* smooths rate distribution (PCVBR only) */
+		double fps = enc->fps_num / (double)(enc->fps_den ? enc->fps_den : 1);
+		if (fps <= 0.0)
+			fps = 30.0;
+		set_avc_property(enc, MAX_AU_SIZE, (int64_t)(peak / fps)); /* hard per-frame cap */
+		return;
+	}
+
 	if (rc != AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CONSTANT_QP &&
 	    rc != AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_QUALITY_VBR) {
 		set_avc_property(enc, TARGET_BITRATE, bitrate);
@@ -1346,8 +1574,11 @@ try {
 	int64_t bitrate = obs_data_get_int(settings, "bitrate");
 	int64_t qp = obs_data_get_int(settings, "cqp");
 	const char *rc_str = obs_data_get_string(settings, "rate_control");
-	int rc = get_avc_rate_control(rc_str);
 	AMF_RESULT res = AMF_OK;
+
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
+
+	int rc = get_avc_rate_control(rc_str);
 
 	amf_avc_update_data(enc, rc, bitrate * 1000, qp);
 
@@ -1479,6 +1710,8 @@ static bool amf_avc_init(void *data, obs_data_t *settings)
 		bf = 0;
 	}
 
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
+
 	int rc = get_avc_rate_control(rc_str);
 
 	set_avc_property(enc, RATE_CONTROL_METHOD, rc);
@@ -1532,6 +1765,7 @@ static bool amf_avc_init(void *data, obs_data_t *settings)
 	info("settings:\n"
 	     "\trate_control: %s\n"
 	     "\tbitrate:      %d\n"
+	     "\tmax bitrate:  %d\n"
 	     "\tcqp:          %d\n"
 	     "\tkeyint:       %d\n"
 	     "\tpreset:       %s\n"
@@ -1542,7 +1776,8 @@ static bool amf_avc_init(void *data, obs_data_t *settings)
 	     "\theight:       %d\n"
 	     "\tFPS:          %g (%u/%u)\n"
 	     "\tparams:       %s",
-	     rc_str, bitrate, qp, gop_size, preset, profile, level_str, bf, enc->cx, enc->cy,
+	     rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"), qp, gop_size, preset, profile, level_str, bf, enc->cx,
+	     enc->cy,
 	     obs_encoder_get_effective_fps(enc->encoder), obs_encoder_get_fps_num(enc->encoder),
 	     obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder), ffmpeg_opts);
 
@@ -1687,6 +1922,8 @@ static void register_avc()
 	amf_encoder_info.get_properties = amf_avc_properties;
 	amf_encoder_info.get_extra_data = amf_extra_data;
 	amf_encoder_info.caps = OBS_ENCODER_CAP_PASS_TEXTURE | OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_ROI;
+	amf_encoder_info.get_video_info = amf_avc_tex_video_info;
+	amf_encoder_info.is_color_format_supported = amf_avc_is_color_format_supported;
 
 	obs_register_encoder(&amf_encoder_info);
 
@@ -1728,6 +1965,8 @@ static inline int get_hevc_rate_control(const char *rc_str)
 		return AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR;
 	else if (astrcmpi(rc_str, "vbr") == 0)
 		return AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
+	else if (astrcmpi(rc_str, "abr_gov") == 0)
+		return AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
 	else if (astrcmpi(rc_str, "cbr") == 0)
 		return AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR;
 	else if (astrcmpi(rc_str, "qvbr") == 0)
@@ -1742,6 +1981,23 @@ static inline int get_hevc_rate_control(const char *rc_str)
 
 static void amf_hevc_update_data(amf_base *enc, int rc, int64_t bitrate, int64_t qp)
 {
+	if (enc->abr_active) {
+		int64_t peak = enc->abr_max_bps > 0 ? enc->abr_max_bps : bitrate;
+		/* ABR_GOV: start TARGET and PEAK both at the user max so complex content can spend
+		 * up to the ceiling; abr_gov_apply() pulls them (kept equal) back toward the target
+		 * on overshoot. PEAK == TARGET stops the driver's min(PEAK, 4*TARGET) cap biting. */
+		set_hevc_property(enc, TARGET_BITRATE, peak);
+		set_hevc_property(enc, PEAK_BITRATE, peak);
+		set_hevc_property(enc, VBV_BUFFER_SIZE, peak / 4); /* ~0.25 s buffer: limits burst headroom */
+		set_hevc_property(enc, INITIAL_VBV_BUFFER_FULLNESS, 32); /* start at 50%, not primed to dump */
+		set_hevc_property(enc, PRE_ANALYSIS_ENABLE, true); /* smooths rate distribution (PCVBR only) */
+		double fps = enc->fps_num / (double)(enc->fps_den ? enc->fps_den : 1);
+		if (fps <= 0.0)
+			fps = 30.0;
+		set_hevc_property(enc, MAX_AU_SIZE, (int64_t)(peak / fps)); /* hard per-frame cap */
+		return;
+	}
+
 	if (rc != AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CONSTANT_QP &&
 	    rc != AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_QUALITY_VBR) {
 		set_hevc_property(enc, TARGET_BITRATE, bitrate);
@@ -1773,6 +2029,7 @@ try {
 	int rc = get_hevc_rate_control(rc_str);
 	AMF_RESULT res = AMF_OK;
 
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
 	amf_hevc_update_data(enc, rc, bitrate * 1000, qp);
 
 	res = enc->amf_encoder->Flush();
@@ -1806,6 +2063,7 @@ static bool amf_hevc_init(void *data, obs_data_t *settings)
 	if (rc != AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CONSTANT_QP)
 		set_hevc_property(enc, ENABLE_VBAQ, true);
 
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
 	amf_hevc_update_data(enc, rc, bitrate * 1000, qp);
 
 	set_hevc_property(enc, ENFORCE_HRD, true);
@@ -1847,6 +2105,7 @@ static bool amf_hevc_init(void *data, obs_data_t *settings)
 	info("settings:\n"
 	     "\trate_control: %s\n"
 	     "\tbitrate:      %d\n"
+	     "\tmax bitrate:  %d\n"
 	     "\tcqp:          %d\n"
 	     "\tkeyint:       %d\n"
 	     "\tpreset:       %s\n"
@@ -1856,7 +2115,8 @@ static bool amf_hevc_init(void *data, obs_data_t *settings)
 	     "\theight:       %d\n"
 	     "\tFPS:          %g (%u/%u)\n"
 	     "\tparams:       %s",
-	     rc_str, bitrate, qp, gop_size, preset, profile, level_str, enc->cx, enc->cy,
+	     rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"), qp, gop_size, preset, profile, level_str, enc->cx,
+	     enc->cy,
 	     obs_encoder_get_effective_fps(enc->encoder), obs_encoder_get_fps_num(enc->encoder),
 	     obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder), ffmpeg_opts);
 
@@ -2033,6 +2293,8 @@ static void register_hevc()
 	amf_encoder_info.get_properties = amf_hevc_properties;
 	amf_encoder_info.get_extra_data = amf_extra_data;
 	amf_encoder_info.caps = OBS_ENCODER_CAP_PASS_TEXTURE | OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_ROI;
+	amf_encoder_info.get_video_info = amf_10bit_tex_video_info;
+	amf_encoder_info.is_color_format_supported = amf_10bit_is_color_format_supported;
 
 	obs_register_encoder(&amf_encoder_info);
 
@@ -2078,6 +2340,8 @@ static inline int get_av1_rate_control(const char *rc_str)
 		return AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR;
 	else if (astrcmpi(rc_str, "vbr") == 0)
 		return AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
+	else if (astrcmpi(rc_str, "abr_gov") == 0)
+		return AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
 	else if (astrcmpi(rc_str, "cbr") == 0)
 		return AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_CBR;
 	else if (astrcmpi(rc_str, "qvbr") == 0)
@@ -2102,6 +2366,20 @@ static inline int get_av1_profile(obs_data_t *settings)
 
 static void amf_av1_update_data(amf_base *enc, int rc, int64_t bitrate, int64_t cq_value)
 {
+	if (enc->abr_active) {
+		int64_t peak = enc->abr_max_bps > 0 ? enc->abr_max_bps : bitrate;
+		/* ABR_GOV: start TARGET and PEAK both at the user max so complex content can spend
+		 * up to the ceiling; abr_gov_apply() pulls them (kept equal) back toward the target
+		 * on overshoot. PEAK == TARGET stops the driver's min(PEAK, 4*TARGET) cap biting. */
+		set_av1_property(enc, TARGET_BITRATE, peak);
+		set_av1_property(enc, PEAK_BITRATE, peak);
+		set_av1_property(enc, VBV_BUFFER_SIZE, peak / 4); /* ~0.25 s buffer: limits burst headroom */
+		set_av1_property(enc, INITIAL_VBV_BUFFER_FULLNESS, 32); /* start at 50%, not primed to dump */
+		set_av1_property(enc, PRE_ANALYSIS_ENABLE, true); /* smooths rate distribution (PCVBR only) */
+		/* NOTE: AV1 has no MAX_AU_SIZE property, so there is no hard per-frame cap here. */
+		return;
+	}
+
 	if (rc != AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_CONSTANT_QP &&
 	    rc != AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_QUALITY_VBR) {
 		set_av1_property(enc, TARGET_BITRATE, bitrate);
@@ -2138,6 +2416,7 @@ try {
 	int rc = get_av1_rate_control(rc_str);
 	AMF_RESULT res = AMF_OK;
 
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
 	amf_av1_update_data(enc, rc, bitrate * 1000, cq_level);
 
 	res = enc->amf_encoder->Flush();
@@ -2178,6 +2457,7 @@ static bool amf_av1_init(void *data, obs_data_t *settings)
 	int rc = get_av1_rate_control(rc_str);
 	set_av1_property(enc, RATE_CONTROL_METHOD, rc);
 
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
 	amf_av1_update_data(enc, rc, bitrate * 1000, qp);
 
 	set_av1_property(enc, ENFORCE_HRD, true);
@@ -2217,6 +2497,7 @@ static bool amf_av1_init(void *data, obs_data_t *settings)
 	info("settings:\n"
 	     "\trate_control: %s\n"
 	     "\tbitrate:      %d\n"
+	     "\tmax bitrate:  %d\n"
 	     "\tcqp:          %d\n"
 	     "\tkeyint:       %d\n"
 	     "\tpreset:       %s\n"
@@ -2227,7 +2508,8 @@ static bool amf_av1_init(void *data, obs_data_t *settings)
 	     "\theight:       %d\n"
 	     "\tFPS:          %g (%u/%u)\n"
 	     "\tparams:       %s",
-	     rc_str, bitrate, qp, gop_size, preset, profile, level_str, bf, enc->cx, enc->cy,
+	     rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"), qp, gop_size, preset, profile, level_str, bf, enc->cx,
+	     enc->cy,
 	     obs_encoder_get_effective_fps(enc->encoder), obs_encoder_get_fps_num(enc->encoder),
 	     obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder), ffmpeg_opts);
 
@@ -2380,6 +2662,8 @@ static void register_av1()
 	amf_encoder_info.get_properties = amf_av1_properties;
 	amf_encoder_info.get_extra_data = amf_extra_data;
 	amf_encoder_info.caps = OBS_ENCODER_CAP_PASS_TEXTURE | OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_ROI;
+	amf_encoder_info.get_video_info = amf_10bit_tex_video_info;
+	amf_encoder_info.is_color_format_supported = amf_10bit_is_color_format_supported;
 
 	obs_register_encoder(&amf_encoder_info);
 
