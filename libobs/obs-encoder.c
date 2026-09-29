@@ -601,6 +601,30 @@ static bool maybe_pre_bind_texture_mix(struct obs_encoder *encoder)
 		return false;
 	if ((encoder->info.caps & OBS_ENCODER_CAP_PASS_TEXTURE) == 0)
 		return false;
+
+	/* If the user didn't pick a Color Format, derive a default texture format from the
+	 * encoder's get_video_info callback. Texture encoders tolerate a NULL context here (see
+	 * obs_encoder_info.get_video_info), so this works pre-create(). This lets a texture
+	 * encoder establish its GPU delivery mix (e.g. RGBA16F master canvas -> NV12/P010) even
+	 * when no explicit format was chosen, matching the behavior users expect from hardware
+	 * encoders such as NVENC. The derived format is validated downstream by
+	 * acquire_encoder_only_mix, which refuses formats that cannot be delivered as a texture. */
+	if (encoder->preferred_format == VIDEO_FORMAT_NONE && encoder->info.get_video_info) {
+		struct video_scale_info probe = {0};
+		video_t *base_video = encoder->source_video ? encoder->source_video : encoder->media;
+		const struct video_output_info *voi = video_output_get_info(base_video);
+
+		probe.format = voi->format;
+		probe.colorspace = voi->colorspace;
+		probe.range = voi->range;
+		probe.width = obs_encoder_get_width(encoder);
+		probe.height = obs_encoder_get_height(encoder);
+
+		encoder->info.get_video_info(NULL, &probe);
+		if (probe.format != VIDEO_FORMAT_NONE)
+			encoder->preferred_format = probe.format;
+	}
+
 	if (encoder->preferred_format == VIDEO_FORMAT_NONE)
 		return false;
 
