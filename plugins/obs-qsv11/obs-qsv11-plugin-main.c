@@ -72,6 +72,8 @@ extern struct obs_encoder_info obs_qsv_av1_encoder_tex;
 extern struct obs_encoder_info obs_qsv_av1_encoder;
 extern struct obs_encoder_info obs_qsv_hevc_encoder_tex;
 extern struct obs_encoder_info obs_qsv_hevc_encoder;
+extern struct obs_encoder_info obs_qsv_vp9_encoder_tex;
+extern struct obs_encoder_info obs_qsv_vp9_encoder;
 
 bool obs_module_load(void)
 {
@@ -81,11 +83,31 @@ bool obs_module_load(void)
 	bool avc_supported = false;
 	bool av1_supported = false;
 	bool hevc_supported = false;
+	bool vp9_supported = false;
 	for (size_t i = 0; i < adapter_count; i++) {
 		struct adapter_info *adapter = &adapters[i];
 		avc_supported |= adapter->is_intel;
 		av1_supported |= adapter->is_intel && adapter->supports_av1;
 		hevc_supported |= adapter->is_intel && adapter->supports_hevc;
+		vp9_supported |= adapter->is_intel && adapter->vp9.encoder_supported;
+	}
+
+	// Log the runtime-detected VP9 profile/format capability matrix (spec §18, §39).
+	if (vp9_supported) {
+		for (size_t i = 0; i < adapter_count; i++) {
+			struct adapter_info *adapter = &adapters[i];
+			if (!adapter->is_intel || !adapter->vp9.encoder_supported)
+				continue;
+			blog(LOG_INFO, "[qsv] VP9 capability detection: adapter %zu (dgpu=%d)", i, (int)adapter->is_dgpu);
+			blog(LOG_INFO, "    Profile 0 (NV12, 8-bit 4:2:0):  %s",
+			     adapter->vp9.profile0_nv12_8bit ? "supported" : "unsupported");
+			blog(LOG_INFO, "    Profile 1 (AYUV, 8-bit 4:4:4):  %s",
+			     adapter->vp9.profile1_ayuv_8bit ? "supported" : "unsupported");
+			blog(LOG_INFO, "    Profile 2 (P010, 10-bit 4:2:0): %s",
+			     adapter->vp9.profile2_p010_10bit ? "supported" : "unsupported");
+			blog(LOG_INFO, "    Profile 3 (Y410, 10-bit 4:4:4): %s",
+			     adapter->vp9.profile3_y410_10bit ? "supported" : "unsupported");
+		}
 	}
 
 	if (avc_supported) {
@@ -104,6 +126,10 @@ bool obs_module_load(void)
 		obs_register_encoder(&obs_qsv_hevc_encoder);
 	}
 #endif
+	if (vp9_supported) {
+		obs_register_encoder(&obs_qsv_vp9_encoder_tex);
+		obs_register_encoder(&obs_qsv_vp9_encoder);
+	}
 
 	return true;
 }

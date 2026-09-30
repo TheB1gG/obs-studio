@@ -80,6 +80,14 @@ static const struct qsv_rate_control_info qsv_ratecontrols[] = {{"CBR", false},
 								{0, false}};
 
 static const char *const qsv_profile_names[] = {"high", "main", "baseline", 0};
+/* VP9 exposes only the core rate-control modes that Intel's low-power VP9
+ * hardware path maps directly (CBR/VBR/CQP). The classic LA/ICQ lookahead BRC
+ * modes are not exposed because generic QSV lookahead is unverified for the
+ * VP9 hardware implementation. */
+static const struct qsv_rate_control_info qsv_ratecontrols_vp9[] = {{"CBR", false},
+                                                                    {"VBR", false},
+                                                                    {"CQP", false},
+                                                                    {0, false}};
 static const char *const qsv_profile_names_av1[] = {"main", 0};
 static const char *const qsv_profile_names_hevc[] = {"main", "main10", 0};
 static const char *const qsv_usage_translation_keys[] = {"TargetUsage.TU1", "TargetUsage.TU2",

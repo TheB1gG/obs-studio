@@ -118,6 +118,7 @@ private:
 	mfxExtCodingOption m_co;
 	mfxExtHEVCParam m_ExtHEVCParam{};
 	mfxExtAV1TileParam m_ExtAv1TileParam{};
+	mfxExtVP9Param m_ExtVP9Param{};
 #if (MFX_VERSION_MAJOR >= 2 && MFX_VERSION_MINOR >= 11) || MFX_VERSION_MAJOR > 2
 	mfxExtAV1ScreenContentTools m_ExtAV1ScreenContentTools{};
 #endif

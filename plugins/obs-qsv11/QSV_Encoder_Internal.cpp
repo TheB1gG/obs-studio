@@ -119,7 +119,7 @@ QSV_Encoder_Internal::QSV_Encoder_Internal(mfxVersion &version, bool useTexAlloc
 		MFXClose(m_session);
 		MFXUnload(loader);
 
-		blog(LOG_INFO, "\tsurf:           %s", m_bUseTexAlloc ? "Texture" : "SysMem");
+		blog(LOG_DEBUG, "\tsurf:           %s", m_bUseTexAlloc ? "Texture" : "SysMem");
 
 		m_ver = version;
 		return;
@@ -146,10 +146,17 @@ mfxStatus QSV_Encoder_Internal::Open(qsv_param_t *pParams, enum qsv_codec codec)
 
 	m_pmfxENC = new MFXVideoENCODE(m_session);
 
+	{
+		mfxVersion qv = {{0, 0}};
+		MFXQueryVersion(m_session, &qv);
+		blog(LOG_DEBUG, "QSV session opened: codec=%u VPL runtime=%u.%u IOPattern-surface=%s",
+		     (unsigned)codec, qv.Major, qv.Minor, m_bUseTexAlloc ? "D3D11-video-memory" : "system-memory");
+	}
+
 	InitParams(pParams, codec);
 	sts = m_pmfxENC->Query(&m_mfxEncParams, &m_mfxEncParams);
 	if (sts == MFX_WRN_INCOMPATIBLE_VIDEO_PARAM) {
-		blog(LOG_WARNING, "[qsv encoder] MFXVideoENCODE_Query modified encoding parameters "
+		blog(LOG_DEBUG, "[qsv encoder] MFXVideoENCODE_Query modified encoding parameters "
 		     "(MFX_WRN_INCOMPATIBLE_VIDEO_PARAM). The driver may have changed your rate control "
 		     "mode, profile, or other settings to values it supports. Check the log for the "
 		     "actual parameters in use.");
@@ -216,10 +223,16 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 		m_mfxEncParams.mfx.CodecId = MFX_CODEC_AV1;
 	else if (codec == QSV_CODEC_HEVC)
 		m_mfxEncParams.mfx.CodecId = MFX_CODEC_HEVC;
+	else if (codec == QSV_CODEC_VP9)
+		m_mfxEncParams.mfx.CodecId = MFX_CODEC_VP9;
 
 	if (codec == QSV_CODEC_HEVC) {
 		m_mfxEncParams.mfx.NumSlice = 0;
 		m_mfxEncParams.mfx.IdrInterval = 1;
+	} else if (codec == QSV_CODEC_VP9) {
+		// VP9 has no slice concept (it uses tiles instead); do not force a
+		// slice structure.
+		m_mfxEncParams.mfx.NumSlice = 0;
 	} else {
 		m_mfxEncParams.mfx.NumSlice = 1;
 	}
@@ -236,13 +249,22 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	} else if (pParams->video_fmt_ayuv) {
 		m_mfxEncParams.mfx.FrameInfo.FourCC = MFX_FOURCC_AYUV;
 		m_mfxEncParams.mfx.FrameInfo.ChromaFormat = MFX_CHROMAFORMAT_YUV444;
+		// Explicit 8-bit 4:4:4 (spec §10): do not leave bit depth at 0.
+		m_mfxEncParams.mfx.FrameInfo.BitDepthLuma = 8;
+		m_mfxEncParams.mfx.FrameInfo.BitDepthChroma = 8;
+		m_mfxEncParams.mfx.FrameInfo.Shift = 0;
 	} else if (pParams->video_fmt_y410) {
 		m_mfxEncParams.mfx.FrameInfo.FourCC = MFX_FOURCC_Y410;
 		m_mfxEncParams.mfx.FrameInfo.ChromaFormat = MFX_CHROMAFORMAT_YUV444;
 		m_mfxEncParams.mfx.FrameInfo.BitDepthChroma = 10;
 		m_mfxEncParams.mfx.FrameInfo.BitDepthLuma = 10;
+		m_mfxEncParams.mfx.FrameInfo.Shift = 1;
 	} else {
 		m_mfxEncParams.mfx.FrameInfo.FourCC = MFX_FOURCC_NV12;
+		// Explicit 8-bit NV12 baseline (spec §6): do not leave bit depth at 0.
+		m_mfxEncParams.mfx.FrameInfo.BitDepthLuma = 8;
+		m_mfxEncParams.mfx.FrameInfo.BitDepthChroma = 8;
+		m_mfxEncParams.mfx.FrameInfo.Shift = 0;
 	}
 	m_mfxEncParams.mfx.FrameInfo.PicStruct = MFX_PICSTRUCT_PROGRESSIVE;
 	m_mfxEncParams.mfx.FrameInfo.CropX = 0;
@@ -250,6 +272,13 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	m_mfxEncParams.mfx.FrameInfo.CropW = pParams->nWidth;
 	m_mfxEncParams.mfx.FrameInfo.CropH = pParams->nHeight;
 	m_mfxEncParams.mfx.GopRefDist = pParams->nbFrames + 1;
+	if (codec == QSV_CODEC_VP9) {
+		// No traditional B-frame pipeline for VP9: GopRefDist=1 means only I/P
+		// frames. This does NOT disable VP9's native LAST/GOLDEN/ALTREF
+		// reference machinery, which the encoder still uses for temporal
+		// prediction.
+		m_mfxEncParams.mfx.GopRefDist = 1;
+	}
 
 	mfxPlatform platform;
 	MFXVideoCORE_QueryPlatform(m_session, &platform);
@@ -261,6 +290,11 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 			m_mfxEncParams.mfx.LowPower = MFX_CODINGOPTION_ON;
 	} else if (codec == QSV_CODEC_AV1) {
 		m_mfxEncParams.mfx.LowPower = MFX_CODINGOPTION_ON;
+	} else if (codec == QSV_CODEC_VP9) {
+		// Intel's VP9 hardware implementation is tied to the Low Power /
+		// fixed-function path; the LowPower=OFF path is not supported. Always
+		// enable it (no "try low power, then fall back" for VP9).
+		m_mfxEncParams.mfx.LowPower = MFX_CODINGOPTION_ON;
 	}
 	PRAGMA_WARN_POP
 
@@ -269,6 +303,13 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	switch (pParams->nRateControl) {
 	case MFX_RATECONTROL_CBR:
 		m_mfxEncParams.mfx.TargetKbps = pParams->nTargetBitRate;
+
+		if (codec == QSV_CODEC_VP9) {
+			// True CBR for the bitrate-constrained streaming target: cap the
+			// max bitrate at the target so the BRC stays within the hard
+			// network budget.
+			m_mfxEncParams.mfx.MaxKbps = pParams->nTargetBitRate;
+		}
 
 		if (HasOptimizedBRCSupport(platform, m_ver, pParams->nRateControl)) {
 			m_mfxEncParams.mfx.BufferSizeInKB = (pParams->nTargetBitRate / 8) * 1;
@@ -314,6 +355,12 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	if (pParams->nbFrames > 1)
 		m_co2.BRefType = MFX_B_REF_PYRAMID;
 
+	if (codec == QSV_CODEC_VP9) {
+		// Strict, predictable GOP for streaming: disable adaptive frame-type
+		// decisions so bitrate/decoder behavior stays deterministic.
+		m_co2.AdaptiveB = MFX_CODINGOPTION_OFF;
+	}
+
 	PRAGMA_WARN_PUSH
 	PRAGMA_WARN_DEPRECATION
 	// LA VME/ENC case for older platforms
@@ -330,9 +377,12 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	}
 	PRAGMA_WARN_POP
 
-	// LA VDENC case for newer platform, works only under CBR / VBR
+	// LA VDENC case for newer platform, works only under CBR / VBR.
+	// VP9 is excluded: generic Intel QSV lookahead BRC is unverified/unsupported
+	// for the low-power VP9 hardware path, so we never attach a LookAheadDepth to
+	// it (the OBS latency setting must not create hidden VP9 lookahead).
 	if (pParams->nRateControl == MFX_RATECONTROL_CBR || pParams->nRateControl == MFX_RATECONTROL_VBR) {
-		if (pParams->nLADEPTH && m_mfxEncParams.mfx.LowPower == MFX_CODINGOPTION_ON) {
+		if (pParams->nLADEPTH && m_mfxEncParams.mfx.LowPower == MFX_CODINGOPTION_ON && codec != QSV_CODEC_VP9) {
 			m_co2.LookAheadDepth = pParams->nLADEPTH;
 		}
 	}
@@ -340,7 +390,7 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	extendedBuffers.push_back((mfxExtBuffer *)&m_co2);
 
 	const bool optBrcSupport = HasOptimizedBRCSupport(platform, m_ver, pParams->nRateControl);
-	if (pParams->video_fmt_ayuv || pParams->video_fmt_y410 || optBrcSupport) {
+	if (pParams->video_fmt_ayuv || pParams->video_fmt_y410 || optBrcSupport || codec == QSV_CODEC_VP9) {
 		memset(&m_co3, 0, sizeof(mfxExtCodingOption3));
 		m_co3.Header.BufferId = MFX_EXTBUFF_CODING_OPTION3;
 		m_co3.Header.BufferSz = sizeof(m_co3);
@@ -357,6 +407,13 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 
 		if (pParams->video_fmt_ayuv || pParams->video_fmt_y410) {
 			m_co3.TargetChromaFormatPlus1 = MFX_CHROMAFORMAT_YUV444 + 1;
+		}
+
+		if (codec == QSV_CODEC_VP9) {
+			// Hint the encoder that this is a live-streaming session. This is an
+			// encoder hint only (it does not by itself change the algorithm); it
+			// must be validated via Query and quality measurements.
+			m_co3.ScenarioInfo = MFX_SCENARIO_LIVE_STREAMING;
 		}
 
 		extendedBuffers.push_back((mfxExtBuffer *)&m_co3);
@@ -394,18 +451,39 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	}
 #endif
 
+	if (codec == QSV_CODEC_VP9) {
+		// VP9-specific extension buffer. Do not copy AVC/HEVC/AV1 buffers into
+		// the VP9 path. WriteIVFHeaders is OFF: OBS streaming passes the raw
+		// VP9 bitstream through and does not emit IVF container headers. Tiles
+		// are disabled for the initial bitrate-constrained streaming baseline.
+		memset(&m_ExtVP9Param, 0, sizeof(m_ExtVP9Param));
+		m_ExtVP9Param.Header.BufferId = MFX_EXTBUFF_VP9_PARAM;
+		m_ExtVP9Param.Header.BufferSz = sizeof(m_ExtVP9Param);
+		m_ExtVP9Param.WriteIVFHeaders = MFX_CODINGOPTION_OFF;
+		m_ExtVP9Param.NumTileRows = 0;
+		m_ExtVP9Param.NumTileColumns = 0;
+		extendedBuffers.push_back((mfxExtBuffer *)&m_ExtVP9Param);
+	}
+
 #if defined(_WIN32)
-	// TODO: Ask about this one on VAAPI too.
-	memset(&m_ExtVideoSignalInfo, 0, sizeof(m_ExtVideoSignalInfo));
-	m_ExtVideoSignalInfo.Header.BufferId = MFX_EXTBUFF_VIDEO_SIGNAL_INFO;
-	m_ExtVideoSignalInfo.Header.BufferSz = sizeof(m_ExtVideoSignalInfo);
-	m_ExtVideoSignalInfo.VideoFormat = pParams->VideoFormat;
-	m_ExtVideoSignalInfo.VideoFullRange = pParams->VideoFullRange;
-	m_ExtVideoSignalInfo.ColourDescriptionPresent = 1;
-	m_ExtVideoSignalInfo.ColourPrimaries = pParams->ColourPrimaries;
-	m_ExtVideoSignalInfo.TransferCharacteristics = pParams->TransferCharacteristics;
-	m_ExtVideoSignalInfo.MatrixCoefficients = pParams->MatrixCoefficients;
-	extendedBuffers.push_back((mfxExtBuffer *)&m_ExtVideoSignalInfo);
+	// The Arc/Battlemage low-power VP9 path rejects any config that carries
+	// MFX_EXTBUFF_VIDEO_SIGNAL_INFO (MFXVideoENCODE_Query returns
+	// MFX_ERR_UNSUPPORTED). Verified empirically: the identical minimal VP9
+	// config Queries OK with {CodingOption2, CodingOption3, VP9Param} but fails
+	// as soon as VideoSignalInfo is added. Do not attach it for VP9 (per spec:
+	// only attach buffers demonstrably supported by the VP9 hardware path).
+	if (codec != QSV_CODEC_VP9) {
+		memset(&m_ExtVideoSignalInfo, 0, sizeof(m_ExtVideoSignalInfo));
+		m_ExtVideoSignalInfo.Header.BufferId = MFX_EXTBUFF_VIDEO_SIGNAL_INFO;
+		m_ExtVideoSignalInfo.Header.BufferSz = sizeof(m_ExtVideoSignalInfo);
+		m_ExtVideoSignalInfo.VideoFormat = pParams->VideoFormat;
+		m_ExtVideoSignalInfo.VideoFullRange = pParams->VideoFullRange;
+		m_ExtVideoSignalInfo.ColourDescriptionPresent = 1;
+		m_ExtVideoSignalInfo.ColourPrimaries = pParams->ColourPrimaries;
+		m_ExtVideoSignalInfo.TransferCharacteristics = pParams->TransferCharacteristics;
+		m_ExtVideoSignalInfo.MatrixCoefficients = pParams->MatrixCoefficients;
+		extendedBuffers.push_back((mfxExtBuffer *)&m_ExtVideoSignalInfo);
+	}
 #endif
 
 	// CLL and Chroma location in HEVC only supported by VPL
@@ -463,6 +541,127 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	m_mfxEncParams.ExtParam = extendedBuffers.data();
 	m_mfxEncParams.NumExtParam = (mfxU16)extendedBuffers.size();
 
+	// Log the full initialization configuration before Query so that any
+	// driver-side modification of parameters is easy to diagnose (the Intel VPL
+	// encoder may modify init params, and GetVideoParam() should be used to read
+	// back the actual working values).
+	blog(LOG_DEBUG, "MFX init params:\n"
+	     "\tCodecId:          %c%c%c%c\n"
+	     "\tProfile:          %u\n"
+	     "\tLevel:            %u\n"
+	     "\tLowPower:         %u\n"
+	     "\tTargetUsage:      %u\n"
+	     "\tRateControl:      %u\n"
+	     "\tTargetKbps:       %u\n"
+	     "\tMaxKbps:          %u\n"
+	     "\tBufferSizeInKB:   %u\n"
+	     "\tInitialDelayInKB: %u\n"
+	     "\tBRCParamMult:     %u\n"
+	     "\tGopPicSize:       %u\n"
+	     "\tGopRefDist:       %u\n"
+	     "\tNumRefFrame:      %u\n"
+	     "\tNumSlice:         %u\n"
+	     "\tFourCC:           %c%c%c%c\n"
+	     "\tChromaFormat:     %u\n"
+	     "\tBitDepthLuma:     %u\n"
+	     "\tBitDepthChroma:   %u\n"
+	     "\tWidth:            %u\n"
+	     "\tHeight:           %u\n"
+	     "\tFrameRate:        %u/%u\n"
+	     "\tAsyncDepth:       %u\n"
+	     "\tLookAheadDepth:   %u\n"
+	     "\tNumExtParam:      %u",
+	     (mfxU8)((m_mfxEncParams.mfx.CodecId >> 24) & 0xFF),
+	     (mfxU8)((m_mfxEncParams.mfx.CodecId >> 16) & 0xFF),
+	     (mfxU8)((m_mfxEncParams.mfx.CodecId >> 8) & 0xFF),
+	     (mfxU8)((m_mfxEncParams.mfx.CodecId >> 0) & 0xFF),
+	     (unsigned)m_mfxEncParams.mfx.CodecProfile,
+	     (unsigned)m_mfxEncParams.mfx.CodecLevel,
+	     (unsigned)m_mfxEncParams.mfx.LowPower,
+	     (unsigned)m_mfxEncParams.mfx.TargetUsage,
+	     (unsigned)m_mfxEncParams.mfx.RateControlMethod,
+	     (unsigned)m_mfxEncParams.mfx.TargetKbps,
+	     (unsigned)m_mfxEncParams.mfx.MaxKbps,
+	     (unsigned)m_mfxEncParams.mfx.BufferSizeInKB,
+	     (unsigned)m_mfxEncParams.mfx.InitialDelayInKB,
+	     (unsigned)m_mfxEncParams.mfx.BRCParamMultiplier,
+	     (unsigned)m_mfxEncParams.mfx.GopPicSize,
+	     (unsigned)m_mfxEncParams.mfx.GopRefDist,
+	     (unsigned)m_mfxEncParams.mfx.NumRefFrame,
+	     (unsigned)m_mfxEncParams.mfx.NumSlice,
+	     (mfxU8)((m_mfxEncParams.mfx.FrameInfo.FourCC >> 24) & 0xFF),
+	     (mfxU8)((m_mfxEncParams.mfx.FrameInfo.FourCC >> 16) & 0xFF),
+	     (mfxU8)((m_mfxEncParams.mfx.FrameInfo.FourCC >> 8) & 0xFF),
+	     (mfxU8)((m_mfxEncParams.mfx.FrameInfo.FourCC >> 0) & 0xFF),
+	     (unsigned)m_mfxEncParams.mfx.FrameInfo.ChromaFormat,
+	     (unsigned)m_mfxEncParams.mfx.FrameInfo.BitDepthLuma,
+	     (unsigned)m_mfxEncParams.mfx.FrameInfo.BitDepthChroma,
+	     (unsigned)m_mfxEncParams.mfx.FrameInfo.Width,
+	     (unsigned)m_mfxEncParams.mfx.FrameInfo.Height,
+	     (unsigned)m_mfxEncParams.mfx.FrameInfo.FrameRateExtN,
+	     (unsigned)m_mfxEncParams.mfx.FrameInfo.FrameRateExtD,
+	     (unsigned)m_mfxEncParams.AsyncDepth,
+	     (unsigned)m_co2.LookAheadDepth,
+	     (unsigned)m_mfxEncParams.NumExtParam);
+
+	// Dump every attached extension buffer (spec §4): index, BufferId (hex +
+	// symbolic name), and size. This confirms the exact buffer combination sent
+	// to Query/Init -- e.g. that VP9 now carries only {CodingOption2,
+	// CodingOption3, VP9Param} and NOT VideoSignalInfo (which the Arc low-power
+	// VP9 path rejects with MFX_ERR_UNSUPPORTED).
+	blog(LOG_DEBUG, "MFX extension buffers (count=%u):", (unsigned)m_mfxEncParams.NumExtParam);
+	for (mfxU16 i = 0; i < m_mfxEncParams.NumExtParam && m_mfxEncParams.ExtParam[i]; i++) {
+		mfxU32 id = m_mfxEncParams.ExtParam[i]->BufferId;
+		const char *name = "<unknown>";
+		switch (id) {
+		case MFX_EXTBUFF_CODING_OPTION:
+			name = "MFX_EXTBUFF_CODING_OPTION";
+			break;
+		case MFX_EXTBUFF_CODING_OPTION2:
+			name = "MFX_EXTBUFF_CODING_OPTION2";
+			break;
+		case MFX_EXTBUFF_CODING_OPTION3:
+			name = "MFX_EXTBUFF_CODING_OPTION3";
+			break;
+		case MFX_EXTBUFF_VP9_PARAM:
+			name = "MFX_EXTBUFF_VP9_PARAM";
+			break;
+		case MFX_EXTBUFF_VIDEO_SIGNAL_INFO:
+			name = "MFX_EXTBUFF_VIDEO_SIGNAL_INFO";
+			break;
+		default:
+			break;
+		}
+		blog(LOG_DEBUG, "\tExt[%u]: BufferId=0x%08X (%s), BufferSz=%u", (unsigned)i, (unsigned)id, name,
+		     (unsigned)m_mfxEncParams.ExtParam[i]->BufferSz);
+	}
+
+	if (codec == QSV_CODEC_VP9) {
+		blog(LOG_DEBUG, "MFX init params (VP9):\n"
+		     "\tCodecProfile:     %u (1=MFX_PROFILE_VP9_0/8bit, 3=MFX_PROFILE_VP9_2/10bit)\n"
+		     "\tWriteIVFHeaders:  %u\n"
+		     "\tNumTileRows:      %u\n"
+		     "\tNumTileColumns:   %u\n"
+		     "\tScenarioInfo:     %u (MFX_SCENARIO_LIVE_STREAMING=%d)",
+		     (unsigned)m_mfxEncParams.mfx.CodecProfile, (unsigned)m_ExtVP9Param.WriteIVFHeaders,
+		     (unsigned)m_ExtVP9Param.NumTileRows, (unsigned)m_ExtVP9Param.NumTileColumns,
+		     (unsigned)m_co3.ScenarioInfo, MFX_SCENARIO_LIVE_STREAMING);
+
+		// mfxExtCodingOption2 IS attached for VP9; log its fields (spec §11).
+		blog(LOG_DEBUG, "MFX CodingOption2 (VP9):\n"
+		     "\tLookAheadDepth: %u\n"
+		     "\tRepeatPPS:      %u\n"
+		     "\tAdaptiveB:      %u\n"
+		     "\tBRefType:       %u\n"
+		     "\tExtBRC:         %u\n"
+		     "\tMBBRC:          %u\n"
+		     "\tIntRefType:     %u\n"
+		     "\tMaxFrameSize:   %u",
+		     (unsigned)m_co2.LookAheadDepth, (unsigned)m_co2.RepeatPPS, (unsigned)m_co2.AdaptiveB,
+		     (unsigned)m_co2.BRefType, (unsigned)m_co2.ExtBRC, (unsigned)m_co2.MBBRC,
+		     (unsigned)m_co2.IntRefType, (unsigned)m_co2.MaxFrameSize);
+	}
+
 	// We don't check what was valid or invalid here, just try changing LowPower.
 	// Ensure set values are not overwritten so in case it wasn't lowPower we fail
 	// during the parameter check.
@@ -471,8 +670,18 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	mfxStatus sts = m_pmfxENC->Query(&m_mfxEncParams, &validParams);
 	if (sts == MFX_ERR_UNSUPPORTED || sts == MFX_ERR_UNDEFINED_BEHAVIOR) {
 		if (m_mfxEncParams.mfx.LowPower == MFX_CODINGOPTION_ON) {
-			m_mfxEncParams.mfx.LowPower = MFX_CODINGOPTION_OFF;
-			m_co2.LookAheadDepth = 0;
+			if (codec != QSV_CODEC_VP9) {
+				m_mfxEncParams.mfx.LowPower = MFX_CODINGOPTION_OFF;
+				m_co2.LookAheadDepth = 0;
+			} else {
+				// VP9 is tied to the Low Power path; LowPower=OFF is not
+				// supported. Do NOT fall back - keep LowPower=ON so Open()'s
+				// Query surfaces the unsupported configuration as a hard error
+				// instead of silently producing a broken stream.
+				warn("VP9: Query rejected LowPower=ON config (sts=%d); this "
+				     "GPU/runtime does not support the low-power VP9 path.",
+				     (int)sts);
+			}
 		}
 	}
 
@@ -579,7 +788,8 @@ mfxStatus QSV_Encoder_Internal::Resize(qsv_param_t *pParams)
 	/* Recreate the MFX session (reuses existing D3D11 device handle) */
 	sts = Initialize(m_ver, &m_session, &m_mfxAllocator, &g_GFX_Handle, false,
 	                  (enum qsv_codec)(m_mfxEncParams.mfx.CodecId == MFX_CODEC_HEVC ? QSV_CODEC_HEVC :
-	                                     m_mfxEncParams.mfx.CodecId == MFX_CODEC_AV1  ? QSV_CODEC_AV1  : QSV_CODEC_AVC),
+	                                     m_mfxEncParams.mfx.CodecId == MFX_CODEC_AV1  ? QSV_CODEC_AV1  :
+	                                     m_mfxEncParams.mfx.CodecId == MFX_CODEC_VP9  ? QSV_CODEC_VP9  : QSV_CODEC_AVC),
 	                  &m_sessionData);
 	if (sts != MFX_ERR_NONE)
 		return sts;
@@ -631,6 +841,7 @@ mfxStatus QSV_Encoder_Internal::Resize(qsv_param_t *pParams)
 	switch (m_mfxEncParams.mfx.CodecId) {
 	case MFX_CODEC_AVC:  codec = QSV_CODEC_AVC; break;
 	case MFX_CODEC_HEVC: codec = QSV_CODEC_HEVC; break;
+	case MFX_CODEC_VP9:  codec = QSV_CODEC_VP9; break;
 	default:             codec = QSV_CODEC_AV1; break;
 	}
 	sts = GetVideoParam(codec);
@@ -698,50 +909,94 @@ mfxStatus QSV_Encoder_Internal::AllocateSurfaces()
 		}
 	}
 
-	blog(LOG_INFO, "\tm_nSurfNum:     %d", m_nSurfNum);
+	blog(LOG_DEBUG, "\tm_nSurfNum:     %d", m_nSurfNum);
 
 	return sts;
+}
+
+// Log the effective (post-Query/Init) working parameters read back via
+// MFXVideoENCODE_GetVideoParam(). Intel VPL may modify init params, so these are
+// the authoritative values for diagnosing BRC/GOP behavior.
+static void LogEffectiveParams(const mfxVideoParam *p)
+{
+	blog(LOG_DEBUG, "MFX effective params (post-GetVideoParam):\n"
+	     "\tRateControl:      %u\n"
+	     "\tTargetKbps:       %u\n"
+	     "\tMaxKbps:          %u\n"
+	     "\tBufferSizeInKB:   %u\n"
+	     "\tInitialDelayInKB: %u\n"
+	     "\tGopPicSize:       %u\n"
+	     "\tGopRefDist:       %u\n"
+	     "\tNumSlice:         %u\n"
+	     "\tLowPower:         %u\n"
+	     "\tAsyncDepth:       %u",
+	     (unsigned)p->mfx.RateControlMethod,
+	     (unsigned)p->mfx.TargetKbps,
+	     (unsigned)p->mfx.MaxKbps,
+	     (unsigned)p->mfx.BufferSizeInKB,
+	     (unsigned)p->mfx.InitialDelayInKB,
+	     (unsigned)p->mfx.GopPicSize,
+	     (unsigned)p->mfx.GopRefDist,
+	     (unsigned)p->mfx.NumSlice,
+	     (unsigned)p->mfx.LowPower,
+	     (unsigned)p->AsyncDepth);
 }
 
 mfxStatus QSV_Encoder_Internal::GetVideoParam(enum qsv_codec codec)
 {
 	memset(&m_parameter, 0, sizeof(m_parameter));
-	mfxExtCodingOptionSPSPPS opt;
-	memset(&m_parameter, 0, sizeof(m_parameter));
-	opt.Header.BufferId = MFX_EXTBUFF_CODING_OPTION_SPSPPS;
-	opt.Header.BufferSz = sizeof(mfxExtCodingOptionSPSPPS);
 
 	std::vector<mfxExtBuffer *> extendedBuffers;
 	extendedBuffers.reserve(2);
 
-	opt.SPSBuffer = m_SPSBuffer;
-	opt.PPSBuffer = m_PPSBuffer;
-	opt.SPSBufSize = 1024; //  m_nSPSBufferSize;
-	opt.PPSBufSize = 1024; //  m_nPPSBufferSize;
+	if (codec != QSV_CODEC_VP9) {
+		// VP9 has no SPS/PPS/VPS parameter-set model, so do not attach the
+		// SPSPPS extension buffer for it (the bitstream is passed through as-is).
+		mfxExtCodingOptionSPSPPS opt;
+		opt.Header.BufferId = MFX_EXTBUFF_CODING_OPTION_SPSPPS;
+		opt.Header.BufferSz = sizeof(mfxExtCodingOptionSPSPPS);
 
-	mfxExtCodingOptionVPS opt_vps{};
-	if (codec == QSV_CODEC_HEVC) {
-		opt_vps.Header.BufferId = MFX_EXTBUFF_CODING_OPTION_VPS;
-		opt_vps.Header.BufferSz = sizeof(mfxExtCodingOptionVPS);
-		opt_vps.VPSBuffer = m_VPSBuffer;
-		opt_vps.VPSBufSize = 1024;
+		opt.SPSBuffer = m_SPSBuffer;
+		opt.PPSBuffer = m_PPSBuffer;
+		opt.SPSBufSize = 1024; //  m_nSPSBufferSize;
+		opt.PPSBufSize = 1024; //  m_nPPSBufferSize;
 
-		extendedBuffers.push_back((mfxExtBuffer *)&opt_vps);
+		mfxExtCodingOptionVPS opt_vps{};
+		if (codec == QSV_CODEC_HEVC) {
+			opt_vps.Header.BufferId = MFX_EXTBUFF_CODING_OPTION_VPS;
+			opt_vps.Header.BufferSz = sizeof(mfxExtCodingOptionVPS);
+			opt_vps.VPSBuffer = m_VPSBuffer;
+			opt_vps.VPSBufSize = 1024;
+
+			extendedBuffers.push_back((mfxExtBuffer *)&opt_vps);
+		}
+
+		extendedBuffers.push_back((mfxExtBuffer *)&opt);
+
+		m_parameter.ExtParam = extendedBuffers.data();
+		m_parameter.NumExtParam = (mfxU16)extendedBuffers.size();
+
+		mfxStatus sts = m_pmfxENC->GetVideoParam(&m_parameter);
+		MSDK_CHECK_RESULT(sts, MFX_ERR_NONE, sts);
+
+		if (codec == QSV_CODEC_HEVC)
+			m_nVPSBufferSize = opt_vps.VPSBufSize;
+		m_nSPSBufferSize = opt.SPSBufSize;
+		m_nPPSBufferSize = opt.PPSBufSize;
+
+		LogEffectiveParams(&m_parameter);
+		return sts;
 	}
 
-	extendedBuffers.push_back((mfxExtBuffer *)&opt);
-
-	m_parameter.ExtParam = extendedBuffers.data();
-	m_parameter.NumExtParam = (mfxU16)extendedBuffers.size();
-
+	// VP9: no parameter sets to retrieve. Still call GetVideoParam (with an
+	// empty extension list) so m_parameter carries the effective AsyncDepth and
+	// BufferSizeInKB used by InitBitstream().
+	m_nSPSBufferSize = 0;
+	m_nPPSBufferSize = 0;
 	mfxStatus sts = m_pmfxENC->GetVideoParam(&m_parameter);
 	MSDK_CHECK_RESULT(sts, MFX_ERR_NONE, sts);
 
-	if (codec == QSV_CODEC_HEVC)
-		m_nVPSBufferSize = opt_vps.VPSBufSize;
-	m_nSPSBufferSize = opt.SPSBufSize;
-	m_nPPSBufferSize = opt.PPSBufSize;
-
+	LogEffectiveParams(&m_parameter);
 	return sts;
 }
 
@@ -789,7 +1044,7 @@ mfxStatus QSV_Encoder_Internal::InitBitstream()
 	m_outBitstream.DataOffset = 0;
 	m_outBitstream.DataLength = 0;
 
-	blog(LOG_INFO, "\tm_nTaskPool:    %d", m_nTaskPool);
+	blog(LOG_DEBUG, "\tm_nTaskPool:    %d", m_nTaskPool);
 
 	return MFX_ERR_NONE;
 }
@@ -1025,7 +1280,7 @@ mfxStatus QSV_Encoder_Internal::Encode_tex(uint64_t ts, void *tex, uint64_t lock
 			blog(LOG_WARNING, "Encode_tex: MFX_ERR_NOT_ENOUGH_BUFFER");
 			break;
 		} else if (sts < MFX_ERR_NONE) {
-			blog(LOG_WARNING, "Encode_tex: EncodeFrameAsync failed: sts=%d", (int)sts);
+			blog(LOG_DEBUG, "Encode_tex: EncodeFrameAsync failed: sts=%d", (int)sts);
 			break;
 		} else
 			break;

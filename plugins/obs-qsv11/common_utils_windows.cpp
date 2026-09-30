@@ -38,6 +38,17 @@ mfxStatus Initialize(mfxVersion ver, mfxSession *pSession, mfxFrameAllocator *pm
 				break;
 			}
 		}
+	} else if (codec == QSV_CODEC_VP9 && !adapters[adapter_idx].supports_vp9) {
+		for (mfxU32 i = 0; i < MAX_ADAPTERS; i++) {
+			if (!adapters[i].is_intel) {
+				idx_adjustment++;
+				continue;
+			}
+			if (adapters[i].supports_vp9) {
+				adapter_idx = i;
+				break;
+			}
+		}
 	} else if (!adapters[adapter_idx].is_intel) {
 		for (mfxU32 i = 0; i < MAX_ADAPTERS; i++) {
 			if (adapters[i].is_intel) {
@@ -219,6 +230,19 @@ void check_adapters(struct adapter_info *adapters, size_t *adapter_count)
 		adapter->is_dgpu = config_get_bool(config, section, "is_dgpu");
 		adapter->supports_av1 = config_get_bool(config, section, "supports_av1");
 		adapter->supports_hevc = config_get_bool(config, section, "supports_hevc");
+		adapter->supports_vp9 = config_get_bool(config, section, "supports_vp9");
+
+		// Runtime-probed VP9 profile/format capabilities (spec §8, §36). These come from
+		// MFXVideoENCODE_Query probes in obs-qsv-test.cpp and drive the dynamic UI,
+		// encoder registration, and create-time validation.
+		adapter->vp9.profile0_nv12_8bit = config_get_bool(config, section, "vp9_p0_nv12");
+		adapter->vp9.profile1_ayuv_8bit = config_get_bool(config, section, "vp9_p1_ayuv");
+		adapter->vp9.profile2_p010_10bit = config_get_bool(config, section, "vp9_p2_p010");
+		adapter->vp9.profile3_y410_10bit = config_get_bool(config, section, "vp9_p3_y410");
+		adapter->vp9.max_width = (uint32_t)config_get_int(config, section, "vp9_max_width");
+		adapter->vp9.max_height = (uint32_t)config_get_int(config, section, "vp9_max_height");
+		adapter->vp9.encoder_supported = adapter->vp9.profile0_nv12_8bit || adapter->vp9.profile1_ayuv_8bit ||
+		                                 adapter->vp9.profile2_p010_10bit || adapter->vp9.profile3_y410_10bit;
 	}
 
 fail:

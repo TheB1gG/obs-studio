@@ -1,6 +1,8 @@
 #pragma once
 
 #include <stdio.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 // Most of this file shouldnt be accessed from C.
 #ifdef __cplusplus
@@ -11,6 +13,40 @@ enum qsv_codec {
 	QSV_CODEC_AVC,
 	QSV_CODEC_AV1,
 	QSV_CODEC_HEVC,
+	QSV_CODEC_VP9,
+};
+
+/* Runtime-probed VP9 encoder capabilities for a single QSV adapter.
+ *
+ * Populated by probing the actual MFX/oneVPL runtime (see obs-qsv-test.cpp on
+ * Windows) rather than from static platform tables. Each profile/format combo is
+ * probed independently with LowPower=ON so that one failing profile never masks
+ * the others (spec §13-§16). Fields that have not yet been queried/verified keep
+ * their zero/false default and must not be exposed in the UI until they actually
+ * are (spec §5, §31). */
+struct vp9_caps {
+	bool encoder_supported; /* true if ANY profile probe succeeded */
+
+	/* Per-profile / per-format capability (each probed independently). */
+	bool profile0_nv12_8bit;  /* VP9 Profile 0: 8-bit  4:2:0 (NV12)   */
+	bool profile1_ayuv_8bit;  /* VP9 Profile 1: 8-bit  4:4:4 (AYUV)   */
+	bool profile2_p010_10bit; /* VP9 Profile 2: 10-bit 4:2:0 (P010)   */
+	bool profile3_y410_10bit; /* VP9 Profile 3: 10-bit 4:4:4 (Y410)   */
+
+	/* Max encoded resolution. 0 = not determined / no known limit enforced. */
+	uint32_t max_width;
+	uint32_t max_height;
+
+	/* Extensible -- populated by future capability detection only. */
+	bool tile_support;
+	uint32_t max_tile_rows;
+	uint32_t max_tile_columns;
+	bool scenario_live_streaming;
+	bool frame_size_tolerance;
+	bool max_frame_size;
+	bool segmentation;
+	bool skip_frame;
+	uint32_t max_reference_frames;
 };
 
 struct adapter_info {
@@ -18,6 +54,8 @@ struct adapter_info {
 	bool is_dgpu;
 	bool supports_av1;
 	bool supports_hevc;
+	bool supports_vp9;
+	struct vp9_caps vp9; /* runtime-probed VP9 profile/format capabilities */
 };
 
 #define MAX_ADAPTERS 10

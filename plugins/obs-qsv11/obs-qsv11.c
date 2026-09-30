@@ -178,6 +178,12 @@ static const char *obs_qsv_getname_hevc(void *type_data)
 	return "QuickSync HEVC";
 }
 
+static const char *obs_qsv_getname_vp9(void *type_data)
+{
+	UNUSED_PARAMETER(type_data);
+	return "QuickSync VP9";
+}
+
 static void clear_data(struct obs_qsv *obsqsv)
 {
 	if (obsqsv->context) {
@@ -211,8 +217,12 @@ static void obs_qsv_defaults(obs_data_t *settings, int ver, enum qsv_codec codec
 	obs_data_set_default_string(settings, "target_usage", "TU4");
 	obs_data_set_default_int(settings, "bitrate", 2500);
 	obs_data_set_default_int(settings, "max_bitrate", 3000);
-	obs_data_set_default_string(settings, "profile", codec == QSV_CODEC_AVC ? "high" : "main");
-	obs_data_set_default_string(settings, "rate_control", "ICQ");
+	obs_data_set_default_string(settings, "profile", codec == QSV_CODEC_AVC ? "high" :
+	                                      (codec == QSV_CODEC_VP9 ? "profile0" : "main"));
+
+	/* CBR is the recommended live-streaming mode for VP9 (bitrate-constrained);
+	 * other codecs default to ICQ. */
+	obs_data_set_default_string(settings, "rate_control", codec == QSV_CODEC_VP9 ? "CBR" : "ICQ");
 
 	obs_data_set_default_int(settings, "__ver", ver);
 
@@ -222,13 +232,18 @@ static void obs_qsv_defaults(obs_data_t *settings, int ver, enum qsv_codec codec
 	obs_data_set_default_int(settings, "qpb", 23);
 	obs_data_set_default_int(settings, "icq_quality", 17);
 
-	obs_data_set_default_int(settings, "keyint_sec", 0);
+	/* VP9 uses an explicit live-streaming GOP (~2s) rather than the recording-
+	 * oriented auto/0 default, for deterministic keyframe/bitrate behavior. */
+	obs_data_set_default_int(settings, "keyint_sec", codec == QSV_CODEC_VP9 ? 2 : 0);
 	obs_data_set_default_string(settings, "latency", "normal");
-	obs_data_set_default_int(settings, "bframes", 3);
+	/* VP9 has no traditional B-frame pipeline (GopRefDist=1); force 0. */
+	obs_data_set_default_int(settings, "bframes", codec == QSV_CODEC_VP9 ? 0 : 3);
 	obs_data_set_default_bool(settings, "repeat_headers", false);
 
-	/* Per-encoder color defaults: H.264 is 8-bit (NV12), HEVC/AV1 default to 10-bit (P010). */
-	obs_data_set_default_string(settings, "color_format", codec == QSV_CODEC_AVC ? "NV12" : "P010");
+	/* Per-encoder color defaults: H.264 is 8-bit (NV12), HEVC/AV1 default to
+	 * 10-bit (P010). VP9 starts on the 8-bit NV12 / profile 0 path. */
+	obs_data_set_default_string(settings, "color_format", codec == QSV_CODEC_AVC ? "NV12" :
+	                                      (codec == QSV_CODEC_VP9 ? "NV12" : "P010"));
 	obs_data_set_default_int(settings, "color_space", VIDEO_CS_709);
 	obs_data_set_default_int(settings, "color_range", VIDEO_RANGE_PARTIAL);
 }
@@ -248,9 +263,49 @@ static void obs_qsv_defaults_av1(obs_data_t *settings)
 	obs_qsv_defaults(settings, 2, QSV_CODEC_AV1);
 }
 
+/* Aggregate VP9 capabilities across all Intel adapters: a profile is "available"
+ * if ANY adapter's runtime probe confirmed it (spec §36-§37). This mirrors how
+ * encoder registration is gated and drives the dynamic profile UI + validation. */
+static void vp9_aggregate_caps(struct vp9_caps *out)
+{
+	memset(out, 0, sizeof(*out));
+	for (size_t i = 0; i < adapter_count; i++) {
+		if (!adapters[i].is_intel)
+			continue;
+		out->profile0_nv12_8bit |= adapters[i].vp9.profile0_nv12_8bit;
+		out->profile1_ayuv_8bit |= adapters[i].vp9.profile1_ayuv_8bit;
+		out->profile2_p010_10bit |= adapters[i].vp9.profile2_p010_10bit;
+		out->profile3_y410_10bit |= adapters[i].vp9.profile3_y410_10bit;
+	}
+	out->encoder_supported = out->profile0_nv12_8bit || out->profile1_ayuv_8bit ||
+	                         out->profile2_p010_10bit || out->profile3_y410_10bit;
+}
+
 static void obs_qsv_defaults_hevc(obs_data_t *settings)
 {
 	obs_qsv_defaults(settings, 2, QSV_CODEC_HEVC);
+}
+
+static void obs_qsv_defaults_vp9(obs_data_t *settings)
+{
+	obs_qsv_defaults(settings, 2, QSV_CODEC_VP9);
+
+	/* Default the standard "Color Format" dropdown (injected by libobs) to the first
+	 * runtime-supported VP9 profile so the initial selection is always valid on this
+	 * hardware. Each OBS color format maps 1:1 to a QSV VP9 profile: NV12->P0, P010->P2,
+	 * I444->P1 (delivered as AYUV), Y410->P3 (spec §23). */
+	struct vp9_caps caps;
+	vp9_aggregate_caps(&caps);
+	const char *default_fmt = "NV12";
+	if (!caps.profile0_nv12_8bit) {
+		if (caps.profile2_p010_10bit)
+			default_fmt = "P010";
+		else if (caps.profile1_ayuv_8bit)
+			default_fmt = "I444";
+		else if (caps.profile3_y410_10bit)
+			default_fmt = "Y410";
+	}
+	obs_data_set_default_string(settings, "color_format", default_fmt);
 }
 
 static inline void add_strings(obs_property_t *list, const char *const *strings)
@@ -418,7 +473,11 @@ static obs_properties_t *obs_qsv_props(enum qsv_codec codec, void *unused, int v
 	prop = obs_properties_add_list(props, "rate_control", TEXT_RATE_CONTROL, OBS_COMBO_TYPE_LIST,
 				       OBS_COMBO_FORMAT_STRING);
 
-	add_rate_controls(prop, qsv_ratecontrols);
+	/* VP9 exposes only CBR/VBR/CQP (no ICQ/LA lookahead modes). */
+	if (codec == QSV_CODEC_VP9)
+		add_rate_controls(prop, qsv_ratecontrols_vp9);
+	else
+		add_rate_controls(prop, qsv_ratecontrols);
 
 	obs_property_set_modified_callback(prop, rate_control_modified);
 
@@ -441,14 +500,19 @@ static obs_properties_t *obs_qsv_props(enum qsv_codec codec, void *unused, int v
 	prop = obs_properties_add_list(props, "target_usage", TEXT_SPEED, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	add_translated_strings(prop, qsv_usage_translation_keys, qsv_usage_names);
 
-	prop = obs_properties_add_list(props, "profile", TEXT_PROFILE, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	if (codec != QSV_CODEC_VP9) {
+		/* VP9 exposes no explicit profile dropdown: the standard "Color Format"
+		 * dropdown (injected by libobs from is_color_format_supported) selects the
+		 * profile implicitly - NV12->P0, P010->P2, I444->P1, Y410->P3 (spec §23-§25). */
+		prop = obs_properties_add_list(props, "profile", TEXT_PROFILE, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 
-	if (codec == QSV_CODEC_AVC)
-		add_strings(prop, qsv_profile_names);
-	else if (codec == QSV_CODEC_AV1)
-		add_strings(prop, qsv_profile_names_av1);
-	else if (codec == QSV_CODEC_HEVC)
-		add_strings(prop, qsv_profile_names_hevc);
+		if (codec == QSV_CODEC_AVC)
+			add_strings(prop, qsv_profile_names);
+		else if (codec == QSV_CODEC_AV1)
+			add_strings(prop, qsv_profile_names_av1);
+		else if (codec == QSV_CODEC_HEVC)
+			add_strings(prop, qsv_profile_names_hevc);
+	}
 
 	prop = obs_properties_add_int(props, "keyint_sec", TEXT_KEYINT_SEC, 0, 20, 1);
 	obs_property_int_set_suffix(prop, " s");
@@ -457,7 +521,10 @@ static obs_properties_t *obs_qsv_props(enum qsv_codec codec, void *unused, int v
 	add_strings(prop, qsv_latency_names);
 	obs_property_set_long_description(prop, obs_module_text("Latency.ToolTip"));
 
-	obs_properties_add_int(props, "bframes", TEXT_BFRAMES, 0, 3, 1);
+	/* VP9 has no B-frame pipeline (GopRefDist=1), so the B-frames control is
+	 * not exposed for it. */
+	if (codec != QSV_CODEC_VP9)
+		obs_properties_add_int(props, "bframes", TEXT_BFRAMES, 0, 3, 1);
 
 	return props;
 }
@@ -484,6 +551,12 @@ static obs_properties_t *obs_qsv_props_hevc(void *unused)
 {
 	UNUSED_PARAMETER(unused);
 	return obs_qsv_props(QSV_CODEC_HEVC, unused, 2);
+}
+
+static obs_properties_t *obs_qsv_props_vp9(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return obs_qsv_props(QSV_CODEC_VP9, unused, 2);
 }
 
 static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
@@ -563,6 +636,41 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 	} else if (obsqsv->codec == QSV_CODEC_AV1) {
 		codec = "AV1";
 		obsqsv->params.nCodecProfile = MFX_PROFILE_AV1_MAIN;
+	} else if (obsqsv->codec == QSV_CODEC_VP9) {
+		codec = "VP9";
+		/* Deterministic profile<->format mapping (spec §25): the VP9 profile
+		 * follows the input surface format. 4:4:4 profiles are only reached when
+		 * capability detection confirmed them and the create path allowed the
+		 * matching AYUV/Y410 input. */
+		if (obsqsv->params.video_fmt_p010)
+			obsqsv->params.nCodecProfile = MFX_PROFILE_VP9_2;
+		else if (obsqsv->params.video_fmt_y410)
+			obsqsv->params.nCodecProfile = MFX_PROFILE_VP9_3;
+		else if (obsqsv->params.video_fmt_ayuv)
+			obsqsv->params.nCodecProfile = MFX_PROFILE_VP9_1;
+		else
+			obsqsv->params.nCodecProfile = MFX_PROFILE_VP9_0;
+	}
+
+	/* The settings dump below prints the raw "profile" OBS string, which is not used for VP9
+	 * (its profile is derived from the input color format above). Show the derived profile so
+	 * the log matches the actual MFX session (CodecProfile). */
+	const char *profile_log = profile ? profile : "";
+	if (obsqsv->codec == QSV_CODEC_VP9) {
+		switch (obsqsv->params.nCodecProfile) {
+		case MFX_PROFILE_VP9_1:
+			profile_log = "VP9 Profile 1 (4:4:4 / AYUV)";
+			break;
+		case MFX_PROFILE_VP9_2:
+			profile_log = "VP9 Profile 2 (10-bit / P010)";
+			break;
+		case MFX_PROFILE_VP9_3:
+			profile_log = "VP9 Profile 3 (4:4:4 / Y410)";
+			break;
+		default:
+			profile_log = "VP9 Profile 0 (4:2:0 / NV12)";
+			break;
+		}
 	}
 
 	obsqsv->params.VideoFormat = 5;
@@ -671,6 +779,18 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 			obsqsv->params.nLADEPTH = 10;
 	}
 
+	/* VP9: the Intel low-power VP9 hardware path does not support the generic
+	 * QSV lookahead BRC (MFX_RATECONTROL_LA / LA_ICQ), and uses a no-B-frame
+	 * pipeline (GopRefDist=1) with native LAST/GOLDEN/ALTREF references.
+	 * Decouple the OBS latency setting from hidden VP9 lookahead, and force
+	 * B-frames to 0 so the generic H.264/HEVC defaults (bframes=3, LA depth
+	 * 30/60) do not leak into the VP9 configuration. AsyncDepth still controls
+	 * the encoder pipeline latency (1 for ultra-low, 4 for low/normal). */
+	if (obsqsv->codec == QSV_CODEC_VP9) {
+		obsqsv->params.nLADEPTH = 0;
+		bFrames = 0;
+	}
+
 	if (ver == 1) {
 		obsqsv->params.nQPI = (mfxU16)qpi;
 		obsqsv->params.nQPP = (mfxU16)qpp;
@@ -737,11 +857,11 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 	     "\twidth:          %d\n"
 	     "\theight:         %d\n"
 	     "\tFPS:            %g (%u/%u)",
-	     target_usage, profile, keyint_sec, latency, bFrames, width, height,
+	     target_usage, profile_log, keyint_sec, latency, bFrames, width, height,
 	     obs_encoder_get_effective_fps(obsqsv->encoder), obs_encoder_get_fps_num(obsqsv->encoder),
 	     obs_encoder_get_fps_den(obsqsv->encoder) * obs_encoder_get_frame_rate_divisor(obsqsv->encoder));
 
-	info("debug info:");
+	blog(LOG_DEBUG, "debug info:");
 }
 
 static bool update_settings(struct obs_qsv *obsqsv, obs_data_t *settings)
@@ -773,6 +893,17 @@ static void load_hevc_headers(struct obs_qsv *obsqsv)
 
 static void load_headers(struct obs_qsv *obsqsv)
 {
+	// VP9 has no SPS/PPS/VPS parameter-set model. Do NOT call the H.264/HEVC
+	// header loader or manufacture parameter sets; the raw VP9 bitstream is
+	// passed through directly (no IVF headers for streaming output).
+	if (obsqsv->codec == QSV_CODEC_VP9) {
+		obsqsv->extra_data = NULL;
+		obsqsv->extra_data_size = 0;
+		obsqsv->sei = NULL;
+		obsqsv->sei_size = 0;
+		return;
+	}
+
 	DARRAY(uint8_t) header;
 	static uint8_t sei = 0;
 
@@ -1019,6 +1150,10 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 	obsqsv->encoder = encoder;
 	obsqsv->codec = codec;
 
+	struct vp9_caps vp9_caps = {0};
+	if (codec == QSV_CODEC_VP9)
+		vp9_aggregate_caps(&vp9_caps);
+
 	video_t *video = obs_encoder_video(encoder);
 	const struct video_output_info *voi = video_output_get_info(video);
 	switch (voi->format) {
@@ -1042,7 +1177,6 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 		return NULL;
 	}
 	case VIDEO_FORMAT_GBRA:
-	case VIDEO_FORMAT_AYUV:
 		if (codec != QSV_CODEC_HEVC || !useTexAlloc) {
 			const char *const text = obs_module_text("444Unsupported");
 			obs_encoder_set_last_error(encoder, text);
@@ -1052,7 +1186,20 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 		}
 		obsqsv->params.video_fmt_ayuv = true;
 		break;
-	case VIDEO_FORMAT_Y410:
+	case VIDEO_FORMAT_AYUV:
+		/* 8-bit 4:4:4 -> VP9 Profile 1, allowed on both the texture and non-texture paths when
+		 * runtime capability detection confirmed P1 (spec §27). */
+		if ((codec == QSV_CODEC_HEVC) ||
+		    (codec == QSV_CODEC_VP9 && vp9_caps.profile1_ayuv_8bit)) {
+			obsqsv->params.video_fmt_ayuv = true;
+		} else {
+			const char *const text = obs_module_text("444Unsupported");
+			obs_encoder_set_last_error(encoder, text);
+			error("%s", text);
+			bfree(obsqsv);
+			return NULL;
+		}
+		break;
 	case VIDEO_FORMAT_GBR10:
 		if (codec != QSV_CODEC_HEVC || !useTexAlloc) {
 			const char *const text = obs_module_text("444Unsupported");
@@ -1062,6 +1209,20 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 			return NULL;
 		}
 		obsqsv->params.video_fmt_y410 = true;
+		break;
+	case VIDEO_FORMAT_Y410:
+		/* 10-bit 4:4:4 -> VP9 Profile 3, allowed on both the texture and non-texture paths when
+		 * runtime capability detection confirmed P3 (spec §27). */
+		if ((codec == QSV_CODEC_HEVC) ||
+		    (codec == QSV_CODEC_VP9 && vp9_caps.profile3_y410_10bit)) {
+			obsqsv->params.video_fmt_y410 = true;
+		} else {
+			const char *const text = obs_module_text("444Unsupported");
+			obs_encoder_set_last_error(encoder, text);
+			error("%s", text);
+			bfree(obsqsv);
+			return NULL;
+		}
 		break;
 	default:
 		switch (voi->colorspace) {
@@ -1073,6 +1234,28 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 			bfree(obsqsv);
 			return NULL;
 		}
+		}
+	}
+
+	if (codec == QSV_CODEC_VP9) {
+		// Validate the effective (format-derived) profile against runtime
+		// capability detection before opening the encoder (spec §26, §30).
+		bool supported;
+		if (obsqsv->params.video_fmt_p010)
+			supported = vp9_caps.profile2_p010_10bit;
+		else if (obsqsv->params.video_fmt_y410)
+			supported = vp9_caps.profile3_y410_10bit;
+		else if (obsqsv->params.video_fmt_ayuv)
+			supported = vp9_caps.profile1_ayuv_8bit;
+		else
+			supported = vp9_caps.profile0_nv12_8bit;
+
+		if (!supported) {
+			const char *const text = obs_module_text("VP9ProfileUnsupported");
+			obs_encoder_set_last_error(encoder, text);
+			error("%s", text);
+			bfree(obsqsv);
+			return NULL;
 		}
 	}
 
@@ -1102,7 +1285,7 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 
 	qsv_encoder_version(&g_verMajor, &g_verMinor);
 
-	blog(LOG_INFO,
+	blog(LOG_DEBUG,
 	     "\tmajor:          %d\n"
 	     "\tminor:          %d",
 	     g_verMajor, g_verMinor);
@@ -1137,6 +1320,11 @@ static void *obs_qsv_create_hevc(obs_data_t *settings, obs_encoder_t *encoder)
 	return obs_qsv_create(QSV_CODEC_HEVC, settings, encoder, false);
 }
 
+static void *obs_qsv_create_vp9(obs_data_t *settings, obs_encoder_t *encoder)
+{
+	return obs_qsv_create(QSV_CODEC_VP9, settings, encoder, false);
+}
+
 static void *obs_qsv_create_tex(enum qsv_codec codec, obs_data_t *settings, obs_encoder_t *encoder,
 				const char *fallback_id)
 {
@@ -1153,6 +1341,11 @@ static void *obs_qsv_create_tex(enum qsv_codec codec, obs_data_t *settings, obs_
 		return obs_encoder_create_rerouted(encoder, (const char *)fallback_id);
 	}
 
+	if (codec == QSV_CODEC_VP9 && !adapters[ovi.adapter].supports_vp9) {
+		blog(LOG_INFO, ">>> cap on different device, fall back to non-texture sharing VP9 qsv encoder");
+		return obs_encoder_create_rerouted(encoder, (const char *)fallback_id);
+	}
+
 	bool gpu_texture_active = obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_NV12);
 
 	if (codec != QSV_CODEC_AVC)
@@ -1163,6 +1356,11 @@ static void *obs_qsv_create_tex(enum qsv_codec codec, obs_data_t *settings, obs_
 				     obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_Y410) ||
 				     obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_GBR10);
 	}
+	if (codec == QSV_CODEC_VP9) {
+		gpu_texture_active = gpu_texture_active || obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_AYUV) ||
+				     obs_encoder_video_tex_active(encoder, VIDEO_FORMAT_Y410);
+	}
+
 
 	if (!gpu_texture_active) {
 		blog(LOG_INFO, ">>> gpu tex not active, fall back to old qsv encoder");
@@ -1199,6 +1397,11 @@ static void *obs_qsv_create_tex_av1(obs_data_t *settings, obs_encoder_t *encoder
 static void *obs_qsv_create_tex_hevc(obs_data_t *settings, obs_encoder_t *encoder)
 {
 	return obs_qsv_create_tex(QSV_CODEC_HEVC, settings, encoder, "obs_qsv11_hevc_soft");
+}
+
+static void *obs_qsv_create_tex_vp9(obs_data_t *settings, obs_encoder_t *encoder)
+{
+	return obs_qsv_create_tex(QSV_CODEC_VP9, settings, encoder, "obs_qsv11_vp9_soft");
 }
 
 static bool obs_qsv_extra_data(void *data, uint8_t **extra_data, size_t *size)
@@ -1308,6 +1511,56 @@ static void obs_qsv_video_info_hevc_tex(void *data, struct video_scale_info *inf
 		/* Use SRGB for SDR */
 		if (info->colorspace != VIDEO_CS_2100_PQ && info->colorspace != VIDEO_CS_2100_HLG)
 			info->colorspace = VIDEO_CS_SRGB;
+		return;
+	}
+#endif
+	obs_qsv_video_plus_hdr_info(data, info);
+}
+
+/* Declares which entries of the standard "Color Format" dropdown the QSV VP9 encoder can
+ * actually encode, based on runtime-detected per-profile capabilities. libobs builds that
+ * dropdown from this set (add_encoder_color_properties), so only formats whose profile was
+ * confirmed by the adapter probe are offered. I444 is the OBS-facing name for 8-bit 4:4:4;
+ * obs_qsv_video_info_vp9_tex remaps it to AYUV, the QSV FourCC the encoder consumes. */
+static bool vp9_is_color_format_supported(void *type_data, enum video_format format)
+{
+	UNUSED_PARAMETER(type_data);
+	struct vp9_caps caps;
+	vp9_aggregate_caps(&caps);
+	switch (format) {
+	case VIDEO_FORMAT_NV12:
+		return caps.profile0_nv12_8bit;
+	case VIDEO_FORMAT_P010:
+		return caps.profile2_p010_10bit;
+	case VIDEO_FORMAT_I444:
+		return caps.profile1_ayuv_8bit;
+	case VIDEO_FORMAT_Y410:
+		return caps.profile3_y410_10bit;
+	default:
+		return false;
+	}
+}
+
+static bool vp9_soft_is_color_format_supported(void *type_data, enum video_format format)
+{
+	/* The non-texture ("soft") fallback encodes the same formats as the texture path (it just
+	 * receives AYUV/Y410 via system memory instead of a shared texture), so offer the identical,
+	 * capability-gated set. */
+	return vp9_is_color_format_supported(type_data, format);
+}
+
+/* VP9 video info. Remaps the OBS-facing 8-bit 4:4:4 color format (I444) to the QSV FourCC layout
+ * the encoder consumes (AYUV) so libobs delivers the matching texture and the create path sees the
+ * correct voi->format (spec §27). Y410 is already the QSV layout. This mirrors the HEVC tex info:
+ * 4:4:4 is delivered regardless of which GPU OBS renders on, because the non-texture ("soft")
+ * fallback also encodes AYUV/Y410 from system memory (see obs_qsv_create). */
+static void obs_qsv_video_info_vp9_tex(void *data, struct video_scale_info *info)
+{
+#ifdef _WIN32
+	if (info->format == VIDEO_FORMAT_I444 || info->format == VIDEO_FORMAT_Y410) {
+		if (info->format == VIDEO_FORMAT_I444)
+			info->format = VIDEO_FORMAT_AYUV;
+		/* Y410 is already the QSV layout */
 		return;
 	}
 #endif
@@ -1480,6 +1733,58 @@ static void parse_packet_av1(struct obs_qsv *obsqsv, struct encoder_packet *pack
 	pBS->DataLength = 0;
 }
 
+static void parse_packet_vp9(struct obs_qsv *obsqsv, struct encoder_packet *packet, mfxBitstream *pBS,
+			     const struct video_output_info *voi, bool *received_packet)
+{
+	if (pBS == NULL || pBS->DataLength == 0) {
+		*received_packet = false;
+		return;
+	}
+
+	da_resize(obsqsv->packet_data, 0);
+	da_push_back_array(obsqsv->packet_data, &pBS->Data[pBS->DataOffset], pBS->DataLength);
+
+	packet->data = obsqsv->packet_data.array;
+	packet->size = obsqsv->packet_data.num;
+	packet->type = OBS_ENCODER_VIDEO;
+	packet->pts = ts_mfx_to_obs((mfxI64)pBS->TimeStamp, voi);
+	packet->keyframe = (pBS->FrameType & MFX_FRAMETYPE_IDR);
+
+	uint16_t frameType = pBS->FrameType;
+	uint8_t priority = OBS_NAL_PRIORITY_DISPOSABLE;
+
+	if (frameType & MFX_FRAMETYPE_I)
+		priority = OBS_NAL_PRIORITY_HIGHEST;
+	else if ((frameType & MFX_FRAMETYPE_P) || (frameType & MFX_FRAMETYPE_REF))
+		priority = OBS_NAL_PRIORITY_HIGH;
+
+	packet->priority = priority;
+
+	/* VPL's low-power VP9 path does not populate DecodeTimeStamp (it stays 0),
+	 * which would make every packet report DTS=0 and corrupt the decode/presentation
+	 * timeline in qsv_fix_timestamps. With B-frames disabled in our VP9 config,
+	 * decode order == presentation order, so fall back to TimeStamp for DTS when
+	 * DecodeTimeStamp is absent. */
+	mfxI64 dts_ts = pBS->DecodeTimeStamp;
+	if (dts_ts == 0 && pBS->TimeStamp != 0)
+		dts_ts = pBS->TimeStamp;
+	packet->dts = ts_mfx_to_obs(dts_ts, voi);
+
+	static bool vp9_ts_logged = false;
+	if (!vp9_ts_logged) {
+		vp9_ts_logged = true;
+		blog(LOG_DEBUG, "[qsv vp9] first packet raw TS: TimeStamp=%lld DecodeTimeStamp=%lld -> pts=%lld dts=%lld",
+		     (long long)pBS->TimeStamp, (long long)pBS->DecodeTimeStamp, (long long)packet->pts, (long long)packet->dts);
+	}
+
+	qsv_fix_timestamps(obsqsv, packet);
+
+	*received_packet = true;
+	if (pBS->FrameType & MFX_FRAMETYPE_IDR)
+		obsqsv->frames_since_idr = 0;
+	pBS->DataLength = 0;
+}
+
 static void parse_packet_hevc(struct obs_qsv *obsqsv, struct encoder_packet *packet, mfxBitstream *pBS,
 			      const struct video_output_info *voi, bool *received_packet)
 {
@@ -1609,6 +1914,8 @@ static bool obs_qsv_encode(void *data, struct encoder_frame *frame, struct encod
 		parse_packet_av1(obsqsv, packet, pBS, voi, received_packet);
 	else if (obsqsv->codec == QSV_CODEC_HEVC)
 		parse_packet_hevc(obsqsv, packet, pBS, voi, received_packet);
+	else if (obsqsv->codec == QSV_CODEC_VP9)
+		parse_packet_vp9(obsqsv, packet, pBS, voi, received_packet);
 
 	pthread_mutex_unlock(&g_QsvLock);
 
@@ -1670,6 +1977,8 @@ static bool obs_qsv_encode_tex(void *data, struct encoder_texture *tex, int64_t 
 		parse_packet_av1(obsqsv, packet, pBS, voi, received_packet);
 	else if (obsqsv->codec == QSV_CODEC_HEVC)
 		parse_packet_hevc(obsqsv, packet, pBS, voi, received_packet);
+	else if (obsqsv->codec == QSV_CODEC_VP9)
+		parse_packet_vp9(obsqsv, packet, pBS, voi, received_packet);
 
 	pthread_mutex_unlock(&g_QsvLock);
 
@@ -1806,4 +2115,38 @@ struct obs_encoder_info obs_qsv_hevc_encoder = {
 	.get_extra_data = obs_qsv_extra_data,
 	.get_video_info = obs_qsv_video_plus_hdr_info,
 	.caps = OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_INTERNAL | OBS_ENCODER_CAP_ROI,
+};
+
+struct obs_encoder_info obs_qsv_vp9_encoder_tex = {
+	.id = "obs_qsv11_vp9",
+	.type = OBS_ENCODER_VIDEO,
+	.codec = "vp9",
+	.get_name = obs_qsv_getname_vp9,
+	.create = obs_qsv_create_tex_vp9,
+	.destroy = obs_qsv_destroy,
+	.caps = OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_PASS_TEXTURE,
+	.encode_texture2 = obs_qsv_encode_tex,
+	.update = obs_qsv_update,
+	.get_properties = obs_qsv_props_vp9,
+	.get_defaults = obs_qsv_defaults_vp9,
+	.get_extra_data = obs_qsv_extra_data,
+	.get_video_info = obs_qsv_video_info_vp9_tex,
+	.is_color_format_supported = vp9_is_color_format_supported,
+};
+
+struct obs_encoder_info obs_qsv_vp9_encoder = {
+	.id = "obs_qsv11_vp9_soft",
+	.type = OBS_ENCODER_VIDEO,
+	.codec = "vp9",
+	.get_name = obs_qsv_getname_vp9,
+	.create = obs_qsv_create_vp9,
+	.destroy = obs_qsv_destroy,
+	.encode = obs_qsv_encode,
+	.update = obs_qsv_update,
+	.get_properties = obs_qsv_props_vp9,
+	.get_defaults = obs_qsv_defaults_vp9,
+	.get_extra_data = obs_qsv_extra_data,
+	.get_video_info = obs_qsv_video_plus_hdr_info,
+	.is_color_format_supported = vp9_soft_is_color_format_supported,
+	.caps = OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_INTERNAL,
 };

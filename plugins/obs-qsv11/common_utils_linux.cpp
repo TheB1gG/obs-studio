@@ -26,6 +26,7 @@
 static const char *default_h264_device = nullptr;
 static const char *default_hevc_device = nullptr;
 static const char *default_av1_device = nullptr;
+static const char *default_vp9_device = nullptr;
 
 struct linux_data {
 	int fd;
@@ -301,6 +302,8 @@ mfxStatus Initialize(mfxVersion ver, mfxSession *pSession, mfxFrameAllocator *pm
 			device_path = default_hevc_device;
 		else if (codec == QSV_CODEC_AV1 && default_av1_device)
 			device_path = default_av1_device;
+		else if (codec == QSV_CODEC_VP9 && default_vp9_device)
+			device_path = default_vp9_device;
 	}
 	fd = open(device_path, O_RDWR);
 	if (fd < 0) {
@@ -475,6 +478,17 @@ static bool vaapi_supports_hevc(VADisplay display)
 	return ret;
 }
 
+static bool vaapi_supports_vp9(VADisplay display)
+{
+	// Intel's VP9 hardware path is tied to the Low Power entrypoint. Probe both
+	// the 8-bit (profile 0) and 10-bit (profile 2) low-power entrypoints.
+	bool ret = false;
+	ret |= vaapi_check_support(display, VAProfileVP9Profile0, VAEntrypointEncSliceLP);
+	ret |= vaapi_check_support(display, VAProfileVP9Profile0, VAEntrypointEncSlice);
+	ret |= vaapi_check_support(display, VAProfileVP9Profile2, VAEntrypointEncSliceLP);
+	return ret;
+}
+
 bool check_adapter(void *param, const char *node, uint32_t idx)
 {
 	struct vaapi_device device = {0};
@@ -490,6 +504,18 @@ bool check_adapter(void *param, const char *node, uint32_t idx)
 	adapter->is_dgpu = false;
 	adapter->supports_av1 = vaapi_supports_av1(device.display);
 	adapter->supports_hevc = vaapi_supports_hevc(device.display);
+	adapter->supports_vp9 = vaapi_supports_vp9(device.display);
+
+	// Conservative VP9 capability fallback for VA-API (spec §8). The per-profile
+	// MFXVideoENCODE_Query probing is a Windows/oneVPL path; on Linux we expose the
+	// 4:2:0 profiles OBS can feed (NV12 -> P0, P010 -> P2), gated on the existing
+	// VA-API VP9 detection. 4:4:4 (P1/P3) is left disabled until a VA-API probe is
+	// added, so it will simply not appear in the UI.
+	adapter->vp9.profile0_nv12_8bit = adapter->supports_vp9;
+	adapter->vp9.profile2_p010_10bit = adapter->supports_vp9;
+	adapter->vp9.profile1_ayuv_8bit = false;
+	adapter->vp9.profile3_y410_10bit = false;
+	adapter->vp9.encoder_supported = adapter->supports_vp9;
 
 	if (adapter->is_intel && default_h264_device == nullptr)
 		default_h264_device = strdup(node);
@@ -499,6 +525,9 @@ bool check_adapter(void *param, const char *node, uint32_t idx)
 
 	if (adapter->is_intel && adapter->supports_hevc && default_hevc_device == nullptr)
 		default_hevc_device = strdup(node);
+
+	if (adapter->is_intel && adapter->supports_vp9 && default_vp9_device == nullptr)
+		default_vp9_device = strdup(node);
 
 	vaapi_close(&device);
 	return true;
