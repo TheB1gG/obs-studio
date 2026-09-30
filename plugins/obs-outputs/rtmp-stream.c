@@ -951,6 +951,18 @@ static bool send_video_header(struct rtmp_stream *stream, size_t idx)
 	case CODEC_AV1:
 		packet.size = obs_parse_av1_header(&packet.data, header, size);
 		return send_packet_ex(stream, &packet, true, false, idx) >= 0;
+	case CODEC_VP9: {
+		// QSV VP9 delivers raw, self-contained frames and no IVF/decoder
+		// extradata, so synthesize the 'vpcC' decoder-configuration record that
+		// FFmpeg writes into the enhanced-FLV sequence-start tag.
+		video_t *video = obs_encoder_video(vencoder);
+		const struct video_output_info *info = video ? video_output_get_info(video) : NULL;
+		uint8_t vpcc[12];
+		size_t n = flv_build_vp9_seq_header(vpcc, info);
+		packet.data = bmemdup(vpcc, n);
+		packet.size = n;
+		return send_packet_ex(stream, &packet, true, false, idx) >= 0;
+	}
 	}
 
 	return false;
@@ -1000,6 +1012,15 @@ static bool send_video_header_ts(struct rtmp_stream *stream, size_t idx, struct 
 	case CODEC_AV1:
 		packet.size = obs_parse_av1_header(&packet.data, header, size);
 		break;
+	case CODEC_VP9: {
+		video_t *video = obs_encoder_video(vencoder);
+		const struct video_output_info *info = video ? video_output_get_info(video) : NULL;
+		uint8_t vpcc[12];
+		size_t n = flv_build_vp9_seq_header(vpcc, info);
+		packet.data = bmemdup(vpcc, n);
+		packet.size = n;
+		break;
+	}
 	}
 
 	return send_packet_start_ts(stream, &packet, idx) >= 0;
@@ -1870,6 +1891,10 @@ static void rtmp_stream_data(void *data, struct encoder_packet *packet)
 		case CODEC_AV1:
 			obs_parse_av1_packet(&new_packet, packet);
 			break;
+		case CODEC_VP9:
+			// Raw self-contained VP9 frame - share the buffer with a ref.
+			obs_encoder_packet_ref(&new_packet, packet);
+			break;
 		}
 	} else {
 		if (!stream->got_first_packet) {
@@ -1983,9 +2008,9 @@ struct obs_output_info rtmp_output_info = {
 	.protocols = "RTMP;RTMPS",
 #endif
 #ifdef ENABLE_HEVC
-	.encoded_video_codecs = "h264;hevc;av1",
+	.encoded_video_codecs = "h264;hevc;av1;vp9",
 #else
-	.encoded_video_codecs = "h264;av1",
+	.encoded_video_codecs = "h264;av1;vp9",
 #endif
 	.encoded_audio_codecs = "aac;opus;flac",
 	.get_name = rtmp_stream_getname,

@@ -332,6 +332,18 @@ static bool write_video_header(struct flv_output *stream, size_t idx)
 	case CODEC_AV1:
 		packet.size = obs_parse_av1_header(&packet.data, header, size);
 		break;
+	case CODEC_VP9: {
+		// QSV VP9 delivers raw, self-contained frames and no IVF/decoder
+		// extradata, so synthesize the 'vpcC' decoder-configuration record that
+		// FFmpeg writes into the enhanced-FLV sequence-start tag.
+		video_t *video = obs_encoder_video(vencoder);
+		const struct video_output_info *info = video ? video_output_get_info(video) : NULL;
+		uint8_t vpcc[12];
+		size_t n = flv_build_vp9_seq_header(vpcc, info);
+		packet.data = bmemdup(vpcc, n);
+		packet.size = n;
+		break;
+	}
 	}
 	write_packet_ex(stream, &packet, true, false, idx);
 
@@ -382,6 +394,15 @@ static bool write_video_header_ts(struct flv_output *stream, size_t idx, struct 
 	case CODEC_AV1:
 		packet.size = obs_parse_av1_header(&packet.data, header, size);
 		break;
+	case CODEC_VP9: {
+		video_t *video = obs_encoder_video(vencoder);
+		const struct video_output_info *info = video ? video_output_get_info(video) : NULL;
+		uint8_t vpcc[12];
+		size_t n = flv_build_vp9_seq_header(vpcc, info);
+		packet.data = bmemdup(vpcc, n);
+		packet.size = n;
+		break;
+	}
 	}
 
 	write_packet_start_ts(stream, &packet, idx);
@@ -706,6 +727,11 @@ static void flv_output_data(void *data, struct encoder_packet *packet)
 		case CODEC_AV1:
 			obs_parse_av1_packet(&parsed_packet, packet);
 			break;
+		case CODEC_VP9:
+			// Raw self-contained VP9 frame - share the buffer with a ref
+			// (no transform needed), matching how the audio path handles it.
+			obs_encoder_packet_ref(&parsed_packet, packet);
+			break;
 		}
 
 		if (stream->video_codec[packet->track_idx] != CODEC_H264 ||
@@ -746,9 +772,9 @@ struct obs_output_info flv_output_info = {
 	.id = "flv_output",
 	.flags = OBS_OUTPUT_AV | OBS_OUTPUT_ENCODED | OBS_OUTPUT_MULTI_TRACK_AV,
 #ifdef ENABLE_HEVC
-	.encoded_video_codecs = "h264;hevc;av1",
+	.encoded_video_codecs = "h264;hevc;av1;vp9",
 #else
-	.encoded_video_codecs = "h264;av1",
+	.encoded_video_codecs = "h264;av1;vp9",
 #endif
 	.encoded_audio_codecs = "aac;opus;flac",
 	.get_name = flv_output_getname,

@@ -33,6 +33,7 @@ enum video_id_t {
 	CODEC_H264 = 1, // legacy & Y2023 spec
 	CODEC_AV1,      // Y2023 spec
 	CODEC_HEVC,
+	CODEC_VP9,      // Y2023 spec (self-describing frames; no decoder-config payload)
 };
 
 static enum audio_id_t to_audio_type(const char *codec)
@@ -56,6 +57,8 @@ static enum video_id_t to_video_type(const char *codec)
 	if (strcmp(codec, "hevc") == 0)
 		return CODEC_HEVC;
 #endif
+	if (strcmp(codec, "vp9") == 0)
+		return CODEC_VP9;
 	return 0;
 }
 
@@ -81,6 +84,14 @@ extern void flv_packet_end(struct encoder_packet *packet, enum video_id_t codec,
 extern void flv_packet_metadata(enum video_id_t codec, uint8_t **output, size_t *size, int bits_per_raw_sample,
 				uint8_t color_primaries, int color_trc, int color_space, int min_luminance,
 				int max_luminance, size_t idx);
+// Builds the VP9 'vpcC' decoder-configuration record (12 bytes) carried in an enhanced-FLV /
+// eRTMP video sequence-start tag. The 'vp09' FourCC is prepended by flv_packet_ex, so this
+// returns only the configuration payload. The layout mirrors FFmpeg's ff_isom_write_vpcc:
+//   version(1)=1 | flags(3)=0 | profile(1) | level(1) |
+//   (bit_depth<<4 | chroma_subsample<<1 | full_range)(1) | color_primaries(1) |
+//   color_trc(1) | color_space(1) | num_sub_streams(2)=0.
+// Returns the number of bytes written (12), or 0 if dst/info is NULL.
+extern size_t flv_build_vp9_seq_header(uint8_t *dst, const struct video_output_info *info);
 extern void flv_packet_audio_start(struct encoder_packet *packet, enum audio_id_t codec, uint8_t **output, size_t *size,
 				   size_t idx);
 extern void flv_packet_audio_frames(struct encoder_packet *packet, enum audio_id_t codec, int32_t dts_offset,

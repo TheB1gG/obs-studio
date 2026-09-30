@@ -131,6 +131,12 @@ static void s_w4cc(struct serializer *s, enum video_id_t id)
 		s_w8(s, 'c');
 		s_w8(s, '1');
 		break;
+	case CODEC_VP9:
+		s_w8(s, 'v');
+		s_w8(s, 'p');
+		s_w8(s, '0');
+		s_w8(s, '9');
+		break;
 	}
 }
 
@@ -681,4 +687,142 @@ void flv_packet_metadata(enum video_id_t codec_id, uint8_t **output, size_t *siz
 
 	*output = data.bytes.array;
 	*size = data.bytes.num;
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* VP9 enhanced-FLV / eRTMP sequence header (vpcC decoder configuration)     */
+/*                                                                           */
+/* QSV VP9 emits raw, self-contained frames and provides no IVF/decoder      */
+/* extradata, so the muxer must synthesize the 'vpcC' record that FFmpeg     */
+/* writes into the enhanced-FLV sequence-start tag (ff_isom_write_vpcc).     */
+/* Without it, eRTMP servers reject the stream.                              */
+
+// Approximate VP9 level from luma sample rate and picture size - mirrors
+// FFmpeg's get_vp9_level() in libavformat/vpcc.c.
+static int vp9_level_from(int width, int height, uint32_t fps_num, uint32_t fps_den)
+{
+	int picture_size = width * height;
+	int64_t sample_rate;
+
+	if (!fps_den)
+		sample_rate = 0;
+	else
+		sample_rate = ((int64_t)picture_size * (int64_t)fps_num) / fps_den;
+
+	if (picture_size <= 0)
+		return 0;
+	else if (sample_rate <= 829440 && picture_size <= 36864)
+		return 10;
+	else if (sample_rate <= 2764800 && picture_size <= 73728)
+		return 11;
+	else if (sample_rate <= 4608000 && picture_size <= 122880)
+		return 20;
+	else if (sample_rate <= 9216000 && picture_size <= 245760)
+		return 21;
+	else if (sample_rate <= 20736000 && picture_size <= 552960)
+		return 30;
+	else if (sample_rate <= 36864000 && picture_size <= 983040)
+		return 31;
+	else if (sample_rate <= 83558400 && picture_size <= 2228224)
+		return 40;
+	else if (sample_rate <= 160432128 && picture_size <= 2228224)
+		return 41;
+	else if (sample_rate <= 311951360 && picture_size <= 8912896)
+		return 50;
+	else if (sample_rate <= 588251136 && picture_size <= 8912896)
+		return 51;
+	else if (sample_rate <= 1176502272 && picture_size <= 8912896)
+		return 52;
+	else if (sample_rate <= 1176502272 && picture_size <= 35651584)
+		return 60;
+	else if (sample_rate <= 2353004544 && picture_size <= 35651584)
+		return 61;
+	else if (sample_rate <= 4706009088 && picture_size <= 35651584)
+		return 62;
+	else
+		return 0;
+}
+
+// Map an OBS colorspace to ISO/IEC 23091-2 primaries / transfer / matrix values,
+// matching the onMetaData colorInfo mapping used elsewhere in this plugin.
+static void vp9_color_info(enum video_colorspace cs, uint8_t *pri, uint8_t *trc, uint8_t *spc)
+{
+	switch (cs) {
+	case VIDEO_CS_601:
+		*pri = 6; // SMPTE 170M
+		*trc = 6;
+		*spc = 6;
+		break;
+	case VIDEO_CS_SRGB:
+		*pri = 1;  // BT.709 primaries
+		*trc = 13; // IEC 61966-2-1 (sRGB)
+		*spc = 1;
+		break;
+	case VIDEO_CS_2100_PQ:
+		*pri = 9;  // BT.2020
+		*trc = 16; // SMPTE ST 2084 (PQ)
+		*spc = 9;
+		break;
+	case VIDEO_CS_2100_HLG:
+		*pri = 9;  // BT.2020
+		*trc = 18; // ARIB STD-B67 (HLG)
+		*spc = 9;
+		break;
+	case VIDEO_CS_DEFAULT:
+	case VIDEO_CS_709:
+	default:
+		*pri = 1; // BT.709
+		*trc = 1;
+		*spc = 1;
+		break;
+	}
+}
+
+size_t flv_build_vp9_seq_header(uint8_t *dst, const struct video_output_info *info)
+{
+	if (!dst || !info)
+		return 0;
+
+	int bit_depth = 8;
+	switch (info->format) {
+	case VIDEO_FORMAT_I010:
+	case VIDEO_FORMAT_P010:
+	case VIDEO_FORMAT_I210:
+		bit_depth = 10;
+		break;
+	case VIDEO_FORMAT_I412:
+	case VIDEO_FORMAT_YA2L:
+		bit_depth = 12;
+		break;
+	default:
+		bit_depth = 8;
+		break;
+	}
+
+	// QSV VP9 streams are always 4:2:0. Profile follows the bit depth, mirroring
+	// FFmpeg's derivation for unknown profiles with 4:2:0 subsampling.
+	int profile = (bit_depth == 8) ? 0 : 2;
+	int level = vp9_level_from((int)info->width, (int)info->height, info->fps_num, info->fps_den);
+
+	uint8_t pri = 0, trc = 0, spc = 0;
+	vp9_color_info(info->colorspace, &pri, &trc, &spc);
+
+	int full_range = (info->range == VIDEO_RANGE_FULL) ? 1 : 0;
+	int chroma_subsample = 0; // VPX_SUBSAMPLING_420_VERTICAL
+
+	dst[0] = 1; // version
+	dst[1] = 0; // flags (3 bytes, big-endian)
+	dst[2] = 0;
+	dst[3] = 0;
+	dst[4] = (uint8_t)profile;
+	dst[5] = (uint8_t)level;
+	dst[6] = (uint8_t)((bit_depth << 4) | (chroma_subsample << 1) | full_range);
+	dst[7] = pri;
+	dst[8] = trc;
+	dst[9] = spc;
+	dst[10] = 0; // num_sub_streams (2 bytes, big-endian) - VP9 has none
+	dst[11] = 0;
+
+	return 12;
 }

@@ -781,6 +781,34 @@ static size_t mp4_write_prores(struct mp4_mux *mux, obs_encoder_t *enc)
 	return write_box_size(s, start);
 }
 
+/// VP9 ISOBMFF (ISO/IEC 14496-15) VP9 Sample Entry.
+/// Unlike avcC/hvcC/av1C, VP9 in MP4 carries no mandatory decoder-config box:
+/// each frame is self-describing via its frame header, so a bare VisualSampleEntry
+/// with the 'vp09' tag is sufficient for players.
+static size_t mp4_write_vp09(struct mp4_mux *mux, obs_encoder_t *enc)
+{
+	struct serializer *s = mux->serializer;
+	int64_t start = serializer_get_pos(s);
+
+	write_box(s, 0, "vp09");
+
+	mp4_write_visual_sample_entry(mux, enc);
+
+	// colr
+	mp4_write_colr(mux, enc);
+
+	// clli
+	mp4_write_clli(mux, enc);
+
+	// mdcv
+	mp4_write_mdcv(mux, enc);
+
+	// pasp
+	mp4_write_pasp(mux);
+
+	return write_box_size(s, start);
+}
+
 static inline void put_descr(struct serializer *s, uint8_t tag, size_t size)
 {
 	int i = 3;
@@ -1299,6 +1327,8 @@ static size_t mp4_write_stsd(struct mp4_mux *mux, struct mp4_track *track)
 			mp4_write_av01(mux, track->encoder);
 		else if (track->codec == CODEC_PRORES)
 			mp4_write_prores(mux, track->encoder);
+		else if (track->codec == CODEC_VP9)
+			mp4_write_vp09(mux, track->encoder);
 	} else if (track->type == TRACK_AUDIO) {
 		if (mux->flavor == FLAVOR_MOV) {
 			mp4_write_mov_audio_tag(mux, track);
@@ -2753,6 +2783,8 @@ static inline enum mp4_codec get_codec(obs_encoder_t *enc)
 		return CODEC_AV1;
 	if (strcmp(codec, "prores") == 0)
 		return CODEC_PRORES;
+	if (strcmp(codec, "vp9") == 0)
+		return CODEC_VP9;
 	if (strcmp(codec, "aac") == 0)
 		return CODEC_AAC;
 	if (strcmp(codec, "opus") == 0)
@@ -2930,6 +2962,12 @@ bool mp4_mux_submit_packet(struct mp4_mux *mux, struct encoder_packet *pkt)
 		else if (track->codec == CODEC_AV1)
 			obs_parse_av1_packet(&parsed_packet, pkt);
 		else if (track->codec == CODEC_PRORES)
+			obs_encoder_packet_ref(&parsed_packet, pkt);
+		else
+			/* VP9 and any other raw-frame codec: no NAL re-serialization is needed
+			 * (frames are self-describing) and the encoder already sets keyframe.
+			 * Copy as-is so parsed_packet is never left uninitialised -- an
+			 * uninitialised packet here caused an integer divide-by-zero crash. */
 			obs_encoder_packet_ref(&parsed_packet, pkt);
 
 		/* Set fragmentation PTS if packet is keyframe and PTS > 0 */
