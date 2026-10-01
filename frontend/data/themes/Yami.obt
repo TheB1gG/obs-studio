@@ -1872,36 +1872,6 @@ OBSBasic {
     qproperty-audioProcessOutputIcon: url(theme:Dark/sources/windowaudio.svg);
 }
 
-/* Scene Tree Grid Mode */
-
-SceneTree {
-    qproperty-gridItemWidth: 154;
-    qproperty-gridItemHeight: var(--input_height_base);
-}
-
-.list-grid SceneTree::item {
-    color: var(--text);
-    background-color: var(--button_bg);
-    border-radius: var(--border_radius);
-    margin: var(--spacing_base);
-}
-
-.list-grid SceneTree::item:selected {
-    background-color: var(--list_item_bg_selected);
-}
-
-.list-grid SceneTree::item:checked {
-    background-color: var(--primary);
-}
-
-.list-grid SceneTree::item:hover {
-    background-color: var(--list_item_bg_hover);
-}
-
-.list-grid SceneTree::item:selected:hover {
-    background-color: var(--list_item_bg_hover);
-}
-
 /* Studio Mode T-Bar */
 
 .slider-tbar {

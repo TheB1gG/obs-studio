@@ -543,6 +543,7 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	connect(ui->enablePreviewButton, &QPushButton::clicked, this, &OBSBasic::TogglePreview);
 
 	connect(ui->scenes, &SceneTree::scenesReordered, []() { OBSProjector::UpdateMultiviewProjectors(); });
+	connect(ui->scenes, &SceneTree::sceneDoubleClicked, this, &OBSBasic::OnSceneDoubleClicked);
 	connect(ui->scenes, &SceneTree::sceneSelectionChanged, this, [this]() {
 		obs_scene_t *selScene = ui->scenes->GetCurrentScene();
 		if (selScene) {

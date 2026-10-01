@@ -83,6 +83,7 @@ public:
 
 signals:
 	void branchClicked(const QModelIndex &index);
+	void doubleClicked(const QModelIndex &index);
 
 protected:
 	void startDrag(Qt::DropActions supportedActions) override;
@@ -90,6 +91,7 @@ protected:
 	void dragMoveEvent(QDragMoveEvent *event) override;
 	void dropEvent(QDropEvent *event) override;
 	void mousePressEvent(QMouseEvent *event) override;
+	void mouseDoubleClickEvent(QMouseEvent *event) override;
 };
 
 // Item delegate that paints a coloured rounded-rectangle background behind
@@ -212,6 +214,7 @@ public:
 signals:
 	void customContextMenuRequested(const QPoint &pos);
 	void sceneSelectionChanged();
+	void sceneDoubleClicked();
 	void scenesReordered();
 	void layoutChanged();
 	void addSceneRequested();

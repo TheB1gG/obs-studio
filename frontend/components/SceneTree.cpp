@@ -292,6 +292,17 @@ void SceneTreeView::mousePressEvent(QMouseEvent *event)
 	QTreeView::mousePressEvent(event);
 }
 
+void SceneTreeView::mouseDoubleClickEvent(QMouseEvent *event)
+{
+	QTreeView::mouseDoubleClickEvent(event);
+
+	if (event->button() == Qt::LeftButton) {
+		QModelIndex index = indexAt(event->pos());
+		if (index.isValid())
+			emit doubleClicked(index);
+	}
+}
+
 // ============================================================================
 // CustomColorDelegate — paints coloured row backgrounds for items with a
 // colour set in SceneColorRole. Rows without a colour use the default style.
@@ -545,6 +556,17 @@ SceneTree::SceneTree(QWidget *parent_) : QWidget(parent_)
 				obs_scene_t *scene = static_cast<obs_scene_t *>(item->data(SceneObsRefRole).value<void *>());
 				MarkSceneActive(scene);
 			}
+		}
+	});
+
+	// Double-click on a scene item (e.g. "transition on double-click" setting)
+	connect(treeView, &SceneTreeView::doubleClicked, this, [this](const QModelIndex &index) {
+		QModelIndex sourceIndex = proxyModel->mapToSource(index);
+		if (!sourceIndex.isValid())
+			return;
+		if (QStandardItem *item = model->itemFromIndex(sourceIndex)) {
+			if (IsSceneItem(item))
+				emit sceneDoubleClicked();
 		}
 	});
 

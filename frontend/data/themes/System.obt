@@ -248,13 +248,6 @@ OBSBasic {
     qproperty-audioProcessOutputIcon: url(:res/images/sources/windowaudio.svg);
 }
 
-/* Scene Tree */
-
-SceneTree {
-    qproperty-gridItemWidth: 150;
-    qproperty-gridItemHeight: 24;
-}
-
 /* Save icon */
 
 .icon-save {

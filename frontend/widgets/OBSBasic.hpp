@@ -1277,7 +1277,6 @@ private slots:
 
 	void on_actionSceneFilters_triggered();
 
-	void on_scenes_currentItemChanged(QListWidgetItem *current, QListWidgetItem *prev);
 	void on_scenes_customContextMenuRequested(const QPoint &pos);
 
 	void GridActionClicked();
@@ -1288,7 +1287,7 @@ private slots:
 	void on_actionRemoveScene_triggered();
 	void on_actionSceneUp_triggered();
 	void on_actionSceneDown_triggered();
-	void on_scenes_itemDoubleClicked(QListWidgetItem *item);
+	void OnSceneDoubleClicked();
 
 	void MoveSceneToTop();
 	void MoveSceneToBottom();

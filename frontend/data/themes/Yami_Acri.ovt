@@ -190,22 +190,6 @@ OBSQTDisplay {
     qproperty-displayBackgroundColor: var(--grey5);
 }
 
-.list-grid SceneTree::item:selected {
-    background-color: var(--button_bg_red);
-}
-
-.list-grid SceneTree::item:checked {
-    background-color: var(--button_bg_red);
-}
-
-.list-grid SceneTree::item:hover {
-    background-color: var(--button_bg_red_down);
-}
-
-.list-grid SceneTree::item:selected:hover {
-    background-color: var(--button_bg_red_hover);
-}
-
 #ytEventList QLabel {
     background-color: var(--grey5);
 }

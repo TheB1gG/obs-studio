@@ -462,11 +462,6 @@ void OBSBasic::SceneItemAdded(void *data, calldata_t *params)
 	QMetaObject::invokeMethod(window, "AddSceneItem", Q_ARG(OBSSceneItem, OBSSceneItem(item)));
 }
 
-void OBSBasic::on_scenes_currentItemChanged(QListWidgetItem *, QListWidgetItem *)
-{
-	// Handled by SceneTree::sceneSelectionChanged signal connection in constructor
-}
-
 void OBSBasic::EditSceneName()
 {
 	ui->scenesDock->removeAction(renameScene);
@@ -847,11 +842,8 @@ void OBSBasic::EditSceneItemName()
 	ui->sources->Edit(idx);
 }
 
-void OBSBasic::on_scenes_itemDoubleClicked(QListWidgetItem *witem)
+void OBSBasic::OnSceneDoubleClicked()
 {
-	if (!witem)
-		return;
-
 	if (IsPreviewProgramMode()) {
 		bool doubleClickSwitch =
 			config_get_bool(App()->GetUserConfig(), "BasicWindow", "TransitionOnDoubleClick");
