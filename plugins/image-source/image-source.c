@@ -28,6 +28,28 @@ struct image_source {
 	volatile bool texture_loaded;
 
 	gs_image_file4_t if4;
+
+	/* --- asynchronous image loading ------------------------------------ */
+	/* The expensive part of showing an image is decoding the file (I/O +  */
+	/* pixel decode). That used to run on the main thread and could stall   */
+	/* the UI / video thread. It now runs on a per-source worker thread     */
+	/* which publishes the decoded + textured image in the "pending" slot   */
+	/* below; the video thread swaps it into `if4` on the next tick so the  */
+	/* previously shown image keeps rendering while the new one loads.      */
+	pthread_mutex_t req_mutex; /* guards thread creation + request handoff */
+	bool thread_created;
+	pthread_t load_thread;
+	os_event_t *load_request; /* AUTO event: work available / quit         */
+	bool load_quit;
+	volatile long load_id; /* bumped per request; worker drops stale loads */
+
+	char *load_file; /* dup'd path handed to the worker (ownership handoff) */
+	bool load_linear_alpha;
+
+	volatile bool has_new_data; /* set by worker, consumed by tick / unload */
+	gs_image_file4_t new_if4; /* decoded + textured image from the worker   */
+	bool new_load_succeeded;
+	time_t new_file_timestamp;
 };
 
 static time_t get_modified_timestamp(const char *filename)
@@ -74,25 +96,149 @@ static void image_source_load_texture(void *data)
 	os_atomic_set_bool(&context->texture_loaded, true);
 }
 
+static void *image_source_load_thread(void *data)
+{
+	struct image_source *context = data;
+
+	while (true) {
+		os_event_wait(context->load_request);
+
+		pthread_mutex_lock(&context->req_mutex);
+		if (context->load_quit) {
+			pthread_mutex_unlock(&context->req_mutex);
+			break;
+		}
+
+		char *file = context->load_file; /* take ownership of the path */
+		bool linear_alpha = context->load_linear_alpha;
+		long id = os_atomic_load_long(&context->load_id);
+		context->load_file = NULL;
+		pthread_mutex_unlock(&context->req_mutex);
+
+		if (!file || !*file) {
+			bfree(file);
+			continue;
+		}
+
+		debug("loading texture '%s' in the background", file);
+
+		gs_image_file4_t if4;
+		memset(&if4, 0, sizeof(if4));
+		gs_image_file4_init(&if4, file, linear_alpha ? GS_IMAGE_ALPHA_PREMULTIPLY_SRGB
+		                                              : GS_IMAGE_ALPHA_PREMULTIPLY);
+
+		const bool loaded = if4.image3.image2.image.loaded;
+		const time_t timestamp = get_modified_timestamp(file);
+
+		obs_enter_graphics();
+		if (os_atomic_load_long(&context->load_id) != id) {
+			/* a newer load was requested in the meantime, discard this one */
+			debug("discarding outdated load of '%s'", file);
+			gs_image_file4_free(&if4);
+			bfree(file);
+			obs_leave_graphics();
+			continue;
+		}
+
+		if (context->has_new_data) {
+			/* discard a previous result that has not been swapped in yet */
+			gs_image_file4_free(&context->new_if4);
+			os_atomic_set_bool(&context->has_new_data, false);
+		}
+
+		gs_image_file4_init_texture(&if4);
+
+		context->new_if4 = if4;
+		context->new_load_succeeded = loaded;
+		context->new_file_timestamp = timestamp;
+		os_atomic_set_bool(&context->has_new_data, true);
+		obs_leave_graphics();
+
+		if (loaded)
+			debug("finished loading texture '%s'", file);
+		else
+			warn("failed to load texture '%s'", file);
+
+		bfree(file);
+	}
+
+	return NULL;
+}
+
+static void image_source_ensure_thread(struct image_source *context)
+{
+	/* called with context->req_mutex held */
+	if (context->thread_created)
+		return;
+
+	if (os_event_init(&context->load_request, OS_EVENT_TYPE_AUTO) != 0) {
+		warn("failed to create load event");
+		return;
+	}
+
+	context->load_quit = false;
+	if (pthread_create(&context->load_thread, NULL, image_source_load_thread, context) != 0) {
+		warn("failed to create load thread");
+		os_event_destroy(context->load_request);
+		context->load_request = NULL;
+		return;
+	}
+
+	context->thread_created = true;
+}
+
+/* Swaps a background-loaded image into the active one. Must be called with  */
+/* the graphics context entered.                                             */
+static void image_source_swap_new_data(struct image_source *context)
+{
+	if (!os_atomic_load_bool(&context->has_new_data))
+		return;
+
+	gs_image_file4_free(&context->if4);
+	context->if4 = context->new_if4;
+	os_atomic_set_bool(&context->has_new_data, false);
+	os_atomic_set_bool(&context->file_decoded, true);
+	os_atomic_set_bool(&context->texture_loaded, true);
+
+	if (context->new_load_succeeded)
+		context->file_timestamp = context->new_file_timestamp;
+}
+
 static void image_source_unload(void *data)
 {
 	struct image_source *context = data;
 	os_atomic_set_bool(&context->file_decoded, false);
 	os_atomic_set_bool(&context->texture_loaded, false);
+	os_atomic_inc_long(&context->load_id); /* invalidate any in-flight background load */
 
 	obs_enter_graphics();
 	gs_image_file4_free(&context->if4);
+	if (os_atomic_load_bool(&context->has_new_data)) {
+		gs_image_file4_free(&context->new_if4);
+		os_atomic_set_bool(&context->has_new_data, false);
+	}
 	obs_leave_graphics();
 }
 
 static void image_source_load(struct image_source *context)
 {
-	image_source_unload(context);
-
-	if (context->file && *context->file) {
-		image_source_preload_image(context);
-		image_source_load_texture(context);
+	if (!context->file || !*context->file) {
+		os_atomic_inc_long(&context->load_id);
+		image_source_unload(context);
+		return;
 	}
+
+	pthread_mutex_lock(&context->req_mutex);
+	bfree(context->load_file);
+	context->load_file = bstrdup(context->file);
+	context->load_linear_alpha = context->linear_alpha;
+	os_atomic_inc_long(&context->load_id);
+	image_source_ensure_thread(context);
+	const bool ready = context->load_request != NULL;
+	pthread_mutex_unlock(&context->req_mutex);
+
+	if (ready)
+		os_event_signal(context->load_request);
 }
 
 static void image_source_update(void *data, obs_data_t *settings)
@@ -170,6 +316,8 @@ static void *image_source_create(obs_data_t *settings, obs_source_t *source)
 	struct image_source *context = bzalloc(sizeof(struct image_source));
 	context->source = source;
 
+	pthread_mutex_init(&context->req_mutex, NULL);
+
 	image_source_update(context, settings);
 	return context;
 }
@@ -178,10 +326,27 @@ static void image_source_destroy(void *data)
 {
 	struct image_source *context = data;
 
+	/* stop the background load thread before freeing anything it touches */
+	pthread_mutex_lock(&context->req_mutex);
+	if (context->thread_created) {
+		context->load_quit = true;
+		os_event_signal(context->load_request);
+		pthread_mutex_unlock(&context->req_mutex);
+
+		pthread_join(context->load_thread, NULL);
+		os_event_destroy(context->load_request);
+	} else {
+		pthread_mutex_unlock(&context->req_mutex);
+	}
+
 	image_source_unload(context);
 
+	if (context->load_file)
+		bfree(context->load_file);
 	if (context->file)
 		bfree(context->file);
+
+	pthread_mutex_destroy(&context->req_mutex);
 	bfree(context);
 }
 
@@ -227,6 +392,14 @@ static void image_source_render(void *data, gs_effect_t *effect)
 static void image_source_tick(void *data, float seconds)
 {
 	struct image_source *context = data;
+
+	/* swap in an image that was loaded in the background */
+	if (os_atomic_load_bool(&context->has_new_data)) {
+		obs_enter_graphics();
+		image_source_swap_new_data(context);
+		obs_leave_graphics();
+	}
+
 	if (!os_atomic_load_bool(&context->texture_loaded)) {
 		if (os_atomic_load_bool(&context->file_decoded))
 			image_source_load_texture(context);
