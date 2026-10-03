@@ -144,8 +144,11 @@ static bool apply_nvenc_reconfigure(struct nvenc_data *enc)
 	NVENCSTATUS err = nv.nvEncReconfigureEncoder(enc->session, &params);
 	nvenc_trace_reconfigure(enc, __FUNCTION__, &params, err);
 	if (NV_FAILED(err)) {
+		error("reconfigure failed (reset=1 forceIDR=1): encoder keeps previous settings");
 		return false; // encoder keeps its previous mode/state
 	}
+
+	const uint32_t discarded = enc->buffers_queued;
 
 	/* resetEncoder flushes every in-flight frame inside NVENC. Rewind   */
 	/* our submission accounting so get_encoded_packet() never locks (and */
@@ -162,6 +165,9 @@ static bool apply_nvenc_reconfigure(struct nvenc_data *enc)
 	/* Players only reliably latch a fresh resolution from a dedicated   */
 	/* sequence-start packet, not from in-band NALs alone.               */
 	enc->first_packet = true;
+
+	info("reconfigure applied (reset=1 forceIDR=1): %u in-flight frame(s) discarded by reset",
+	     discarded);
 
 	return true;
 }
@@ -195,6 +201,7 @@ static void abr_gov_apply(struct nvenc_data *enc, uint32_t new_max_bps)
 		return;
 	}
 
+	debug("ABR governor: maxBitRate %u -> %u kbps", old / 1000, new_max_bps / 1000);
 	enc->abr_max_rate = new_max_bps;
 }
 
@@ -315,11 +322,8 @@ static bool apply_nvenc_resize(struct nvenc_data *enc, uint32_t w, uint32_t h)
 		cuda_free_surfaces(enc);
 	}
 
-	const int flushed = enc->buffers_queued;
-
 	if (!apply_nvenc_reconfigure(enc)) // reset=1 + forceIDR, carries updated params (+ queue rewind)
 		return false;
-
 #ifdef _WIN32
 	if (!enc->non_texture) {
 		enc->textures.num = 0;         // reuse reserved storage, re-init refills entries
@@ -337,7 +341,7 @@ static bool apply_nvenc_resize(struct nvenc_data *enc, uint32_t w, uint32_t h)
 	/* refresh our cached header so get_extra_data() returns the new one. */
 	enc->first_packet = true;
 
-	info("resize reconfigure accepted: %d in-flight frame(s) discarded by reset", flushed);
+	info("resize to %ux%u complete", w, h); // reconfigure result logged by apply_nvenc_reconfigure
 	return true;
 }
 
@@ -691,6 +695,50 @@ static bool is_10_bit(const struct nvenc_data *enc)
 				   obs_encoder_video_tex_active(enc->encoder, VIDEO_FORMAT_GBR10));
 }
 
+/* tfLevel for the active codec (0 when the loaded API has no tfLevel field
+ * for it). OBS never sets this - the value comes from the NVENC preset. */
+static bool is_444(const struct nvenc_data *enc);
+
+static uint32_t nvenc_tf_level(const struct nvenc_data *enc)
+{
+	const NV_ENC_CONFIG *cfg = &enc->config;
+#ifdef NVENC_12_2_OR_LATER
+	if (enc->codec == CODEC_HEVC)
+		return cfg->encodeCodecConfig.hevcConfig.tfLevel;
+#endif
+#ifdef NVENC_13_0_OR_LATER
+	if (enc->codec == CODEC_H264)
+		return cfg->encodeCodecConfig.h264Config.tfLevel;
+	if (enc->codec == CODEC_AV1)
+		return cfg->encodeCodecConfig.av1Config.tfLevel;
+#endif
+	return 0;
+}
+
+/* Effective input/output bit depth, computed the same way the codec start
+ * functions do it (input from the delivery format, output from the profile).
+ * Must stay in sync with the profile logic in nvenc_h264/hevc/av1_start -
+ * it runs before those functions set config->profileGUID. */
+static void nvenc_bit_depths(const struct nvenc_data *enc, int *in_depth, int *out_depth)
+{
+	*in_depth = is_10_bit(enc) ? 10 : 8;
+	*out_depth = *in_depth;
+
+	if (enc->codec == CODEC_H264) {
+#ifdef NVENC_13_0_OR_LATER
+		/* high10 selected explicitly, or forced for P010 input.
+		 * 4:4:4 input takes the HIGH_444 profile (8-bit) instead. */
+		*out_depth = !is_444(enc) && (astrcmpi(enc->props.profile, "high10") == 0 || is_10_bit(enc)) ? 10 : 8;
+#endif
+	} else if (enc->codec == CODEC_HEVC) {
+#ifdef NVENC_12_2_OR_LATER
+		/* main10 selected explicitly, or forced for P010 input. */
+		*out_depth = (astrcmpi(enc->props.profile, "main10") == 0 || is_10_bit(enc)) ? 10 : 8;
+#endif
+	}
+	/* AV1: output always equals input. */
+}
+
 static bool is_hdr(const enum video_colorspace space)
 {
 	return space == VIDEO_CS_2100_HLG || space == VIDEO_CS_2100_PQ;
@@ -895,7 +943,7 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 	config->rcParams.qpMapMode = NV_ENC_QP_MAP_DELTA;
 
 	/* -------------------------- */
-	/* log settings	              */
+	/* log settings               */
 
 	struct dstr log = {0};
 
@@ -906,10 +954,12 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 		dstr_catf(&log, "\tbitrate:      %d\n", bitrate);
 	if (vbr || abr)
 		dstr_catf(&log, "\tmax_bitrate:  %d\n", max_bitrate);
+	if (config->rcParams.vbvBufferSize)
+		dstr_catf(&log, "\tvbv_buffer:   %u kbps\n", config->rcParams.vbvBufferSize / 1000);
 	if (cqp)
-		dstr_catf(&log, "\tcqp:          %ld\n", enc->props.cqp);
+		dstr_catf(&log, "\tcqp:          %lld\n", (long long)enc->props.cqp);
 	if (cqvbr) {
-		dstr_catf(&log, "\tcq:           %ld\n", enc->props.target_quality);
+		dstr_catf(&log, "\tcq:           %lld\n", (long long)enc->props.target_quality);
 	}
 
 	dstr_catf(&log, "\tkeyint:       %d\n", gop_size);
@@ -917,19 +967,27 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 	dstr_catf(&log, "\ttuning:       %s\n", enc->props.tune);
 	dstr_catf(&log, "\tmultipass:    %s\n", enc->props.multipass);
 	dstr_catf(&log, "\tprofile:      %s\n", enc->props.profile);
+
+	int in_depth, out_depth;
+	nvenc_bit_depths(enc, &in_depth, &out_depth);
+	dstr_catf(&log, "\tbit_depth:    in=%d out=%d\n", in_depth, out_depth);
+
 	dstr_catf(&log, "\twidth:        %d\n", enc->cx);
 	dstr_catf(&log, "\theight:       %d\n", enc->cy);
 	dstr_catf(&log, "\tFPS:          %g (%u/%u)\n", obs_encoder_get_effective_fps(enc->encoder),
 		  obs_encoder_get_fps_num(enc->encoder),
 		  obs_encoder_get_fps_den(enc->encoder) * obs_encoder_get_frame_rate_divisor(enc->encoder));
-	dstr_catf(&log, "\tb-frames:     %ld\n", enc->props.bf);
-	dstr_catf(&log, "\tb-ref-mode:   %ld\n", enc->props.bframe_ref_mode);
+
+	dstr_catf(&log, "\tb-frames:     %lld\n", (long long)enc->props.bf);
+	dstr_catf(&log, "\tb-ref-mode:   %lld\n", (long long)enc->props.bframe_ref_mode);
+
 	dstr_catf(&log, "\tlookahead:    %s (%d frames)\n", lookahead ? "true" : "false",
 		  config->rcParams.lookaheadDepth);
 	dstr_catf(&log, "\taq:           %s\n", enc->props.adaptive_quantization ? "true" : "false");
+	dstr_catf(&log, "\ttfLevel:      %u\n", nvenc_tf_level(enc));
 
 	if (enc->props.split_encode) {
-		dstr_catf(&log, "\tsplit encode: %ld\n", enc->props.split_encode);
+		dstr_catf(&log, "\tsplit encode: %lld\n", (long long)enc->props.split_encode);
 	}
 	if (enc->props.opts.count)
 		dstr_catf(&log, "\tuser opts:    %s\n", enc->props.opts_str);
@@ -1089,7 +1147,10 @@ static bool init_encoder_h264(struct nvenc_data *enc, obs_data_t *settings)
 		return false;
 	}
 
-	if (NV_FAILED(nv.nvEncInitializeEncoder(enc->session, &enc->params))) {
+	nvenc_trace_pre_init(enc, &enc->config, &enc->params);
+	NVENCSTATUS err = nv.nvEncInitializeEncoder(enc->session, &enc->params);
+	nvenc_trace_post_init(enc, &enc->config, &enc->params, err);
+	if (NV_FAILED(err)) {
 		return false;
 	}
 
