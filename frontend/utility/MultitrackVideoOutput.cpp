@@ -426,10 +426,25 @@ void MultitrackVideoOutput::PrepareStreaming(
 	{
 		const std::lock_guard<std::mutex> current_lock{current_mutex};
 		const std::lock_guard<std::mutex> current_stream_dump_lock{current_stream_dump_mutex};
-		if (current || current_stream_dump) {
+		if ((current && obs_output_active(current->output_)) ||
+		    (current_stream_dump && obs_output_active(current_stream_dump->output_))) {
 			blog(LOG_WARNING, "Tried to prepare multitrack video output while it's already active");
 			return;
 		}
+	}
+
+	// A previous start attempt that failed after preparation (e.g. the encoder rejected its settings and
+	// obs_output_start() returned false) leaves the session objects behind: the output never started, so no
+	// "stop" signal fires and take_current() is never called. Without discarding them, the guard above would
+	// treat the stale session as active and the freshly loaded config (e.g. a fixed JSON override) would be
+	// silently ignored until OBS is restarted.
+	if (auto stale = take_current()) {
+		blog(LOG_WARNING, "MultitrackVideoOutput: discarding leftover session from a previous failed start");
+		ReleaseOnMainThread(std::move(stale));
+	}
+	if (auto stale_dump = take_current_stream_dump()) {
+		blog(LOG_WARNING, "MultitrackVideoOutput: discarding leftover stream dump from a previous failed start");
+		ReleaseOnMainThread(std::move(stale_dump));
 	}
 
 	restart_on_error = false;
