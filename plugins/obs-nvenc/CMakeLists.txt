@@ -4,6 +4,11 @@ option(ENABLE_NVENC "Build NVIDIA Hardware Encoder Plugin" ON)
 option(ENABLE_NVENC_FFMPEG_IDS "Register FFmpeg encoder IDs" ON)
 mark_as_advanced(ENABLE_NVENC_FFMPEG_IDS)
 
+# Forensic NVENC trace (nvenc-trace.h documents format and env vars).
+# Compile-time gated; runtime enablement via OBS_NVENC_TRACE=1|2|3.
+option(OBS_NVENC_DEBUG_TRACE "Build obs-nvenc with the forensic NVENC trace" OFF)
+mark_as_advanced(OBS_NVENC_DEBUG_TRACE)
+
 if(NOT ENABLE_NVENC)
   target_disable_feature(obs-nvenc "NVIDIA Hardware Encoder")
   target_disable(obs-nvenc)
@@ -50,6 +55,11 @@ target_link_libraries(
 )
 
 target_compile_definitions(obs-nvenc PRIVATE $<$<BOOL:${ENABLE_NVENC_FFMPEG_IDS}>:REGISTER_FFMPEG_IDS>)
+
+if(OBS_NVENC_DEBUG_TRACE)
+  target_sources(obs-nvenc PRIVATE nvenc-trace.c nvenc-trace.h)
+  target_compile_definitions(obs-nvenc PRIVATE NVENC_DEBUG_TRACE)
+endif()
 
 if(OS_WINDOWS)
   configure_file(cmake/windows/obs-module.rc.in obs-nvenc.rc)

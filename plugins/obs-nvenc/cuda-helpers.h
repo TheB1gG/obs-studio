@@ -17,6 +17,7 @@ typedef struct CudaFunctions {
 	tcuDeviceGetCount *cuDeviceGetCount;
 	tcuDeviceGet *cuDeviceGet;
 	tcuDeviceGetAttribute *cuDeviceGetAttribute;
+	tcuDeviceGetName *cuDeviceGetName;
 
 	tcuCtxCreate_v2 *cuCtxCreate;
 	tcuCtxDestroy_v2 *cuCtxDestroy;

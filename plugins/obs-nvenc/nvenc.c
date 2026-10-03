@@ -1,4 +1,5 @@
 #include "nvenc-internal.h"
+#include "nvenc-trace.h"
 
 #include <util/darray.h>
 #include <util/dstr.h>
@@ -88,9 +89,11 @@ static inline int nv_get_cap(struct nvenc_data *enc, NV_ENC_CAPS cap)
 
 	NV_ENC_CAPS_PARAM param = {NV_ENC_CAPS_PARAM_VER};
 	int v;
+	NVENCSTATUS status;
 
 	param.capsToQuery = cap;
-	nv.nvEncGetEncodeCaps(enc->session, enc->codec_guid, &param, &v);
+	status = nv.nvEncGetEncodeCaps(enc->session, enc->codec_guid, &param, &v);
+	nvenc_trace_cap(enc, cap, v, status);
 	return v;
 }
 
@@ -138,7 +141,9 @@ static bool apply_nvenc_reconfigure(struct nvenc_data *enc)
 	params.resetEncoder = 1;                 // resets rate-control state - requires IDR
 	params.forceIDR = 1;
 
-	if (NV_FAILED(nv.nvEncReconfigureEncoder(enc->session, &params))) {
+	NVENCSTATUS err = nv.nvEncReconfigureEncoder(enc->session, &params);
+	nvenc_trace_reconfigure(enc, __FUNCTION__, &params, err);
+	if (NV_FAILED(err)) {
 		return false; // encoder keeps its previous mode/state
 	}
 
@@ -182,7 +187,9 @@ static void abr_gov_apply(struct nvenc_data *enc, uint32_t new_max_bps)
 	const uint32_t old = enc->config.rcParams.maxBitRate;
 	enc->config.rcParams.maxBitRate = new_max_bps;
 
-	if (NV_FAILED(nv.nvEncReconfigureEncoder(enc->session, &params))) {
+	NVENCSTATUS err = nv.nvEncReconfigureEncoder(enc->session, &params);
+	nvenc_trace_reconfigure(enc, "abr_gov_apply", &params, err);
+	if (NV_FAILED(err)) {
 		enc->config.rcParams.maxBitRate = old; // revert: driver kept previous value
 		warn("ABR governor: reconfigure failed, keeping previous max bitrate");
 		return;
@@ -576,6 +583,9 @@ static bool init_session(struct nvenc_data *enc)
 	if (NV_FAILED(nv.nvEncOpenEncodeSessionEx(&params, &enc->session))) {
 		return false;
 	}
+
+	/* Forensic trace: create the context now that the session exists. */
+	enc->trace = nvenc_trace_init(enc);
 	return true;
 }
 
@@ -743,6 +753,9 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 	if (nv_failed(enc->encoder, err, __FUNCTION__, "nvEncGetEncodePresetConfig")) {
 		return false;
 	}
+
+	/* preset_idx = upper 32 bits of the preset GUID (Data1). */
+	nvenc_trace_preset(enc, &preset_config, nv_preset.Data1, (uint32_t)nv_tuning, (uint32_t)nv_multipass);
 
 	/* -------------------------- */
 	/* main configuration         */
@@ -1207,7 +1220,10 @@ static bool init_encoder_hevc(struct nvenc_data *enc, obs_data_t *settings)
 		return false;
 	}
 
-	if (NV_FAILED(nv.nvEncInitializeEncoder(enc->session, &enc->params))) {
+	nvenc_trace_pre_init(enc, &enc->config, &enc->params);
+	NVENCSTATUS err = nv.nvEncInitializeEncoder(enc->session, &enc->params);
+	nvenc_trace_post_init(enc, &enc->config, &enc->params, err);
+	if (NV_FAILED(err)) {
 		return false;
 	}
 
@@ -1301,7 +1317,10 @@ static bool init_encoder_av1(struct nvenc_data *enc, obs_data_t *settings)
 		return false;
 	}
 
-	if (NV_FAILED(nv.nvEncInitializeEncoder(enc->session, &enc->params))) {
+	nvenc_trace_pre_init(enc, &enc->config, &enc->params);
+	NVENCSTATUS err = nv.nvEncInitializeEncoder(enc->session, &enc->params);
+	nvenc_trace_post_init(enc, &enc->config, &enc->params, err);
+	if (NV_FAILED(err)) {
 		return false;
 	}
 
@@ -1598,6 +1617,7 @@ static void nvenc_destroy(void *data)
 	if (enc->encode_started) {
 		NV_ENC_PIC_PARAMS params = {NV_ENC_PIC_PARAMS_VER};
 		params.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+		nvenc_trace_pic(enc, &params, true);
 		nv.nvEncEncodePicture(enc->session, &params);
 		get_encoded_packet(enc, true);
 	}
@@ -1607,6 +1627,8 @@ static void nvenc_destroy(void *data)
 	}
 	if (enc->session)
 		nv.nvEncDestroyEncoder(enc->session);
+
+	nvenc_trace_destroy(enc);
 
 #ifdef _WIN32
 	d3d11_free_textures(enc);
@@ -1691,7 +1713,8 @@ static bool get_encoded_packet(struct nvenc_data *enc, bool finalize)
 			payload.inBufferSize = sizeof(buf);
 			payload.outSPSPPSPayloadSize = &size;
 
-			nv.nvEncGetSequenceParams(s, &payload);
+			NVENCSTATUS sps_err = nv.nvEncGetSequenceParams(s, &payload);
+			nvenc_trace_sequence_params(enc, buf, size, sps_err);
 			enc->header = bmemdup(buf, size);
 			enc->header_size = size;
 			enc->first_packet = false;
@@ -1945,6 +1968,8 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 	/* Add ROI map if enabled */
 	if (obs_encoder_has_roi(enc->encoder))
 		add_roi(enc, &params);
+
+	nvenc_trace_pic(enc, &params, false);
 
 	NVENCSTATUS err = nv.nvEncEncodePicture(enc->session, &params);
 	if (err != NV_ENC_SUCCESS && err != NV_ENC_ERR_NEED_MORE_INPUT) {

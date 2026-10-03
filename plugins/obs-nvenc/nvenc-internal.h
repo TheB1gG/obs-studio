@@ -80,6 +80,9 @@ struct nvenc_data {
 	bool can_change_bitrate;
 	bool non_texture;
 
+	/* Forensic trace context (nvenc-trace.c), NULL when tracing is off. */
+	void *trace;
+
 	/* NVENC bakes its SPS/VUI at create() time, before the delivery mix is bound to
 	 * encoder->media, so the identity-RGB VUI override in init_encoder_* may miss RGB
 	 * encodes. vui_identity_applied records what the SPS was generated with; the

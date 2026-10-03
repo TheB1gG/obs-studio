@@ -43,6 +43,7 @@ static const cuda_function cuda_functions[] = {
 	{offsetof(CudaFunctions, cuDeviceGetCount), "cuDeviceGetCount"},
 	{offsetof(CudaFunctions, cuDeviceGet), "cuDeviceGet"},
 	{offsetof(CudaFunctions, cuDeviceGetAttribute), "cuDeviceGetAttribute"},
+	{offsetof(CudaFunctions, cuDeviceGetName), "cuDeviceGetName"},
 
 	{offsetof(CudaFunctions, cuCtxCreate), "cuCtxCreate_v2"},
 	{offsetof(CudaFunctions, cuCtxDestroy), "cuCtxDestroy_v2"},

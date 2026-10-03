@@ -186,6 +186,22 @@ const char *nv_error_name(NVENCSTATUS err)
 	return "Unknown Error";
 }
 
+uint32_t nvenc_get_loaded_api_version(void)
+{
+	uint32_t ver = get_nvenc_ver();
+	return ver ? ver : NVCODEC_CONFIGURED_VERSION;
+}
+
+int nvenc_driver_version_major(void)
+{
+	return driver_version_major;
+}
+
+int nvenc_driver_version_minor(void)
+{
+	return driver_version_minor;
+}
+
 static inline bool init_nvenc_internal(obs_encoder_t *encoder)
 {
 	static bool initialized = false;
