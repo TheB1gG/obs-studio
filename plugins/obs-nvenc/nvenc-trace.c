@@ -525,6 +525,8 @@ static const char *bframe_ref_mode_name(NV_ENC_BFRAME_REF_MODE m)
 		return "EACH";
 	case NV_ENC_BFRAME_REF_MODE_MIDDLE:
 		return "MIDDLE";
+	case NV_ENC_BFRAME_REF_MODE_HIERARCHICAL:
+		return "HIERARCHICAL";
 	default:
 		return NULL;
 	}

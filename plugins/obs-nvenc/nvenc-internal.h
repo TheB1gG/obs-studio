@@ -117,17 +117,12 @@ struct nvenc_data {
 	double   abr_acc_time;    /* stream seconds accumulated since last adjustment */
 	uint32_t abr_max_rate;    /* currently applied maxBitRate (bps) */
 
-	/* Live RESOLUTION changes cannot be staged the same way: libobs  */
-	/* starts delivering frames at the new size on the very next tick,*/
-	/* so the NVENC session is resized immediately (forced mid-GOP    */
-	/* IDR). align_pending then counts down submissions and forces one*/
-	/* more keyframe exactly on the next shared GOP boundary so this  */
-	/* track re-locks onto its sibling encoders' keyframe pts grid.   */
-	bool align_pending;
-	int64_t align_remaining; /* encode() calls until realignment fires (incl. current) */
-
 #ifdef _WIN32
 	DARRAY(struct nv_texture) textures;
+	/* Old-size textures kept alive after a live resize (resetEncoder=0 path).
+	 * In-flight frames still reference these; freed after buf_count frames. */
+	DARRAY(struct nv_texture) old_textures;
+	uint32_t old_tex_frames_remaining;
 	ID3D11Device *device;
 	ID3D11DeviceContext *context;
 #endif

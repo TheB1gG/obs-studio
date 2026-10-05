@@ -11,6 +11,7 @@
 
 class QString;
 class QWidget;
+class QTimer;
 
 void StreamStartHandler(void *arg, calldata_t *);
 void StreamStopHandler(void *arg, calldata_t *data);
@@ -22,6 +23,8 @@ bool MultitrackVideoDeveloperModeEnabled();
 
 struct MultitrackVideoOutput {
 public:
+	~MultitrackVideoOutput();
+
 	void PrepareStreaming(QWidget *parent, const char *service_name, obs_service_t *service,
 			      const std::optional<std::string> &rtmp_url, const QString &stream_key,
 			      const char *audio_encoder_id, std::optional<uint32_t> maximum_aggregate_bitrate,
@@ -84,6 +87,20 @@ private:
 
 	bool restart_on_error = false;
 	uint8_t reconnect_attempts = 0;
+
+	// Live-resize staggering: resolution changes are applied one encoder at a time so that
+	// concurrent NVENC sessions never reset on the shared encoder engine in the same tick
+	// (simultaneous resets can trip a driver TDR / desync in-flight bitstream state).
+	struct PendingResize {
+		OBSEncoderAutoRelease encoder; // owns one ref (obs_output_get_video_encoder2 returns a borrowed ref)
+		uint32_t width = 0;
+		uint32_t height = 0;
+	};
+	std::vector<PendingResize> pending_resizes;
+	QTimer *resize_stagger_timer = nullptr;
+
+	void StartResizeStagger();
+	void ApplyNextStaggeredResize();
 
 	friend void StreamStartHandler(void *arg, calldata_t *data);
 	friend void StreamStopHandler(void *arg, calldata_t *data);

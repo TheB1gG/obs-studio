@@ -22,6 +22,10 @@
 #define NVENC_13_0_OR_LATER
 #endif
 
+#ifndef NV_ENC_BFRAME_REF_MODE_HIERARCHICAL
+#define NV_ENC_BFRAME_REF_MODE_HIERARCHICAL 0x4
+#endif
+
 enum codec_type {
 	CODEC_H264,
 	CODEC_HEVC,

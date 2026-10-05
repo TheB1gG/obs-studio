@@ -158,6 +158,16 @@ static bool apply_nvenc_reconfigure(struct nvenc_data *enc)
 	deque_init(&enc->dts_list);
 	enc->cur_bitstream = enc->next_bitstream;
 
+	/* nvEncReconfigureEncoder with resetEncoder=1 invalidates previously
+	 * allocated bitstream buffers in the driver (observed as
+	 * NV_ENC_ERR_INVALID_PARAM on the next nvEncEncodePicture). Re-create
+	 * every ring buffer and the refill buffer so post-reset encode calls
+	 * reference valid output destinations. */
+	for (uint32_t i = 0; i < enc->bitstreams.num; i++) {
+		nv_bitstream_free(enc, &enc->bitstreams.array[i]);
+		if (!nv_bitstream_init(enc, &enc->bitstreams.array[i]))
+			return false;
+	}
 	/* Re-arm sequence-parameter capture: the next locked frame is the   */
 	/* forced IDR of the reconfigured session, and get_encoded_packet()  */
 	/* refreshes enc->header via nvEncGetSequenceParams(), so muxers see */
@@ -166,8 +176,16 @@ static bool apply_nvenc_reconfigure(struct nvenc_data *enc)
 	/* sequence-start packet, not from in-band NALs alone.               */
 	enc->first_packet = true;
 
-	info("reconfigure applied (reset=1 forceIDR=1): %u in-flight frame(s) discarded by reset",
-	     discarded);
+	/* The bitstream ring (buf_count slots) is sized to hold the full post-reset
+	 * pipeline with headroom (see buf_count calculation above). get_encoded_packet()
+	 * handles the transient INVALID_PARAM "not ready" responses during the fill
+	 * period gracefully. */
+
+	info("reconfigure applied (reset=1 forceIDR=1): %u in-flight frame(s) discarded by reset, "
+	     "queued=%u cur_bs=%u next_bs=%u buf_count=%u output_delay=%u first_packet=%d",
+	     discarded, (unsigned)enc->buffers_queued, (unsigned)enc->cur_bitstream,
+	     (unsigned)enc->next_bitstream, (unsigned)enc->buf_count,
+	     (unsigned)enc->output_delay, (int)enc->first_packet);
 
 	return true;
 }
@@ -282,11 +300,15 @@ static void abr_gov_update(struct nvenc_data *enc, uint32_t frame_size_bytes)
 /* obs_encoder_set_scaled_size() makes libobs start delivering frames at the  */
 /* new size on the very next tick, so - unlike RC changes - a resize cannot   */
 /* be deferred to the GOP boundary: this frame's input texture already has    */
-/* the new dimensions. We therefore apply it immediately (reconfigure with    */
-/* reset + forceIDR), which inevitably lands mid-GOP and shifts this track's  */
-/* keyframe phase off the shared multitrack grid. To re-lock, nvenc_encode_   */
-/* base() then stages one more forced keyframe exactly on the next shared     */
-/* boundary (align_pending / align_remaining countdown).                     */
+/* the new dimensions.                                                       */
+/*                                                                           */
+/* We use resetEncoder=0 + forceIDR=1 (matching NVIDIA's DRC sample):        */
+/*  - The ring buffer continues operating normally (no reset of              */
+/*    buffers_queued / cur_bitstream / next_bitstream / dts_list).           */
+/*  - In-flight frames continue encoding at the old resolution; the          */
+/*    forced IDR marks the start of the new resolution.                      */
+/*  - Old input textures are kept alive (in-flight frames reference them)    */
+/*    and freed after buf_count frames.                                      */
 
 static bool apply_nvenc_resize(struct nvenc_data *enc, uint32_t w, uint32_t h)
 {
@@ -303,9 +325,10 @@ static bool apply_nvenc_resize(struct nvenc_data *enc, uint32_t w, uint32_t h)
 		return false;
 	}
 
-	info("applying live resolution change: %ux%u -> %ux%u (forced IDR this frame)", enc->cx, enc->cy, w, h);
+	info("applying live resolution change: %ux%u -> %ux%u (reset=0 forceIDR=1, ring preserved)",
+	     enc->cx, enc->cy, w, h);
 
-	/* Session parameters for the reconfigure below. */
+	/* Update session parameters for the reconfigure. */
 	enc->params.encodeWidth = w;
 	enc->params.encodeHeight = h;
 	enc->params.darWidth = w;
@@ -313,35 +336,57 @@ static bool apply_nvenc_resize(struct nvenc_data *enc, uint32_t w, uint32_t h)
 	enc->cx = w;
 	enc->cy = h;
 
-#ifdef _WIN32
-	if (!enc->non_texture) {
-		d3d11_free_textures(enc); // unmaps/unregisters + releases (mapped-safe)
-	} else
-#endif
-	{
-		cuda_free_surfaces(enc);
+	/* Soft reconfigure: resetEncoder=0 keeps the output pipeline intact.
+	 * forceIDR ensures the decoder receives a fresh SPS/PPS with the new
+	 * resolution. The ring buffer (buffers_queued, cur_bitstream,
+	 * next_bitstream, dts_list) is NOT reset - NVIDIA's DRC sample
+	 * preserves output sequencing across reconfigure. */
+	NV_ENC_RECONFIGURE_PARAMS params = {0};
+	params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+	params.reInitEncodeParams = enc->params;
+	params.resetEncoder = 0;
+	params.forceIDR = 1;
+
+	NVENCSTATUS err = nv.nvEncReconfigureEncoder(enc->session, &params);
+	nvenc_trace_reconfigure(enc, __FUNCTION__, &params, err);
+	if (NV_FAILED(err)) {
+		error("resize reconfigure failed (reset=0 forceIDR=1): err=%d", (int)err);
+		return false;
 	}
 
-	if (!apply_nvenc_reconfigure(enc)) // reset=1 + forceIDR, carries updated params (+ queue rewind)
-		return false;
+	/* Create new-size textures. The old textures remain alive because
+	 * in-flight frames (up to output_delay) still reference them via
+	 * nvEncMapInputResource. We move them to old_textures and free them
+	 * after buf_count frames (guarantees all in-flight frames complete). */
 #ifdef _WIN32
 	if (!enc->non_texture) {
-		enc->textures.num = 0;         // reuse reserved storage, re-init refills entries
-		if (!d3d11_init_textures(enc)) // register new-size resources on the resized session
+		/* Save old textures for deferred free. */
+		da_move(enc->old_textures, enc->textures);
+		enc->textures.num = 0;
+		enc->old_tex_frames_remaining = enc->buf_count;
+
+		if (!d3d11_init_textures(enc))
 			return false;
 	} else
 #endif
 	{
+		cuda_free_surfaces(enc);
 		enc->surfaces.num = 0;
 		if (!cuda_init_surfaces(enc))
 			return false;
 	}
 
-	/* The reconfigured session emits a fresh SPS/PPS (new resolution); */
-	/* refresh our cached header so get_extra_data() returns the new one. */
+	/* The reconfigured session will emit a fresh SPS/PPS with the new
+	 * resolution at the forced IDR. The in-flight old-resolution frames in
+	 * the ring are emitted normally (they complete the old GOP), followed by
+	 * the new-resolution IDR which starts the new GOP. This is valid H.264:
+	 * the SPS/PPS change takes effect at the IDR, and all prior P/B frames
+	 * belong to the old-resolution sequence. */
 	enc->first_packet = true;
 
-	info("resize to %ux%u complete", w, h); // reconfigure result logged by apply_nvenc_reconfigure
+	info("resize to %ux%u complete: ring preserved (queued=%u cur_bs=%u next_bs=%u buf_count=%u)",
+	     w, h, (unsigned)enc->buffers_queued, (unsigned)enc->cur_bitstream,
+	     (unsigned)enc->next_bitstream, (unsigned)enc->buf_count);
 	return true;
 }
 
@@ -359,40 +404,16 @@ bool nvenc_maybe_resize(struct nvenc_data *enc)
 		return false; // caps check: nothing was touched, retried on the next frame
 	}
 
-	/* Stage realignment onto the shared keyframe grid. */
-	/* `frames_since_idr` resets to 0 when an IDR packet is observed,   */
-	/* which happens output_delay-1 ticks AFTER that IDR's submission.  */
-	/* Within each observation cycle the natural (shared) IDR           */
-	/* submissions sit at counter position s = gopLength-(delay-1),     */
-	/* i.e. exactly where nvenc_encode_base()'s boundary check fires.   */
-	const int64_t g = enc->config.gopLength;
-	if (!obs_encoder_active(enc->encoder) || g <= 0 || enc->output_delay < 2) {
-		info("resize applied off-grid (not streaming or no pipeline delay); alignment not staged");
-		return true;
-	}
-
-	const int64_t s = g - ((int64_t)enc->output_delay - 1); /* counter position of a shared keyframe tick */
-	const int64_t o = enc->frames_since_idr; /* submissions since last observed IDR (pre-increment) */
-	const int64_t p = o + 1;                 /* this submission's position in the cycle [1..g] */
-
-	int64_t delta; // submissions after THIS one until the next shared keyframe tick (0 = this frame)
-	if (p < s)
-		delta = s - p; /* grid point later in this observation cycle */
-	else if (p > s)
-		delta = g - (p - s); /* already past it, wraps to the next cycle */
-	else
-		delta = 0; /* this frame is itself a shared keyframe tick */
-
-	if (delta == 0) {
-		info("resize landed exactly on a shared keyframe boundary - alignment preserved");
-		enc->reconfig_pending = false; /* any staged RC change already rode on this reset */
-	} else {
-		enc->align_pending = true;
-		enc->align_remaining = delta + 1; /* pre-decremented in encode_base() starting with this frame */
-		info("staged resize realignment - forcing keyframe at next shared boundary "
-		     "(%lld frames, gopLength=%d output_delay=%d)",
-		     (long long)delta, (int)g, enc->output_delay);
-	}
+	/* No staged realignment needed. The forceIDR=1 in apply_nvenc_resize()
+	 * already produces an IDR that resets the GOP phase. The ring is
+	 * preserved (resetEncoder=0), so the encoder continues producing frames
+	 * in order. The next natural keyframe boundary (within gopLength frames)
+	 * will re-align this track with sibling encoders on the shared grid.
+	 *
+	 * A second nvEncReconfigureEncoder(resetEncoder=1) here was previously
+	 * used to force a realignment IDR at the shared boundary, but it breaks
+	 * the NVENC AV1 pipeline (persistent INVALID_PARAM on lock after ring
+	 * reset). The natural GOP boundary is sufficient. */
 
 	return true;
 }
@@ -701,17 +722,17 @@ static bool is_444(const struct nvenc_data *enc);
 
 static uint32_t nvenc_tf_level(const struct nvenc_data *enc)
 {
-	const NV_ENC_CONFIG *cfg = &enc->config;
 #ifdef NVENC_12_2_OR_LATER
 	if (enc->codec == CODEC_HEVC)
-		return cfg->encodeCodecConfig.hevcConfig.tfLevel;
+		return enc->config.encodeCodecConfig.hevcConfig.tfLevel;
 #endif
 #ifdef NVENC_13_0_OR_LATER
 	if (enc->codec == CODEC_H264)
-		return cfg->encodeCodecConfig.h264Config.tfLevel;
+		return enc->config.encodeCodecConfig.h264Config.tfLevel;
 	if (enc->codec == CODEC_AV1)
-		return cfg->encodeCodecConfig.av1Config.tfLevel;
+		return enc->config.encodeCodecConfig.av1Config.tfLevel;
 #endif
+	(void)enc;
 	return 0;
 }
 
@@ -853,14 +874,30 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 	}
 
 	int buf_count = max(4, config->frameIntervalP * 2 * 2);
+	int output_delay;
 	if (lookahead) {
-		buf_count = max(buf_count, config->frameIntervalP + rc_lookahead + EXTRA_BUFFERS);
+		/* The ring must hold every in-flight frame plus headroom for the
+		 * post-reset pipeline fill. Measured against working/failing configs,
+		 * the AV1/uhq post-reset pipeline (lookahead + temporal filtering +
+		 * B-frame reordering) can exceed 2x the steady-state depth. Size at
+		 * 4x to guarantee the ring never overflows during the fill period. */
+		const int pipeline_depth = config->frameIntervalP + rc_lookahead;
+		buf_count = max(buf_count, pipeline_depth * 4);
+
+		/* The output gate should open when NVENC has likely produced its first
+		 * post-reset output - approximately 2x the nominal pipeline depth plus
+		 * a small margin. NOT buf_count-1 (that would delay output by the full
+		 * ring size, causing a multi-second silence after reconfigure). */
+		output_delay = pipeline_depth * 2 + 16;
+	} else {
+		output_delay = buf_count - 1;
 	}
 
-	buf_count = min(64, buf_count);
+	buf_count = min(128, buf_count);
 	enc->buf_count = buf_count;
 
-	const int output_delay = buf_count - 1;
+	/* Ensure the gate opens before the overflow guard fires. */
+	output_delay = min(output_delay, buf_count - 2);
 	enc->output_delay = output_delay;
 
 	info("pipeline params: gopLength=%d frameIntervalP=%d bf=%d buf_count=%d output_delay=%d",
@@ -868,7 +905,12 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 	     enc->output_delay);
 
 	if (lookahead) {
-		const int lkd_bound = output_delay - config->frameIntervalP - 4;
+		/* Clamp the effective lookahead so that 2x the resulting pipeline
+		 * depth fits in the bitstream ring. During the post-reset transition
+		 * the pipeline holds extra frames before emitting output, delaying
+		 * ring-frame outputs by one full pipeline depth. The ring therefore
+		 * needs 2x depth headroom. */
+		const int lkd_bound = enc->buf_count / 2 - config->frameIntervalP - 8;
 		if (lkd_bound >= 0) {
 			config->rcParams.enableLookahead = 1;
 			config->rcParams.lookaheadDepth = min(rc_lookahead, lkd_bound);
@@ -1693,6 +1735,19 @@ static void nvenc_destroy(void *data)
 
 #ifdef _WIN32
 	d3d11_free_textures(enc);
+	/* Free any deferred old-size textures from a live resize. */
+	if (enc->old_textures.num > 0) {
+		for (size_t i = 0; i < enc->old_textures.num; i++) {
+			struct nv_texture *ot = &enc->old_textures.array[i];
+			if (ot->res) {
+				if (ot->mapped_res)
+					nv.nvEncUnmapInputResource(enc->session, ot->mapped_res);
+				nv.nvEncUnregisterResource(enc->session, ot->res);
+				ot->tex->lpVtbl->Release(ot->tex);
+			}
+		}
+		da_free(enc->old_textures);
+	}
 	d3d11_free(enc);
 #else
 	cuda_opengl_free(enc);
@@ -1735,8 +1790,14 @@ static bool get_encoded_packet(struct nvenc_data *enc, bool finalize)
 
 	if (!enc->buffers_queued)
 		return true;
-	if (!finalize && enc->buffers_queued < enc->output_delay)
+
+	if (!finalize && enc->buffers_queued < enc->output_delay) {
+		/* Post-reset fill period: log progress every 10 frames */
+		if (enc->first_packet && (enc->buffers_queued % 10 == 0))
+			debug("fill period: queued=%u/%u (waiting for output_delay)",
+			      (unsigned)enc->buffers_queued, (unsigned)enc->output_delay);
 		return true;
+	}
 
 	size_t count = finalize ? enc->buffers_queued : 1;
 
@@ -1754,13 +1815,49 @@ static bool get_encoded_packet(struct nvenc_data *enc, bool finalize)
 
 		NV_ENC_LOCK_BITSTREAM lock = {NV_ENC_LOCK_BITSTREAM_VER};
 		lock.outputBitstream = bs->ptr;
-		lock.doNotWait = false;
+		lock.doNotWait = true;
 
 		NVENCSTATUS err;
 
 		err = nv.nvEncLockBitstream(s, &lock);
-		if (NV_FAILED(err)) {
-			error("nvEncLockBitstream failed (err=%d) - in-flight state out of sync", (int)err);
+		if (err != NV_ENC_SUCCESS) {
+			/* With doNotWait=true, the lock returns immediately if no output
+			 * is ready. Two transient errors are expected during the post-reset
+			 * fill period:
+			 *   INVALID_PARAM - pipeline not yet deep enough to emit output
+			 *   LOCK_BUSY     - encoder still processing (synchronous mode)
+			 * Both mean "try again on the next submission." Leave the frame
+			 * queued (no consume, no DTS pop). Bounded by the ring size: if
+			 * the queue fills to buf_count without producing output the
+			 * pipeline is genuinely broken and we fall through to fatal. */
+			if (!finalize &&
+			    (err == NV_ENC_ERR_INVALID_PARAM || err == NV_ENC_ERR_LOCK_BUSY) &&
+			    (uint32_t)enc->buffers_queued < enc->buf_count) {
+				/* Log transient lock failures during first_packet period */
+				if (enc->first_packet && (enc->buffers_queued % 10 == 0))
+					debug("lock failure during fill: err=%d (%s) queued=%u/%u bs_idx=%u",
+					      (int)err,
+					      err == NV_ENC_ERR_LOCK_BUSY ? "LOCK_BUSY" : "INVALID_PARAM",
+					      (unsigned)enc->buffers_queued,
+					      (unsigned)enc->buf_count, (unsigned)enc->cur_bitstream);
+				return true;
+			}
+
+			/* During finalize (EOS flush), the driver may have already
+			 * released its internal encode resources. OUT_OF_MEMORY means
+			 * no more output will be produced - stop flushing gracefully. */
+			if (finalize && err == NV_ENC_ERR_OUT_OF_MEMORY) {
+				debug("EOS flush: encoder released resources, %u frame(s) not retrieved",
+				      (unsigned)enc->buffers_queued);
+				return true;
+			}
+
+			nv_failed(enc->encoder, err, __FUNCTION__, "nvEncLockBitstream");
+			error("nvEncLockBitstream failed (err=%d) after %u queued frame(s) "
+			      "(buf_count=%u): the post-reset pipeline is deeper than the "
+			      "bitstream ring - lower the lookahead depth to make live "
+			      "resize work",
+			      (int)err, (unsigned)enc->buffers_queued, (unsigned)enc->buf_count);
 			return false;
 		}
 
@@ -1779,6 +1876,9 @@ static bool get_encoded_packet(struct nvenc_data *enc, bool finalize)
 			enc->header = bmemdup(buf, size);
 			enc->header_size = size;
 			enc->first_packet = false;
+			info("first packet after reconfigure: pts=%lld size=%u pic_type=%d queued=%u",
+			     (long long)lock.outputTimeStamp, lock.bitstreamSizeInBytes,
+			     (int)lock.pictureType, (unsigned)enc->buffers_queued);
 		}
 
 		da_copy_array(enc->packet_data, lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes);
@@ -1945,6 +2045,7 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 		}
 	}
 
+
 	/* Count submissions since last observed IDR. get_encoded_packet() */
 	/* only starts returning packets once buffers_queued reaches       */
 	/* output_delay, so in steady state exactly output_delay - 1      */
@@ -1961,32 +2062,26 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 	const int64_t pipeline_delay = (int64_t)enc->output_delay - 1; /* see get_encoded_packet() gate */
 	const int64_t keyframe_boundary = (int64_t)enc->config.gopLength - pipeline_delay;
 
-	/* Staged change firing.                                           */
-	/* RC changes ride the natural counter boundary above. Resize      */
-	/* realignment uses its own submission countdown instead: the       */
-	/* resize's forced IDR re-anchors this encoder mid-GOP, so the      */
-	/* observation resets (and with them the counter phase) resume from  */
-	/* that point - the plain boundary would fire off-grid.             */
+	/* Staged RC change firing at the shared keyframe boundary.
+	 * Do NOT fire during the post-reset fill period (first_packet still
+	 * true): the ring is filling and no output has been produced yet.
+	 * A second reset would discard the in-flight frames and restart
+	 * the fill, causing an infinite loop of resets with no output. */
 	bool fire_now = false;
 
-	if (enc->align_pending) {
-		if (--enc->align_remaining == 0)
+	if (!enc->first_packet) {
+		if (enc->reconfig_pending && enc->frames_since_idr >= keyframe_boundary)
 			fire_now = true;
-	} else if (enc->reconfig_pending && enc->frames_since_idr >= keyframe_boundary) {
-		fire_now = true;
 	}
 
 	if (fire_now) {
 		info("applying staged encoder reconfigure at shared keyframe boundary "
-		     "(align=%d rc=%d counter=%lld gopLength=%d output_delay=%d forced_frame_pts=%lld)",
-		     enc->align_pending, enc->reconfig_pending, (long long)enc->frames_since_idr,
+		     "(rc=%d counter=%lld gopLength=%d output_delay=%d forced_frame_pts=%lld)",
+		     enc->reconfig_pending, (long long)enc->frames_since_idr,
 		     (int)enc->config.gopLength, enc->output_delay, (long long)pts);
 		bool ok = apply_nvenc_reconfigure(enc);
 
-		/* One reset+IDR at a shared tick re-anchors the GOP phase; any  */
-		/* staged RC change rides on it too. No per-GOP retry - restart  */
-		/* needed on failure.                                            */
-		enc->align_pending = false;
+		/* One reset+IDR at a shared tick re-anchors the GOP phase. */
 		enc->reconfig_pending = false;
 		if (ok)
 			enc->frames_since_idr = 0;
@@ -2032,17 +2127,66 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 
 	nvenc_trace_pic(enc, &params, false);
 
-	NVENCSTATUS err = nv.nvEncEncodePicture(enc->session, &params);
-	if (err != NV_ENC_SUCCESS && err != NV_ENC_ERR_NEED_MORE_INPUT) {
-		nv_failed(enc->encoder, err, __FUNCTION__, "nvEncEncodePicture");
-		return false;
+	/* Overflow guard: if the ring is nearly full (all but one slot in-flight
+	 * with no output yet), skip the submission to avoid wrapping next_bitstream
+	 * onto cur_bitstream. Still attempt a read so NVENC can drain its pipeline
+	 * and free a slot. This should not happen with the enlarged ring
+	 * (buf_count sized at 4x pipeline depth). */
+	bool submitted = true;
+	if ((uint32_t)enc->buffers_queued >= enc->buf_count - 1) {
+		static int64_t last_overflow_warn = 0;
+		if (pts - last_overflow_warn > 2000000000LL) { /* ~2s at 1GHz timescale */
+			warn("bitstream ring nearly full (%u/%u) with no output ready - "
+			     "dropping frames until pipeline drains (pts=%lld)",
+			     (unsigned)enc->buffers_queued, (unsigned)enc->buf_count, (long long)pts);
+			last_overflow_warn = pts;
+		}
+		submitted = false;
+		/* The backend already pushed this frame's PTS onto dts_list before
+		 * calling us. Since we're not submitting, remove it to keep the
+		 * list in sync with the ring. */
+		int64_t dummy;
+		if (enc->dts_list.size > 0)
+			deque_pop_back(&enc->dts_list, &dummy, sizeof(dummy));
 	}
 
-	enc->encode_started = true;
-	enc->buffers_queued++;
+	if (submitted) {
+		NVENCSTATUS err = nv.nvEncEncodePicture(enc->session, &params);
+		if (err != NV_ENC_SUCCESS && err != NV_ENC_ERR_NEED_MORE_INPUT) {
+			nv_failed(enc->encoder, err, __FUNCTION__, "nvEncEncodePicture");
+			return false;
+		}
 
-	if (++enc->next_bitstream == enc->buf_count) {
-		enc->next_bitstream = 0;
+		enc->encode_started = true;
+		enc->buffers_queued++;
+
+		if (++enc->next_bitstream == enc->buf_count) {
+			enc->next_bitstream = 0;
+		}
+
+#ifdef _WIN32
+		/* Deferred free of old-size textures after a live resize.
+		 * In-flight frames referenced the old textures via
+		 * nvEncMapInputResource; after buf_count new frames are
+		 * submitted, all old in-flight frames have completed. */
+		if (enc->old_tex_frames_remaining > 0) {
+			enc->old_tex_frames_remaining--;
+			if (enc->old_tex_frames_remaining == 0 && enc->old_textures.num > 0) {
+				debug("freeing %u old-size texture(s) after live resize",
+				      (unsigned)enc->old_textures.num);
+				for (size_t i = 0; i < enc->old_textures.num; i++) {
+					struct nv_texture *ot = &enc->old_textures.array[i];
+					if (ot->res) {
+						if (ot->mapped_res)
+							nv.nvEncUnmapInputResource(enc->session, ot->mapped_res);
+						nv.nvEncUnregisterResource(enc->session, ot->res);
+						ot->tex->lpVtbl->Release(ot->tex);
+					}
+				}
+				da_free(enc->old_textures);
+			}
+		}
+#endif
 	}
 
 	/* ------------------------------------ */

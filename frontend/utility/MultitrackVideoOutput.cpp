@@ -13,6 +13,7 @@
 #include <QPushButton>
 #include <QMessageBox>
 #include <QThread>
+#include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
 
@@ -29,6 +30,12 @@ static const char *av1_main = "Main";
 
 // Maximum reconnect attempts with an invalid key error before giving up (roughly 30 seconds with default start value)
 static constexpr uint8_t MAX_RECONNECT_ATTEMPTS = 5;
+
+// Stagger interval between live encoder resizes. Keep this >= one GOP so each session's reset +
+// keyframe realignment completes before the next session starts: simultaneous NVENC resets on the
+// shared encoder engine can trip a driver TDR and desync in-flight bitstream state. With up to 11
+// concurrent sessions the full stagger takes N * interval; lower it only if you accept that risk.
+static constexpr int RESIZE_STAGGER_INTERVAL_MS = 4000;
 
 extern bool EncoderAvailable(const char *encoder);
 
@@ -755,6 +762,65 @@ static const char *range_to_string(enum video_range_type range)
 	return "unknown";
 }
 
+MultitrackVideoOutput::~MultitrackVideoOutput()
+{
+	if (resize_stagger_timer) {
+		resize_stagger_timer->stop();
+		delete resize_stagger_timer;
+		resize_stagger_timer = nullptr;
+	}
+}
+
+void MultitrackVideoOutput::StartResizeStagger()
+{
+	if (pending_resizes.empty())
+		return;
+
+	if (!resize_stagger_timer) {
+		resize_stagger_timer = new QTimer;
+		QObject::connect(resize_stagger_timer, &QTimer::timeout, [this] { ApplyNextStaggeredResize(); });
+	}
+
+	if (!resize_stagger_timer->isActive()) {
+		// Fresh stagger: apply the first resize now, then tick for the rest.
+		ApplyNextStaggeredResize();
+		if (!pending_resizes.empty())
+			resize_stagger_timer->start(RESIZE_STAGGER_INTERVAL_MS);
+	}
+
+	blog(LOG_INFO, "MultitrackVideoOutput: staggering live encoder resizes (%zu queued, %d ms interval)",
+	     pending_resizes.size(), RESIZE_STAGGER_INTERVAL_MS);
+}
+
+void MultitrackVideoOutput::ApplyNextStaggeredResize()
+{
+	if (pending_resizes.empty()) {
+		if (resize_stagger_timer)
+			resize_stagger_timer->stop();
+		blog(LOG_INFO, "MultitrackVideoOutput: staggered encoder resizes complete");
+		return;
+	}
+
+	PendingResize next = std::move(pending_resizes.front());
+	pending_resizes.erase(pending_resizes.begin());
+
+	obs_encoder_t *encoder = next.encoder.Get();
+	if (!encoder || !obs_encoder_active(encoder)) {
+		blog(LOG_WARNING, "MultitrackVideoOutput: encoder no longer active, aborting staggered resize (%zu remaining)",
+		     pending_resizes.size());
+		pending_resizes.clear();
+		if (resize_stagger_timer)
+			resize_stagger_timer->stop();
+		return;
+	}
+
+	char line[160];
+	snprintf(line, sizeof(line), "video encoder resolution -> %" PRIu32 "x%" PRIu32 " (staggered)", next.width,
+	         next.height);
+	blog(LOG_INFO, "MultitrackVideoOutput: applied live:%s", line);
+	obs_encoder_set_scaled_size(encoder, next.width, next.height);
+}
+
 bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config_json, std::string *failure_reason)
 {
 	auto fail = [&](const char *reason) {
@@ -924,8 +990,12 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 				             "x%" PRIu32,
 				         i, old_encoder_config.width, old_encoder_config.height, new_encoder_config.width,
 				         new_encoder_config.height);
-				blog(LOG_INFO, "MultitrackVideoOutput: applied live:%s (encoder resizes at the next frame)", line);
-				obs_encoder_set_scaled_size(encoder, new_encoder_config.width, new_encoder_config.height);
+				blog(LOG_INFO, "MultitrackVideoOutput: queued live:%s (staggered)", line);
+				PendingResize pr;
+				pr.encoder = obs_encoder_get_ref(encoder); // borrowed ref from obs_output_get_video_encoder2
+				pr.width = new_encoder_config.width;
+				pr.height = new_encoder_config.height;
+				pending_resizes.push_back(std::move(pr));
 			}
 		} else if (structural_video_change) {
 			char line[160];
@@ -993,6 +1063,10 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 			}
 		}
 	}
+
+	// Apply queued resolution changes one encoder at a time so concurrent NVENC sessions
+	// never reset on the shared encoder engine in the same tick (see StartResizeStagger).
+	StartResizeStagger();
 
 	auto old_audios = collect_audio_configurations(old_config);
 	auto new_audios = collect_audio_configurations(new_config);

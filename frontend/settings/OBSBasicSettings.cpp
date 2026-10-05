@@ -1749,7 +1749,6 @@ void OBSBasicSettings::LoadVideoSettings()
 	loading = true;
 
 	if (obs_video_active()) {
-		ui->videoPage->setEnabled(false);
 		ui->videoMsg->setText(QTStr("Basic.Settings.Video.CurrentlyActive"));
 	}
 
@@ -2329,7 +2328,20 @@ void OBSBasicSettings::LoadOutputSettings()
 		ui->advStreamTrackWidget->setEnabled(false);
 		ui->advOutAEncoder->setEnabled(false);
 		ui->advOutEncoder->setEnabled(false);
-		ui->advOutRecTopContainer->setEnabled(false);
+		// Disable recording output widgets individually, but keep Rescale (resolution/filter) and FPS
+		// enabled so they can be changed live while recording.
+		ui->advOutRecPath->setEnabled(false);
+		ui->advOutRecPathBrowse->setEnabled(false);
+		ui->advOutNoSpace->setEnabled(false);
+		ui->advOutRecFormat->setEnabled(false);
+		ui->advOutRecEncoder->setEnabled(false);
+		ui->advOutRecAEncoder->setEnabled(false);
+		ui->advRecTrackWidget->setEnabled(false);
+		ui->advOutMuxCustom->setEnabled(false);
+		ui->advOutSplitFile->setEnabled(false);
+		ui->advOutSplitFileType->setEnabled(false);
+		ui->advOutSplitFileTime->setEnabled(false);
+		ui->advOutSplitFileSize->setEnabled(false);
 		ui->advOutRecTypeContainer->setEnabled(false);
 		ui->advOutputAudioTracksTab->setEnabled(false);
 		ui->advNetworkGroupBox->setEnabled(false);

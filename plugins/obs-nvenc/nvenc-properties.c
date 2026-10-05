@@ -238,6 +238,10 @@ obs_properties_t *nvenc_properties_internal(enum codec_type codec)
 			obs_property_list_add_int(p, obs_module_text("BframeRefMode.Middle"),
 						  NV_ENC_BFRAME_REF_MODE_MIDDLE);
 		}
+		if (caps->bref_modes & 4) {
+			obs_property_list_add_int(p, obs_module_text("BframeRefMode.Hierarchical"),
+					  NV_ENC_BFRAME_REF_MODE_HIERARCHICAL);
+		}
 	}
 
 #ifdef NVENC_12_1_OR_LATER

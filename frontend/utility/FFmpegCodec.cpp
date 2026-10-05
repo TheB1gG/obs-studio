@@ -61,7 +61,8 @@ bool FFCodecAndFormatCompatible(const char *codec, const char *format)
 }
 
 static const unordered_set<string> builtin_codecs = {
-	"h264", "hevc", "av1", "prores", "aac", "opus", "alac", "flac", "pcm_s16le", "pcm_s24le", "pcm_f32le",
+	"h264", "hevc", "av1", "vp9", "prores", "aac", "opus", "alac", "flac", "pcm_s16le", "pcm_s24le",
+	"pcm_f32le",
 };
 
 bool IsBuiltinCodec(const char *codec)
@@ -70,11 +71,16 @@ bool IsBuiltinCodec(const char *codec)
 }
 
 static const unordered_map<string, unordered_set<string>> codec_compat = {
-	// Technically our muxer supports HEVC and AV1 as well, but nothing else does
+	// eFLV (Y2023) supports H.264, HEVC, AV1, and VP9
 	{"flv",
 	 {
 		 "h264",
+		 "hevc",
+		 "av1",
+		 "vp9",
 		 "aac",
+		 "opus",
+		 "flac",
 	 }},
 	{"mpegts",
 	 {
