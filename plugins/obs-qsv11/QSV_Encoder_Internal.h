@@ -92,6 +92,7 @@ protected:
 			   uint32_t strideUV);
 	mfxStatus LoadP010(mfxFrameSurface1 *pSurface, uint8_t *pDataY, uint8_t *pDataUV, uint32_t strideY,
 			   uint32_t strideUV);
+	mfxStatus LoadY410(mfxFrameSurface1 *pSurface, uint8_t *pDataY, uint32_t strideY);
 	mfxStatus Drain();
 	int GetFreeTaskIndex(Task *pTaskPool, mfxU16 nPoolSize);
 

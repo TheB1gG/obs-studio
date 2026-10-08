@@ -679,6 +679,19 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 	const bool is_gbr = obs_encoder_video_tex_active(obsqsv->encoder, VIDEO_FORMAT_GBRA) ||
 			    obs_encoder_video_tex_active(obsqsv->encoder, VIDEO_FORMAT_GBR10);
 
+	/* Raw-RGB delivery (HEVC Main 4:4:4, MatrixCoefficients=0): RGB sources are remapped to
+	 * Y410+SRGB+FULL by obs_qsv_video_info_hevc_tex and the Y410_RGB conversion repacks the
+	 * display-encoded channels into the coded samples in GBR order (the component order the
+	 * "RGB"/Identity matrix actually uses) without color conversion. The (Y410, SRGB, FULL)
+	 * triple is exactly the marker obs.c uses to select that conversion, so these VUI tags
+	 * always describe what the shader actually did. With an Identity matrix the decoder must
+	 * interpret the samples as RGB, so per spec the remaining VUI color fields are unspecified
+	 * (2) and the range is full. */
+	const bool rgb_identity = (voi->format == VIDEO_FORMAT_Y410 && voi->colorspace == VIDEO_CS_SRGB &&
+				   voi->range == VIDEO_RANGE_FULL);
+	if (rgb_identity)
+		obsqsv->params.VideoFullRange = true;
+
 	switch (voi->colorspace) {
 	case VIDEO_CS_601:
 		obsqsv->params.ColourPrimaries = 6;
@@ -696,9 +709,15 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 		obsqsv->params.ChromaSampleLocTypeBottomField = 0;
 		break;
 	case VIDEO_CS_SRGB:
-		obsqsv->params.ColourPrimaries = 1;
-		obsqsv->params.TransferCharacteristics = 13;
-		obsqsv->params.MatrixCoefficients = is_gbr ? 0 : 1;
+		if (rgb_identity) {
+			obsqsv->params.ColourPrimaries = 2; /* unspecified */
+			obsqsv->params.TransferCharacteristics = 2; /* unspecified */
+			obsqsv->params.MatrixCoefficients = 0; /* Identity (RGB) */
+		} else {
+			obsqsv->params.ColourPrimaries = 1;
+			obsqsv->params.TransferCharacteristics = 13;
+			obsqsv->params.MatrixCoefficients = is_gbr ? 0 : 1;
+		}
 		obsqsv->params.ChromaSampleLocTypeTopField = 0;
 		obsqsv->params.ChromaSampleLocTypeBottomField = 0;
 		break;
@@ -1177,6 +1196,9 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 		return NULL;
 	}
 	case VIDEO_FORMAT_GBRA:
+		/* Safety net only: on Windows obs_qsv_video_info_hevc_tex remaps BGRA to Y410, so a
+		 * GBRA mix can no longer reach here for HEVC. Kept so any future raw-RGB delivery is
+		 * rejected explicitly instead of mis-encoding RGB bytes as YUV. */
 		if (codec != QSV_CODEC_HEVC || !useTexAlloc) {
 			const char *const text = obs_module_text("444Unsupported");
 			obs_encoder_set_last_error(encoder, text);
@@ -1201,6 +1223,8 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 		}
 		break;
 	case VIDEO_FORMAT_GBR10:
+		/* Safety net only: on Windows obs_qsv_video_info_hevc_tex remaps GBR10/R10L to Y410,
+		 * so a GBR10 mix can no longer reach here for HEVC (see the GBRA case above). */
 		if (codec != QSV_CODEC_HEVC || !useTexAlloc) {
 			const char *const text = obs_module_text("444Unsupported");
 			obs_encoder_set_last_error(encoder, text);
@@ -1493,20 +1517,34 @@ static void obs_qsv_video_plus_hdr_info(void *data, struct video_scale_info *inf
 static void obs_qsv_video_info_hevc_tex(void *data, struct video_scale_info *info)
 {
 #ifdef _WIN32
-	/* Override to GBRA for BGRA to enable RGB texture encoding without colour conversion. */
+	/* Deliver every 4:4:4 and RGB input as Y410 (packed R10G10B10A2):
+	 *  - YUV sources (I444/Y410): the Y410_SRGB/PQ/HLG conversion shaders perform a real
+	 *    in-shader RGB->YUV transform on the linear canvas; the VUI tags describe the
+	 *    converted YUV data.
+	 *  - RGB sources (BGRA/GBR10/R10L): tagged SRGB+FULL so libobs selects the Y410_RGB
+	 *    conversion, which repacks the channels raw into the coded samples in GBR order
+	 *    (the component order the Identity matrix actually uses; no colour conversion),
+	 *    and update_params writes MatrixCoefficients=0 (Identity) + full range - HEVC Main
+	 *    4:4:4 carrying genuine RGB exactly as the spec intends.
+	 *
+	 * Previously I444 was remapped to AYUV and BGRA/GBR10 were repacked raw into AYUV/Y410
+	 * slots without colour conversion. That stored the channels in the wrong coded positions
+	 * (scrambled colours) and the AYUV layout is broken on the dGPU fallback path: libobs has
+	 * no GPU-conversion/staging/readback support for AYUV mixes, so the raw connection
+	 * delivered a constant stale buffer and recordings came out solid green. Y410 is the only
+	 * 4:4:4 layout with full support across conversion, staging, readback and the MFX session
+	 * on both the iGPU texture path and the dGPU fallback (obs_qsv_create accepts it regardless
+	 * of useTexAlloc). 8-bit content maps losslessly into the 10-bit container (Main 4:4:4 10). */
 	if (info->format == VIDEO_FORMAT_BGRA) {
-		info->format = VIDEO_FORMAT_GBRA;
+		info->format = VIDEO_FORMAT_Y410;
 		info->range = VIDEO_RANGE_FULL;
 		info->colorspace = VIDEO_CS_SRGB;
 		return;
-	} else if (info->format == VIDEO_FORMAT_I444) {
-		info->format = VIDEO_FORMAT_AYUV;
-		return;
-	} else if (info->format == VIDEO_FORMAT_Y410) {
+	} else if (info->format == VIDEO_FORMAT_I444 || info->format == VIDEO_FORMAT_Y410) {
 		info->format = VIDEO_FORMAT_Y410;
 		return;
 	} else if (info->format == VIDEO_FORMAT_GBR10 || info->format == VIDEO_FORMAT_R10L) {
-		info->format = VIDEO_FORMAT_GBR10;
+		info->format = VIDEO_FORMAT_Y410;
 		info->range = VIDEO_RANGE_FULL;
 		/* Use SRGB for SDR */
 		if (info->colorspace != VIDEO_CS_2100_PQ && info->colorspace != VIDEO_CS_2100_HLG)
@@ -2113,7 +2151,14 @@ struct obs_encoder_info obs_qsv_hevc_encoder = {
 	.get_properties = obs_qsv_props_hevc,
 	.get_defaults = obs_qsv_defaults_hevc,
 	.get_extra_data = obs_qsv_extra_data,
-	.get_video_info = obs_qsv_video_plus_hdr_info,
+	/* Negotiate the same formats as the texture path. The QSV session's FourCC is derived from
+	 * voi->format at create() time (e.g. Y410 when the user picks 10-bit 4:4:4), so the raw
+	 * delivery format must match it exactly. The generic obs_qsv_video_plus_hdr_info only accepts
+	 * NV12/P010 and would hand 8-bit NV12 bytes to a Y410 session, which LoadY410() then misreads
+	 * as packed 10-bit 4:4:4 words -> hue-shifted output. With matching formats the raw connection
+	 * reuses the pre-bound GPU-conversion mix (RGBA16F -> XV30LE shader + staging surface) with no
+	 * per-frame CPU swscale stage. */
+	.get_video_info = obs_qsv_video_info_hevc_tex,
 	.caps = OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_INTERNAL | OBS_ENCODER_CAP_ROI,
 };
 

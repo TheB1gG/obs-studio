@@ -245,6 +245,15 @@ static inline void calc_gpu_conversion_sizes(struct obs_core_video_mix *video)
 			video->conversion_techs[0] = "Y410_PQ";
 		} else if (info->colorspace == VIDEO_CS_2100_HLG) {
 			video->conversion_techs[0] = "Y410_HLG";
+		} else if (info->colorspace == VIDEO_CS_SRGB && info->range == VIDEO_RANGE_FULL) {
+			/* Raw-RGB delivery marker: texture encoders that remap an RGB source to Y410 tag the
+			 * mix exactly (Y410, SRGB, FULL) - obs_qsv_video_info_hevc_tex does this for
+			 * BGRA/GBR10/R10L. The encoder writes MatrixCoefficients=0 (Identity), so repack the
+			 * display-encoded channels into the coded samples in GBR order (the component order
+			 * the "RGB" matrix actually uses) instead of converting to YUV. A real YUV 4:4:4
+			 * source tagged sRGB keeps its preferred range (Limited by default) and takes the
+			 * Y410_SRGB conversion below. */
+			video->conversion_techs[0] = "Y410_RGB";
 		} else {
 			video->conversion_techs[0] = "Y410_SRGB";
 		}

@@ -281,6 +281,17 @@ static inline bool format_conversion_is_lossless(enum video_format from, enum vi
 {
 	if (from == to)
 		return true;
+	/* Texture encoders may remap a requested format onto a different layout whose GPU
+	 * conversion shaders perform a real same-fidelity transform. QSV HEVC delivers all
+	 * 4:4:4 and RGB inputs as Y410: I444 is zero-extended from 8 to 10 bits and converted
+	 * RGB->YUV in-shader; BGRA/GBR10/R10L are repacked raw into the coded samples in GBR
+	 * order (the component order the Identity matrix actually uses) with an Identity-matrix
+	 * VUI. Accept these remaps; the generic rule below would reject
+	 * them (color family and/or bit depth). */
+	if (to == VIDEO_FORMAT_Y410 &&
+	    (from == VIDEO_FORMAT_I444 || from == VIDEO_FORMAT_BGRA || from == VIDEO_FORMAT_GBR10 ||
+	     from == VIDEO_FORMAT_R10L))
+		return true;
 	if (format_is_yuv(from) != format_is_yuv(to))
 		return false;
 	if (video_format_bit_depth(from) != video_format_bit_depth(to))

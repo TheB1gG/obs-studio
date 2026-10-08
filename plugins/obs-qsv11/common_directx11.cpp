@@ -380,6 +380,13 @@ mfxStatus simple_lock(mfxHDL pthis, mfxMemId mid, mfxFrameData *ptr)
 		ptr->Y = ptr->V + 2;
 		ptr->A = ptr->V + 3;
 		break;
+	case DXGI_FORMAT_Y410:
+		// Packed 10-bit 4:4:4 (one plane, 4 bytes/pixel). Expose the base
+		// pointer and pitch so LoadY410 can bulk-copy the frame; per-channel
+		// pointers are not needed for that path.
+		ptr->Pitch = (mfxU16)lockedRect.RowPitch;
+		ptr->Y = (mfxU8 *)lockedRect.pData;
+		break;
 	default:
 		return MFX_ERR_LOCK_MEMORY;
 	}

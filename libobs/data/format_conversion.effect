@@ -1462,6 +1462,21 @@ float4 PSY410_HLG(FragPos frag_in) : TARGET
 	return float4(u, y, v, 1.);
 }
 
+/* Raw RGB repack for HEVC Main 4:4:4 with MatrixCoefficients=0 (Identity/GBR): the coded
+ * samples must be G,B,R in (C0,C1,C2) order - the "RGB" matrix actually stores its
+ * components in GBR order (see FFmpeg's AVCOL_SPC_RGB: "order of coefficients is actually
+ * GBR"), full range, display-encoded. No color conversion is applied - the linear canvas
+ * values are gamma-encoded first (like PSY410_SRGB) and expanded losslessly into 10 bits.
+ * In this pipeline the R10G10B10A2 view's x/y/z components land in the Y410 surface's
+ * U/Y/V slots, which MFX encodes as coded C1/C0/C2 (the same mapping PSY410_SRGB relies
+ * on), so B,G,R are written into x,y,z to yield coded (G,B,R). */
+float4 PSY410_RGB(FragPos frag_in) : TARGET
+{
+	float4 rgba = image.Load(int3(frag_in.pos.xy, 0));
+	float3 rgb = srgb_linear_to_nonlinear(rgba.rgb);
+	return float4(rgb.b, rgb.g, rgb.r, 1.);
+}
+
 float4 PSGBR10_SRGB(FragPos frag_in) : TARGET
 {
 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
@@ -2528,6 +2543,15 @@ technique Y410_HLG
 	{
 		vertex_shader = VSPos(id);
 		pixel_shader  = PSY410_HLG(frag_in);
+	}
+}
+
+technique Y410_RGB
+{
+	pass
+	{
+		vertex_shader = VSPos(id);
+		pixel_shader  = PSY410_RGB(frag_in);
 	}
 }
 

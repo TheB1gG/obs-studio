@@ -165,7 +165,10 @@ int qsv_encoder_encode(qsv_t *pContext, uint64_t ts, uint8_t *pDataY, uint8_t *p
 	QSV_Encoder_Internal *pEncoder = (QSV_Encoder_Internal *)pContext;
 	mfxStatus sts = MFX_ERR_NONE;
 
-	if (pDataY != NULL && pDataUV != NULL)
+	/* Single-plane formats (Y410, AYUV) deliver data[1] == NULL, so the UV
+	 * pointer must not gate the encode call. Encode() dispatches on the
+	 * session FourCC and only uses pDataUV/strideUV for NV12/P010. */
+	if (pDataY != NULL)
 		sts = pEncoder->Encode(ts, pDataY, pDataUV, strideY, strideUV, pBS);
 
 	if (sts == MFX_ERR_NONE)

@@ -258,7 +258,12 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 		m_mfxEncParams.mfx.FrameInfo.ChromaFormat = MFX_CHROMAFORMAT_YUV444;
 		m_mfxEncParams.mfx.FrameInfo.BitDepthChroma = 10;
 		m_mfxEncParams.mfx.FrameInfo.BitDepthLuma = 10;
-		m_mfxEncParams.mfx.FrameInfo.Shift = 1;
+		// Y410 packs three 10-bit components into 32 bits per pixel (no 16-bit
+		// container), so -- like AYUV and unlike P010 -- the data is NOT
+		// left-shifted. Keep Shift at 0 to match upstream PR #13152; setting it
+		// to 1 makes the VPL driver misread the surface and fail the first
+		// encode with MFX_ERR_MEMORY (-7).
+		m_mfxEncParams.mfx.FrameInfo.Shift = 0;
 	} else {
 		m_mfxEncParams.mfx.FrameInfo.FourCC = MFX_FOURCC_NV12;
 		// Explicit 8-bit NV12 baseline (spec §6): do not leave bit depth at 0.
@@ -381,8 +386,12 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	// VP9 is excluded: generic Intel QSV lookahead BRC is unverified/unsupported
 	// for the low-power VP9 hardware path, so we never attach a LookAheadDepth to
 	// it (the OBS latency setting must not create hidden VP9 lookahead).
+	// HEVC is excluded too: on this Arc iGPU / oneVPL build, attaching a
+	// LookAheadDepth to the low-power HEVC main10 (P010) path makes the first
+	// EncodeFrameAsync fail, so keep lookahead disabled for HEVC as well.
 	if (pParams->nRateControl == MFX_RATECONTROL_CBR || pParams->nRateControl == MFX_RATECONTROL_VBR) {
-		if (pParams->nLADEPTH && m_mfxEncParams.mfx.LowPower == MFX_CODINGOPTION_ON && codec != QSV_CODEC_VP9) {
+		if (pParams->nLADEPTH && m_mfxEncParams.mfx.LowPower == MFX_CODINGOPTION_ON && codec != QSV_CODEC_VP9 &&
+		    codec != QSV_CODEC_HEVC) {
 			m_co2.LookAheadDepth = pParams->nLADEPTH;
 		}
 	}
@@ -1116,6 +1125,36 @@ mfxStatus QSV_Encoder_Internal::LoadNV12(mfxFrameSurface1 *pSurface, uint8_t *pD
 	return MFX_ERR_NONE;
 }
 
+mfxStatus QSV_Encoder_Internal::LoadY410(mfxFrameSurface1 *pSurface, uint8_t *pDataY, uint32_t strideY)
+{
+	mfxU16 w, h, i, pitch;
+	mfxU8 *ptr;
+	mfxFrameInfo *pInfo = &pSurface->Info;
+	mfxFrameData *pData = &pSurface->Data;
+
+	if (pInfo->CropH > 0 && pInfo->CropW > 0) {
+		w = pInfo->CropW;
+		h = pInfo->CropH;
+	} else {
+		w = pInfo->Width;
+		h = pInfo->Height;
+	}
+
+	// Y410 is a packed 4:4:4 format: every pixel occupies 32 bits (Y, U, V
+	// plus 2 spare bits), so the whole frame is a single plane of w*4 bytes
+	// per row. Copy it row-by-row honouring both the source stride and the
+	// destination pitch -- an opaque packed block, not planar Y/UV.
+	pitch = pData->Pitch;
+	ptr = pData->Y + pInfo->CropX * 4 + pInfo->CropY * pitch;
+	const size_t line_size = (size_t)w * 4;
+
+	for (i = 0; i < h; i++)
+		memcpy(ptr + i * pitch, pDataY + (size_t)i * strideY, line_size);
+
+	return MFX_ERR_NONE;
+}
+
+
 int QSV_Encoder_Internal::GetFreeTaskIndex(Task *pTaskPool, mfxU16 nPoolSize)
 {
 	if (pTaskPool)
@@ -1183,8 +1222,12 @@ mfxStatus QSV_Encoder_Internal::Encode(uint64_t ts, uint8_t *pDataY, uint8_t *pD
 		MSDK_CHECK_RESULT(sts, MFX_ERR_NONE, sts);
 	}
 
-	sts = (pSurface->Info.FourCC == MFX_FOURCC_P010) ? LoadP010(pSurface, pDataY, pDataUV, strideY, strideUV)
-							 : LoadNV12(pSurface, pDataY, pDataUV, strideY, strideUV);
+	if (pSurface->Info.FourCC == MFX_FOURCC_P010)
+		sts = LoadP010(pSurface, pDataY, pDataUV, strideY, strideUV);
+	else if (pSurface->Info.FourCC == MFX_FOURCC_Y410)
+		sts = LoadY410(pSurface, pDataY, strideY);
+	else
+		sts = LoadNV12(pSurface, pDataY, pDataUV, strideY, strideUV);
 
 	MSDK_CHECK_RESULT(sts, MFX_ERR_NONE, sts);
 	pSurface->Data.TimeStamp = ts;

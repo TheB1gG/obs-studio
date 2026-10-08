@@ -316,6 +316,15 @@ static enum encoder_mix_acquire acquire_encoder_only_mix(struct obs_encoder *enc
 					     get_video_format_name(encoder_info.format),
 					     get_video_format_name(format));
 					format = encoder_info.format;
+
+					/* The remapped texture layout dictates the color semantics: e.g. a raw-RGB
+					 * repack must be tagged SRGB/full-range so libobs selects the identity
+					 * conversion and the encoder writes an Identity-matrix VUI, while a YUV
+					 * repack keeps the user's colorspace/range preference. The callback was
+					 * seeded with our preferred values before the call, so adopting them only
+					 * changes what the encoder explicitly changed for this layout. */
+					space = encoder_info.colorspace;
+					range = encoder_info.range;
 				} else {
 					/* Lossy conversion: the encoder cannot handle the requested format via texture. */
 					blog(LOG_ERROR,
