@@ -1,0 +1,342 @@
+name: Test Tag
+run-name: Test build ${{ github.ref_name }} 🧪
+on:
+  push:
+    tags:
+      - 'test-*'
+permissions:
+  contents: write
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.ref }}'
+jobs:
+  validate-tag:
+    name: Validate Tag Schema ☑️
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Check Tag Name ☑️
+        run: |
+          : Check Tag Name ☑️
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+
+          # Test tags must be "test-" followed by the problem being fixed or the
+          # feature being added. Git tag names cannot contain whitespace, and this
+          # check additionally enforces a compact, filesystem-safe suffix.
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^test-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error::Invalid test tag '${GITHUB_REF_NAME}'. Use the schema 'test-<problem-or-feature>' without whitespace, e.g. 'test-qsv-hevc-444-colors'."
+            exit 1
+          fi
+
+  check-event:
+    name: Event Data 🔎
+    runs-on: ubuntu-26.04
+    needs: validate-tag
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      package: ${{ steps.setup.outputs.package }}
+      config: ${{ steps.setup.outputs.config }}
+      commitHash: ${{ steps.setup.outputs.commitHash }}
+    steps:
+      - name: Check Event Data ☑️
+        id: setup
+        run: |
+          : Check Event Data ☑️
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+
+          # Test tags are verification builds only: always package, never Release.
+          echo 'package=true' >> $GITHUB_OUTPUT
+          echo 'config=RelWithDebInfo' >> $GITHUB_OUTPUT
+          echo "commitHash=${GITHUB_SHA:0:9}" >> $GITHUB_OUTPUT
+
+  macos-build:
+    name: macOS 🍏
+    runs-on: macos-26
+    needs: check-event
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [arm64, x86_64]
+    defaults:
+      run:
+        shell: zsh --no-rcs --errexit --pipefail {0}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set Up Environment 🔧
+        id: setup
+        run: |
+          : Set Up Environment 🔧
+          if (( ${+RUNNER_DEBUG} )) setopt XTRACE
+
+          print '::group::Enable Xcode 26.5'
+          sudo xcode-select --switch /Applications/Xcode_26.5.app/Contents/Developer
+          print '::endgroup::'
+
+          print '::group::Clean Homebrew Environment'
+          local -a unwanted_formulas=()
+          local -a remove_formulas=()
+          for formula (${unwanted_formulas}) {
+            if [[ -d ${HOMEBREW_PREFIX}/Cellar/${formula} ]] remove_formulas+=(${formula})
+          }
+
+          if (( #remove_formulas )) brew uninstall --ignore-dependencies ${remove_formulas}
+          print '::endgroup::'
+
+          local -A arch_names=(x86_64 intel arm64 apple)
+          print "cpuName=${arch_names[${{ matrix.target }}]}" >> $GITHUB_OUTPUT
+
+          local xcode_cas_path="${HOME}/Library/Developer/Xcode/DerivedData/CompilationCache.noindex"
+
+          if ! [[ -d ${xcode_cas_path} ]] mkdir -p ${xcode_cas_path}
+
+          print "xcodeCasPath=${xcode_cas_path}" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: xcode-cache
+        with:
+          path: ${{ steps.setup.outputs.xcodeCasPath }}
+          key: ${{ runner.os }}-xcode-${{ matrix.target }}-${{ needs.check-event.outputs.config }}
+          restore-keys: |
+            ${{ runner.os }}-xcode-${{ matrix.target }}-
+
+      - name: Build OBS Studio 🧱
+        uses: ./.github/actions/build-obs
+        env:
+          TWITCH_CLIENTID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_HASH: ${{ secrets.TWITCH_HASH }}
+          RESTREAM_CLIENTID: ${{ secrets.RESTREAM_CLIENTID }}
+          RESTREAM_HASH: ${{ secrets.RESTREAM_HASH }}
+          YOUTUBE_CLIENTID: ${{ secrets.YOUTUBE_CLIENTID }}
+          YOUTUBE_CLIENTID_HASH: ${{ secrets.YOUTUBE_CLIENTID_HASH }}
+          YOUTUBE_SECRET: ${{ secrets.YOUTUBE_SECRET }}
+          YOUTUBE_SECRET_HASH: ${{ secrets.YOUTUBE_SECRET_HASH }}
+          XCODE_CAS_PATH: ${{ steps.setup.outputs.xcodeCasPath }}
+        with:
+          target: ${{ matrix.target }}
+          config: ${{ needs.check-event.outputs.config }}
+
+      - name: Package OBS Studio 📀
+        uses: ./.github/actions/package-obs
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        with:
+          target: ${{ matrix.target }}
+          config: ${{ needs.check-event.outputs.config }}
+          package: ${{ fromJSON(needs.check-event.outputs.package) }}
+
+      - name: Upload Artifacts 📡
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        with:
+          name: obs-studio-macos-${{ matrix.target }}-${{ needs.check-event.outputs.commitHash }}
+          path: ${{ github.workspace }}/build_macos/obs-studio-*-macos-${{ steps.setup.outputs.cpuName }}.*
+
+      - name: Upload Debug Symbol Artifacts 🪲
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ needs.check-event.outputs.config == 'Release' }}
+        with:
+          name: obs-studio-macos-${{ matrix.target }}-${{ needs.check-event.outputs.commitHash }}-dSYMs
+          path: ${{ github.workspace }}/build_macos/obs-studio-*-macos-${{ steps.setup.outputs.cpuName }}-dSYMs.tar.xz
+
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        if: github.event_name != 'pull_request' && steps.xcode-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ steps.setup.outputs.xcodeCasPath }}
+          key: ${{ runner.os }}-xcode-${{ matrix.target }}-${{ needs.check-event.outputs.config }}
+  ubuntu-build:
+    name: Ubuntu 🐧
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    needs: check-event
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: ccache-cache
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ${{ runner.os }}-${{ matrix.os }}-ccache-x86_64-${{ needs.check-event.outputs.config }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.os }}-ccache-x86_64-
+
+      - name: Build OBS Studio 🧱
+        uses: ./.github/actions/build-obs
+        env:
+          TWITCH_CLIENTID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_HASH: ${{ secrets.TWITCH_HASH }}
+          RESTREAM_CLIENTID: ${{ secrets.RESTREAM_CLIENTID }}
+          RESTREAM_HASH: ${{ secrets.RESTREAM_HASH }}
+          YOUTUBE_CLIENTID: ${{ secrets.YOUTUBE_CLIENTID }}
+          YOUTUBE_CLIENTID_HASH: ${{ secrets.YOUTUBE_CLIENTID_HASH }}
+          YOUTUBE_SECRET: ${{ secrets.YOUTUBE_SECRET }}
+          YOUTUBE_SECRET_HASH: ${{ secrets.YOUTUBE_SECRET_HASH }}
+        with:
+          target: x86_64
+          config: ${{ needs.check-event.outputs.config }}
+
+      - name: Package OBS Studio 📀
+        uses: ./.github/actions/package-obs
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        with:
+          target: x86_64
+          config: ${{ needs.check-event.outputs.config }}
+          package: ${{ fromJSON(needs.check-event.outputs.package) }}
+
+      - name: Upload Source Tarball 🗜️
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        with:
+          name: obs-studio-${{ matrix.os }}-sources-${{ needs.check-event.outputs.commitHash }}
+          path: ${{ github.workspace }}/build_ubuntu/obs-studio-*-sources.*
+
+      - name: Upload Artifacts 📡
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        with:
+          name: obs-studio-${{ matrix.os }}-x86_64-${{ needs.check-event.outputs.commitHash }}
+          path: ${{ github.workspace }}/build_ubuntu/obs-studio-*-x86_64-ubuntu-gnu.*
+
+      - name: Upload Debug Symbol Artifacts 🪲
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        with:
+          name: obs-studio-${{ matrix.os }}-x86_64-${{ needs.check-event.outputs.commitHash }}-dbgsym
+          path: ${{ github.workspace }}/build_ubuntu/obs-studio-*-x86_64-ubuntu-gnu-dbgsym.ddeb
+
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        if: github.event_name != 'pull_request' && steps.ccache-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ${{ runner.os }}-${{ matrix.os }}-ccache-x86_64-${{ needs.check-event.outputs.config }}
+
+  windows-build:
+    name: Windows 🪟
+    strategy:
+      matrix:
+        architecture: [x64, arm64]
+    runs-on: windows-2025-vs2026
+    needs: check-event
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Build OBS Studio 🧱
+        uses: ./.github/actions/build-obs
+        env:
+          TWITCH_CLIENTID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_HASH: ${{ secrets.TWITCH_HASH }}
+          RESTREAM_CLIENTID: ${{ secrets.RESTREAM_CLIENTID }}
+          RESTREAM_HASH: ${{ secrets.RESTREAM_HASH }}
+          YOUTUBE_CLIENTID: ${{ secrets.YOUTUBE_CLIENTID }}
+          YOUTUBE_CLIENTID_HASH: ${{ secrets.YOUTUBE_CLIENTID_HASH }}
+          YOUTUBE_SECRET: ${{ secrets.YOUTUBE_SECRET }}
+          YOUTUBE_SECRET_HASH: ${{ secrets.YOUTUBE_SECRET_HASH }}
+          GPU_PRIORITY_VAL: ${{ secrets.GPU_PRIORITY_VAL }}
+        with:
+          target: ${{ matrix.architecture }}
+          config: ${{ needs.check-event.outputs.config }}
+
+      - name: Package OBS Studio 📀
+        uses: ./.github/actions/package-obs
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        with:
+          target: ${{ matrix.architecture }}
+          config: ${{ needs.check-event.outputs.config }}
+          package: ${{ fromJSON(needs.check-event.outputs.package) }}
+
+      - name: Upload Artifacts 📡
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        with:
+          name: obs-studio-windows-${{ matrix.architecture }}-${{ needs.check-event.outputs.commitHash }}
+          path: ${{ github.workspace }}/build_${{ matrix.architecture }}/obs-studio-*-windows-${{ matrix.architecture }}.zip
+
+  create-release:
+    name: Create Test Release 🛫
+    runs-on: ubuntu-26.04
+    needs: [macos-build, ubuntu-build, windows-build]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download Build Artifacts 📥
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+
+      - name: Rename Files 🏷️
+        run: |
+          : Rename Files 🏷️
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+
+          root_dir="${PWD}"
+
+          tag_name="${GITHUB_REF_NAME}"
+          commit_hash="${GITHUB_SHA:0:9}"
+          macos_arm64_artifact_name="obs-studio-macos-arm64-${commit_hash}"
+          macos_intel_artifact_name="obs-studio-macos-x86_64-${commit_hash}"
+          ubuntu_2604_x86_64_artifact_name="obs-studio-ubuntu-26.04-x86_64-${commit_hash}"
+          ubuntu_2604_x86_64_debug_name="obs-studio-ubuntu-26.04-x86_64-${commit_hash}-dbgsym"
+          ubuntu_2604_sources_name="obs-studio-ubuntu-26.04-sources-${commit_hash}"
+          windows_x64_artifact_name="obs-studio-windows-x64-${commit_hash}"
+          windows_arm64_artifact_name="obs-studio-windows-arm64-${commit_hash}"
+
+          echo '::group::Renaming Artifacts'
+          mv -v "${macos_arm64_artifact_name}/"obs-studio-*-macos-apple.dmg \
+            "${root_dir}"/OBS-Studio-${tag_name}-macOS-Apple.dmg
+          mv -v "${macos_intel_artifact_name}/"obs-studio-*-macos-intel.dmg \
+            "${root_dir}"/OBS-Studio-${tag_name}-macOS-Intel.dmg
+          mv -v "${ubuntu_2604_x86_64_artifact_name}/"obs-studio-*-x86_64-ubuntu-gnu.deb \
+            "${root_dir}"/OBS-Studio-${tag_name}-Ubuntu-26.04-x86_64.deb
+          mv -v "${ubuntu_2604_x86_64_debug_name}/"obs-studio-*-x86_64-ubuntu-gnu-dbgsym.ddeb \
+            "${root_dir}"/OBS-Studio-${tag_name}-Ubuntu-26.04-x86_64-dbsym.ddeb
+          mv -v "${ubuntu_2604_sources_name}/"obs-studio-*-sources.tar.gz \
+            "${root_dir}"/OBS-Studio-${tag_name}-Sources.tar.gz
+          mv -v "${windows_x64_artifact_name}/"obs-studio-*-windows-x64.zip \
+            "${root_dir}"/OBS-Studio-${tag_name}-Windows-x64.zip
+          mv -v "${windows_arm64_artifact_name}/"obs-studio-*-windows-arm64.zip \
+            "${root_dir}"/OBS-Studio-${tag_name}-Windows-arm64.zip
+          echo '::endgroup::'
+
+      - name: Generate Checksums 🪪
+        run: |
+          : Generate Checksums 🪪
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          shopt -s extglob
+
+          echo "### Checksums" > ${{ github.workspace }}/CHECKSUMS.txt
+          for file in ${{ github.workspace }}/@(*.deb|*.ddeb|*.dmg|*.tar.xz|*.tar.gz|*.exe|*.zip); do
+            echo "    ${file##*/}: $(sha256sum "${file}" | cut -d " " -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
+          done
+
+      - name: Create Test Release 🛫
+        id: create_release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          draft: false # Public by default so the test build is immediately visible/downloadable
+          tag_name: ${{ github.ref_name }}
+          name: Test build ${{ github.ref_name }}
+          body_path: ${{ github.workspace }}/CHECKSUMS.txt
+          files: |
+            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-macOS-*.dmg
+            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-Ubuntu-*.deb
+            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-Ubuntu-*.ddeb
+            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-Sources.tar.gz
+            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-Windows-x64.zip
+            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-Windows-arm64.zip
+
