@@ -5,7 +5,7 @@ on:
     tags:
       - 'test-*'
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: '${{ github.workflow }} @ ${{ github.ref }}'
 jobs:
@@ -267,76 +267,3 @@ jobs:
         with:
           name: obs-studio-windows-${{ matrix.architecture }}-${{ needs.check-event.outputs.commitHash }}
           path: ${{ github.workspace }}/build_${{ matrix.architecture }}/obs-studio-*-windows-${{ matrix.architecture }}.zip
-
-  create-release:
-    name: Create Test Release 🛫
-    runs-on: ubuntu-26.04
-    needs: [macos-build, ubuntu-build, windows-build]
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Download Build Artifacts 📥
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-
-      - name: Rename Files 🏷️
-        run: |
-          : Rename Files 🏷️
-          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-
-          root_dir="${PWD}"
-
-          tag_name="${GITHUB_REF_NAME}"
-          commit_hash="${GITHUB_SHA:0:9}"
-          macos_arm64_artifact_name="obs-studio-macos-arm64-${commit_hash}"
-          macos_intel_artifact_name="obs-studio-macos-x86_64-${commit_hash}"
-          ubuntu_2604_x86_64_artifact_name="obs-studio-ubuntu-26.04-x86_64-${commit_hash}"
-          ubuntu_2604_x86_64_debug_name="obs-studio-ubuntu-26.04-x86_64-${commit_hash}-dbgsym"
-          ubuntu_2604_sources_name="obs-studio-ubuntu-26.04-sources-${commit_hash}"
-          windows_x64_artifact_name="obs-studio-windows-x64-${commit_hash}"
-          windows_arm64_artifact_name="obs-studio-windows-arm64-${commit_hash}"
-
-          echo '::group::Renaming Artifacts'
-          mv -v "${macos_arm64_artifact_name}/"obs-studio-*-macos-apple.dmg \
-            "${root_dir}"/OBS-Studio-${tag_name}-macOS-Apple.dmg
-          mv -v "${macos_intel_artifact_name}/"obs-studio-*-macos-intel.dmg \
-            "${root_dir}"/OBS-Studio-${tag_name}-macOS-Intel.dmg
-          mv -v "${ubuntu_2604_x86_64_artifact_name}/"obs-studio-*-x86_64-ubuntu-gnu.deb \
-            "${root_dir}"/OBS-Studio-${tag_name}-Ubuntu-26.04-x86_64.deb
-          mv -v "${ubuntu_2604_x86_64_debug_name}/"obs-studio-*-x86_64-ubuntu-gnu-dbgsym.ddeb \
-            "${root_dir}"/OBS-Studio-${tag_name}-Ubuntu-26.04-x86_64-dbsym.ddeb
-          mv -v "${ubuntu_2604_sources_name}/"obs-studio-*-sources.tar.gz \
-            "${root_dir}"/OBS-Studio-${tag_name}-Sources.tar.gz
-          mv -v "${windows_x64_artifact_name}/"obs-studio-*-windows-x64.zip \
-            "${root_dir}"/OBS-Studio-${tag_name}-Windows-x64.zip
-          mv -v "${windows_arm64_artifact_name}/"obs-studio-*-windows-arm64.zip \
-            "${root_dir}"/OBS-Studio-${tag_name}-Windows-arm64.zip
-          echo '::endgroup::'
-
-      - name: Generate Checksums 🪪
-        run: |
-          : Generate Checksums 🪪
-          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          shopt -s extglob
-
-          echo "### Checksums" > ${{ github.workspace }}/CHECKSUMS.txt
-          for file in ${{ github.workspace }}/@(*.deb|*.ddeb|*.dmg|*.tar.xz|*.tar.gz|*.exe|*.zip); do
-            echo "    ${file##*/}: $(sha256sum "${file}" | cut -d " " -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
-          done
-
-      - name: Create Test Release 🛫
-        id: create_release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
-        with:
-          draft: false # Public by default so the test build is immediately visible/downloadable
-          tag_name: ${{ github.ref_name }}
-          name: Test build ${{ github.ref_name }}
-          body_path: ${{ github.workspace }}/CHECKSUMS.txt
-          files: |
-            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-macOS-*.dmg
-            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-Ubuntu-*.deb
-            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-Ubuntu-*.ddeb
-            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-Sources.tar.gz
-            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-Windows-x64.zip
-            ${{ github.workspace }}/OBS-Studio-${{ github.ref_name }}-Windows-arm64.zip
-

@@ -74,9 +74,8 @@ on all supported platforms by running CI on a test tag:
    - `git tag test-... <commit> && git push origin test-...`
 3. Wait for the "Test Tag" workflow (`.github/workflows/test-tag.yaml`) to
    finish green. It builds Windows (x64/arm64), macOS (arm64/x86_64) and
-   Ubuntu 26.04 - no Flatpak - and publishes a **public GitHub Release** with
-   the built artifacts attached to the test tag, so the build is immediately
-   visible and downloadable for verification.
+   Ubuntu 26.04 - no Flatpak. The built artifacts are available on the
+   workflow run page (Actions → run → Artifacts) for verification.
 4. Only after the build succeeds, push the branch/commit to the repository.
 5. After the changes have been pushed, delete the test tag again (mandatory -
    test tags are a temporary CI gate, not part of the release history):
