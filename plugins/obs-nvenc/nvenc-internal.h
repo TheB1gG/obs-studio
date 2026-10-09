@@ -107,6 +107,12 @@ struct nvenc_data {
 	bool reconfig_pending;
 	int64_t frames_since_idr; /* submitted frames since last observed IDR packet */
 
+	/* ABR quality-aim changes are applied without reset/IDR (the same soft
+	 * mechanism the ABR governor uses for maxBitRate), so they can fire on any
+	 * frame - no keyframe alignment needed. Staged to the encode thread like
+	 * reconfig_pending (see nvenc_update / nvenc_encode_base). */
+	bool tq_soft_pending;
+
 	/* ABR governor (ABR mode only): runs NVENC in QVBR (averageBitRate=0) so the
 	 * driver's sustained-rate cap of min(maxBitRate, 2*averageBitRate) doesn't
 	 * apply, then adapts maxBitRate at runtime so the long-term average tracks
@@ -116,6 +122,8 @@ struct nvenc_data {
 	double   abr_total_time;  /* cumulative stream seconds */
 	double   abr_acc_time;    /* stream seconds accumulated since last adjustment */
 	uint32_t abr_max_rate;    /* currently applied maxBitRate (bps) */
+	NV_ENC_QP preset_min_qp;        /* rcParams.minQP from the preset config (restored on live switch away from ABR) */
+	bool      preset_enable_min_qp; /* rcParams.enableMinQP from the preset config */
 
 #ifdef _WIN32
 	DARRAY(struct nv_texture) textures;

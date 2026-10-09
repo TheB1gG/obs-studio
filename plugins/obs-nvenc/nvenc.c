@@ -8,11 +8,11 @@
 
 #define EXTRA_BUFFERS 5
 
-/* ABR (Adaptive Bitrate) mode: QVBR quality aim. 1 = best-quality target that is
- * valid across H.264/HEVC (range 0-51) and AV1 (where 0 means "automatic", so 1 is
- * the true best-quality setting). The ABR governor adapts maxBitRate to track the
- * user's target bitrate, so this only sets how aggressively the encoder spends bits. */
-#define ABR_TARGET_QUALITY 1
+/* ABR mode QP floor: the rate controller never encodes below this QP, so easy
+ * content can't spend the bitrate budget on quality above QP 24 - the budget is
+ * left for complex scenes. Applied at session create (and on live switch into
+ * ABR); the preset default is restored when switching away from ABR. */
+#define ABR_MIN_QP 24
 
 #ifndef _WIN32
 #define min(a, b) (((a) < (b)) ? (a) : (b))
@@ -187,6 +187,32 @@ static bool apply_nvenc_reconfigure(struct nvenc_data *enc)
 	     (unsigned)enc->next_bitstream, (unsigned)enc->buf_count,
 	     (unsigned)enc->output_delay, (int)enc->first_packet);
 
+	return true;
+}
+
+/* Applies the staged NV_ENC_CONFIG WITHOUT resetting encoder state and without
+ * forcing an IDR: used for pure rate-control parameter updates (ABR quality
+ * aim). Mirrors the soft reconfigure the ABR governor does for maxBitRate every
+ * second. No in-flight frames are discarded, so no bookkeeping rewind or buffer
+ * re-creation is needed. Must run on the encode thread while streaming (between
+ * frame submissions), or any time when the encoder is inactive. */
+static bool apply_nvenc_reconfigure_soft(struct nvenc_data *enc)
+{
+	NV_ENC_RECONFIGURE_PARAMS params = {0};
+	params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+	params.reInitEncodeParams = enc->params; // carries enc->config (encodeConfig)
+	params.resetEncoder = 0;                 // keep rate-control state, no IDR needed
+	params.forceIDR = 0;
+
+	NVENCSTATUS err = nv.nvEncReconfigureEncoder(enc->session, &params);
+	nvenc_trace_reconfigure(enc, __FUNCTION__, &params, err);
+	if (NV_FAILED(err)) {
+		error("soft reconfigure failed (reset=0 forceIDR=0): encoder keeps previous settings");
+		return false;
+	}
+
+	info("soft reconfigure applied (reset=0 forceIDR=0): queued=%u output_delay=%u",
+	     (unsigned)enc->buffers_queued, (unsigned)enc->output_delay);
 	return true;
 }
 
@@ -469,10 +495,15 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 			   config->rcParams.averageBitRate == 0;
 	bool cq_state = qvbr_config && !enc->abr_active; /* currently CQVBR (not ABR) */
 
-	bool rc_changed =
+	/* CQVBR and ABR are both quality-driven VBR (averageBitRate=0): the
+	 * "target_quality" setting maps to rcParams.targetQuality in both. */
+	bool tq_changed = (cq_vbr || abr) && config->rcParams.targetQuality != (uint8_t)tq_val;
+
+	bool rc_mode_changed =
 		desired_mode != config->rcParams.rateControlMode || (cq_vbr != cq_state) || (abr != enc->abr_active) ||
-		(desired_mode == NV_ENC_PARAMS_RC_CONSTQP && (int64_t)config->rcParams.constQP.qpIntra != cqp_scaled) ||
-		(cq_vbr && config->rcParams.targetQuality != (uint8_t)tq_val);
+		(desired_mode == NV_ENC_PARAMS_RC_CONSTQP && (int64_t)config->rcParams.constQP.qpIntra != cqp_scaled);
+
+	bool rc_changed = rc_mode_changed || tq_changed;
 
 	bool br_changed = enc->can_change_bitrate &&
 			  (enc->props.bitrate != bitrate || enc->props.max_bitrate != max_bitrate);
@@ -503,15 +534,52 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 			dstr_cat(&change_desc, ", ");
 		dstr_catf(&change_desc, "RC %s", rc_name ? rc_name : "?");
 	}
+	if (tq_changed) {
+		if (change_desc.array)
+			dstr_cat(&change_desc, ", ");
+		dstr_catf(&change_desc, "quality %u -> %lld", (unsigned)config->rcParams.targetQuality, (long long)tq_val);
+	}
 
 	if (!rc_changed && !br_changed && !fps_changed)
 		return true; // nothing to do - avoids needless encoder reset + IDR churn
 
+	/* A pure quality-aim change in ABR mode is a rate-control parameter update,
+	 * like the maxBitRate updates the ABR governor makes every second: no reset
+	 * and no IDR are needed, so it fires on the next frame without keyframe
+	 * alignment. CQVBR keeps the staged RC reconfigure path below. */
+	if (abr && tq_changed && !rc_mode_changed && !br_changed && !fps_changed) {
+		uint8_t old_tq = config->rcParams.targetQuality;
+		enc->config.rcParams.targetQuality = (uint8_t)tq_val;
+		info("changing ABR quality target from %u to %lld while streaming (soft reconfigure, no IDR)",
+		     (unsigned)old_tq, (long long)tq_val);
+
+		if (!obs_encoder_active(enc->encoder)) {
+			if (!apply_nvenc_reconfigure_soft(enc)) {
+				enc->config.rcParams.targetQuality = old_tq;
+				return false;
+			}
+		} else {
+			enc->tq_soft_pending = true;
+		}
+
+		enc->props.target_quality = tq_val;
+		return true;
+	}
+
 	/* --- apply desired state --------------------------------------------- */
 
 	if (rc_changed) {
-		info("switching rate control from %s to %s while streaming (forced IDR)",
-		     nvenc_rc_mode_name(config->rcParams.rateControlMode), nvenc_rc_mode_name(desired_mode));
+		bool mode_switch = desired_mode != config->rcParams.rateControlMode || (cq_vbr != cq_state) ||
+				   (abr != enc->abr_active);
+
+		if (mode_switch)
+			info("switching rate control from %s to %s while streaming (forced IDR)",
+			     nvenc_rc_mode_name(config->rcParams.rateControlMode), nvenc_rc_mode_name(desired_mode));
+		else if (tq_changed)
+			info("changing quality target from %u to %lld while streaming (forced IDR)",
+			     (unsigned)config->rcParams.targetQuality, (long long)tq_val);
+		else
+			info("changing rate-control settings while streaming (forced IDR)");
 
 		config->rcParams.rateControlMode = desired_mode;
 		config->rcParams.averageBitRate = (uint32_t)bitrate * 1000;
@@ -527,7 +595,7 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 			config->rcParams.averageBitRate = 0;
 			config->rcParams.vbvBufferSize = 0;
 		} else if (abr) {
-			config->rcParams.targetQuality = ABR_TARGET_QUALITY;
+			config->rcParams.targetQuality = (uint8_t)tq_val;
 			config->rcParams.averageBitRate = 0;
 			config->rcParams.vbvBufferSize = 0;
 			/* Open at the target (mirror init_encoder_base): governor raises toward max. */
@@ -536,6 +604,19 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 			enc->abr_total_time = 0.0;
 			enc->abr_acc_time = 0.0;
 			enc->abr_max_rate = config->rcParams.maxBitRate;
+		}
+
+		/* ABR raises the QP floor to ABR_MIN_QP (see init_encoder_base); restore the
+		 * preset default when leaving ABR so other modes keep stock behavior. */
+		if (abr) {
+			const uint32_t abr_min_qp = enc->codec == CODEC_AV1 ? ABR_MIN_QP * 4 : ABR_MIN_QP;
+			config->rcParams.enableMinQP = 1;
+			config->rcParams.minQP.qpInterP = abr_min_qp;
+			config->rcParams.minQP.qpInterB = abr_min_qp;
+			config->rcParams.minQP.qpIntra = abr_min_qp;
+		} else {
+			config->rcParams.enableMinQP = enc->preset_enable_min_qp;
+			config->rcParams.minQP = enc->preset_min_qp;
 		}
 
 		enc->abr_active = abr; /* track ABR state for governor + future change detection */
@@ -564,7 +645,7 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 	enc->props.max_bitrate = max_bitrate;
 	if (cqp) {
 		enc->props.cqp = cqp_val;
-	} else if (cq_vbr) {
+	} else if (cq_vbr || abr) {
 		enc->props.target_quality = tq_val;
 	}
 
@@ -830,6 +911,10 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 	/* main configuration         */
 
 	enc->config = preset_config.presetCfg;
+	/* Remember the preset's QP floor so a live switch away from ABR can restore it
+	 * (ABR raises rcParams.minQP to ABR_MIN_QP below). */
+	enc->preset_min_qp = enc->config.rcParams.minQP;
+	enc->preset_enable_min_qp = enc->config.rcParams.enableMinQP != 0;
 
 	int keyint = (int)enc->props.keyint_sec * voi->fps_num / voi->fps_den;
 	get_user_arg_int(enc, "keyint", &keyint);
@@ -961,8 +1046,17 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 		config->rcParams.vbvBufferSize = 0;
 	} else if (abr) {
 		/* ABR: QVBR (averageBitRate=0) so the driver's 2x-average cap doesn't apply,
-		 * plus a runtime governor that adapts maxBitRate to track the target bitrate. */
-		config->rcParams.targetQuality = ABR_TARGET_QUALITY;
+		 * plus a runtime governor that adapts maxBitRate to track the target bitrate.
+		 * The quality aim is user-configurable via "target_quality" like CQVBR. */
+		config->rcParams.targetQuality = (uint8_t)enc->props.target_quality;
+		/* QP floor: easy content stops at ABR_MIN_QP instead of burning the budget on
+		 * ultra-low QPs - see ABR_MIN_QP. AV1 QP fields use the 4x user-QP scale,
+		 * like cqp does. */
+		const uint32_t abr_min_qp = enc->codec == CODEC_AV1 ? ABR_MIN_QP * 4 : ABR_MIN_QP;
+		config->rcParams.enableMinQP = 1;
+		config->rcParams.minQP.qpInterP = abr_min_qp;
+		config->rcParams.minQP.qpInterB = abr_min_qp;
+		config->rcParams.minQP.qpIntra = abr_min_qp;
 		config->rcParams.averageBitRate = 0;
 		config->rcParams.vbvBufferSize = 0;
 		/* Open at the target, not the max: the governor raises the cap toward the
@@ -1000,9 +1094,11 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 		dstr_catf(&log, "\tvbv_buffer:   %u kbps\n", config->rcParams.vbvBufferSize / 1000);
 	if (cqp)
 		dstr_catf(&log, "\tcqp:          %lld\n", (long long)enc->props.cqp);
-	if (cqvbr) {
+	if (cqvbr || abr) {
 		dstr_catf(&log, "\tcq:           %lld\n", (long long)enc->props.target_quality);
 	}
+	if (abr)
+		dstr_catf(&log, "\tmin_qp:       %u\n", ABR_MIN_QP);
 
 	dstr_catf(&log, "\tkeyint:       %d\n", gop_size);
 	dstr_catf(&log, "\tpreset:       %s\n", enc->props.preset);
@@ -2045,6 +2141,15 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 		}
 	}
 
+
+	/* Soft RC-parameter change (ABR quality aim): no reset, no IDR, so it can
+	 * fire immediately on any frame - no keyframe alignment needed. */
+	if (enc->tq_soft_pending) {
+		info("applying soft quality reconfigure (reset=0 forceIDR=0) pts=%lld", (long long)pts);
+		if (!apply_nvenc_reconfigure_soft(enc))
+			warn("soft quality reconfigure failed; keeping previous target quality");
+		enc->tq_soft_pending = false;
+	}
 
 	/* Count submissions since last observed IDR. get_encoded_packet() */
 	/* only starts returning packets once buffers_queued reaches       */

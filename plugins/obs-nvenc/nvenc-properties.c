@@ -101,7 +101,7 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs
 	p = obs_properties_get(ppts, "max_bitrate");
 	obs_property_set_visible(p, vbr || cqvbr || abr);
 	p = obs_properties_get(ppts, "target_quality");
-	obs_property_set_visible(p, cqvbr);
+	obs_property_set_visible(p, cqvbr || abr);
 	p = obs_properties_get(ppts, "cqp");
 	obs_property_set_visible(p, cqp);
 	p = obs_properties_get(ppts, "preset");
@@ -120,6 +120,14 @@ obs_properties_t *nvenc_properties_internal(enum codec_type codec)
 	obs_property_t *p;
 
 	struct encoder_caps *caps = get_encoder_caps(codec);
+
+	/* Encoder properties show no preview in the Properties dialog, so the
+	 * per-tick "visual update" path (OBSPropertiesView calls obs_source_update
+	 * on every control change) only makes a running encoder reconfigure on
+	 * every slider move - before the user clicks OK. Defer updates so the
+	 * settings are applied exactly once when the dialog is accepted; Cancel
+	 * restores the previous values without touching the encoder. */
+	obs_properties_set_flags(props, OBS_PROPERTIES_DEFER_UPDATE);
 
 	p = obs_properties_add_list(props, "rate_control", obs_module_text("RateControl"), OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_STRING);
