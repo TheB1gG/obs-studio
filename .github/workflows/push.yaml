@@ -21,6 +21,10 @@ jobs:
 
   build-project:
     name: Build 🧱
+    # Test tags (test-*) are handled by the Test Tag workflow only; skip the
+    # full push build for them. create-release needs this job, so it is
+    # skipped as well.
+    if: ${{ !startsWith(github.ref_name, 'test-') }}
     uses: ./.github/workflows/build-project.yaml
     secrets: inherit
     permissions:
