@@ -41,9 +41,6 @@ jobs:
             workflow_dispatch)
               config_data=('package:false' 'config:RelWithDebInfo')
               ;;
-            schedule)
-              config_data=('package:true' 'config:RelWithDebInfo')
-              ;;
             *) ;;
           esac
 
