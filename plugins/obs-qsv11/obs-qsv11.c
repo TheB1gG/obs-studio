@@ -60,9 +60,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <util/darray.h>
 #include <util/platform.h>
 #include <util/threading.h>
+#include <util/base.h>
 #include <obs-module.h>
 #include <obs-hevc.h>
 #include <obs-avc.h>
+#include <abr-gov.h>
 
 #include "QSV_Encoder.h"
 #include "common_utils.h"
@@ -79,7 +81,23 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define GS_INVALID_HANDLE (uint32_t) - 1
 #endif
 
+/* Number of emitted packets after a live re-init for which the DTS regression check
+ * is suppressed (see struct obs_qsv::dts_suppress). Covers MFX's initial B-frame
+ * window, whose DecodeTimeStamps are not yet monotonic. */
+#define QSV_REINIT_DTS_SUPPRESS 16
+
 /* ------------------------------------------------------------------------- */
+
+/* One frame deep-copied while a background timed re-init is in progress (see
+ * obs_qsv::reinit_in_progress). Buffered so it can be re-fed through the normal encode path
+ * after the reset instead of being dropped - which would leave a DTS gap at the resize point. */
+struct qsv_pending_frame {
+	uint8_t *y;  /* owned copy of plane 0 (NV12/P010) */
+	uint8_t *uv; /* owned copy of plane 1 */
+	uint32_t ls0;
+	uint32_t ls1;
+	int64_t pts;
+};
 
 struct obs_qsv {
 	obs_encoder_t *encoder;
@@ -105,16 +123,59 @@ struct obs_qsv {
 	/* GOP boundary so sibling encoders of a multitrack output stay   */
 	/* keyframe-aligned (see qsv_check_staged).                       */
 	bool reconfig_pending;
+	/* ABR live TargetKbps changes are staged here and applied at the next keyframe boundary (qsv_check_staged),
+	 * where the reset starts a new sequence (StartNewSequence=ON) so the driver's BRC/VBV state re-anchors to
+	 * the new target immediately - a non-IDR reset would leave HEVC drifting toward it for ~20 s. Firing on the
+	 * boundary makes the inserted IDR coincide with the natural GOP keyframe, keeping multitrack siblings aligned.
+	 * Set by the governor tick or a manual ABR settings change; one re-anchor per boundary (latest value wins). */
+	bool abr_reconfig_pending;
+	bool fps_reinit_pending; /* effective-FPS change needs a full Close+Init: staged at the next shared
+	                             * keyframe boundary for grouped encoders, immediate otherwise (qsv_check_staged) */
 	int64_t frames_since_idr; /* submitted frames since last observed IDR packet */
 
-	/* Live RESOLUTION changes cannot be staged the same way: libobs  */
-	/* starts delivering frames at the new size on the very next tick,*/
-	/* so the MFX session is resized immediately (forced mid-GOP      */
-	/* IDR). align_pending then counts down submissions and forces one*/
-	/* more keyframe exactly on the next shared GOP boundary so this  */
-	/* track re-locks onto its sibling encoders' keyframe pts grid.   */
+	/* Live RESOLUTION changes: single-track encoders re-init the MFX      */
+	/* session immediately (forced mid-GOP IDR); align_pending then counts*/
+	/* down submissions and forces one more keyframe exactly on the next  */
+	/* GOP boundary so the track re-locks onto its keyframe pts grid.     */
+	/* Multitrack (encoder group) members instead stage a TIMED resize    */
+	/* (resize_pending, mirrors obs_x264_maybe_resize): an off-grid       */
+	/* session re-init would emit its session-start IDR at the resize      */
+	/* point and re-anchor this track's GOP phase there, desyncing every  */
+	/* subsequent keyframe from its siblings on the shared grid (libobs   */
+	/* reports "Missing keyframe" for the whole group). The re-init is     */
+	/* therefore deferred to the next shared keyframe boundary so that     */
+	/* IDR lands exactly on-grid; while waiting, new-size frames are       */
+	/* scaled down to the old resolution (scale_buf) and encoded by the    */
+	/* current session. No off-grid keyframe is ever emitted.             */
 	bool align_pending;
 	int64_t align_remaining; /* encode() calls until realignment fires (incl. current) */
+
+	bool resize_pending;      /* timed resize staged: scale new-size frames to the old size while waiting */
+	uint32_t pending_width;   /* target size for the staged re-init         */
+	uint32_t pending_height;
+	bool fps_pending;         /* timed full re-init staged for an effective-FPS change (shares the boundary below) */
+	int64_t reinit_target_pts;/* shared keyframe boundary to re-init on (staged resize and/or FPS change) */
+	uint32_t reinit_misses;   /* boundaries missed due to dropped frames    */
+	int64_t last_keyframe_pts;/* most recent steady-state on-grid keyframe pts (-1 = none yet) */
+	int64_t gop_pts;          /* measured keyframe cadence in pts units (0 = unknown) */
+	uint8_t *scale_buf[2];    /* NV12 scale-to-old-size buffers for the wait window */
+	uint32_t scale_stride[2];
+	enum video_format delivery_format; /* format libobs delivers (set in obs_qsv_video_info) */
+
+	/* Background timed re-init (CPU-frame path only): the ~400 ms MFX Close+Init of a timed
+	 * resize/FPS change runs on a worker thread so it never blocks the encode (mix) thread -
+	 * blocking would stall the whole mix pipeline and every frame of the window is lost
+	 * (missed ticks are never rendered: a visible freeze). While the worker runs, incoming
+	 * frames are deep-copied into pending_frames; once the reset completes they are re-fed
+	 * through the normal encode path one per call (oldest first), so no frame is dropped and
+	 * DTS stays continuous across the boundary. Note: with libobs' 1-frame-in/1-packet-out
+	 * contract this track then runs ~one reset duration behind real time until a restart -
+	 * catching up faster would require dropping frames, i.e. the freeze this prevents. */
+	bool reinit_in_progress;
+	pthread_t reinit_thread; /* valid while reinit_in_progress */
+	os_event_t *reinit_done;  /* manual-reset event, valid while reinit_in_progress */
+	int64_t reinit_boundary_pts; /* pts of the frame that triggered the re-init (grid re-anchor) */
+	DARRAY(struct qsv_pending_frame) pending_frames;
 
 	/* Current encoded resolution (for live resize detection).        */
 	uint32_t cx;
@@ -134,19 +195,38 @@ struct obs_qsv {
 	 * frame rate while receiving more frames -> inflated bitrate). */
 	int64_t gop_frames;
 
-	/* Output timestamp continuity across a live reconfigure. MFX's Reset()
-	 * restarts its internal output-timestamp base, so after an FPS change the
-	 * first decoded frame can carry a decode/presentation timestamp that REGRESSES
-	 * behind the previous frame. A non-monotonic DTS is fatal to downstream
-	 * muxers/decoders on a live stream (this is what crashes viewers when the
-	 * FPS is lowered). We therefore apply a running offset to both PTS and DTS:
-	 * whenever a timestamp would fall back onto or before the last emitted DTS,
-	 * we grow the offset to bridge the gap. Shifting PTS and DTS by the same
-	 * amount preserves B-frame reordering, so only the discontinuity is removed. */
+	/* Output timestamps stay on the OBS timeline across a live reconfigure.
+	 * MFX echoes back the per-frame TimeStamp we submit (encoder->cur_pts) as its
+	 * output PresentationTimeStamp and continues its DecodeTimeStamp base, so no
+	 * correction is normally needed: ts_offset stays 0 and pkt->pts keeps matching
+	 * encoder->cur_pts (libobs's frame-timing association). The one anomaly the
+	 * offset guards against is a genuine DTS regression outside the post-reinit
+	 * window; if that ever happens, ts_offset is grown to bridge it (last_dts/
+	 * have_last_dts feed the check in qsv_fix_timestamps). */
 	int64_t ts_offset;
 	int64_t last_dts;
 	bool have_last_dts;
+
+	/* >0: number of emitted packets left to pass through WITHOUT running the DTS
+	 * regression check. Set on every live re-init (qsv_reset_ts_state): MFX emits
+	 * its initial B-frame window with non-monotonic DecodeTimeStamps, which would
+	 * otherwise trip the regression check and shift ts_offset off 0 (desyncing PTS
+	 * from cur_pts). See qsv_fix_timestamps. */
+	int64_t dts_suppress;
+
+	/* ABR (QVBR) governor state. The shared governor (shared/abr-gov) steers TargetKbps around the
+	 * user's "bitrate" so the long-term average converges to it; MaxKbps is a fixed ceiling. */
+	bool abr_active;        /* true when rate_control == ABR (QVBR base mode) */
+	double abr_deadband;    /* deadband as a fraction of target, e.g. 0.005 = +/-0.5% */
+	int abr_target_kbps;     /* user's "bitrate" setting (the convergence target) */
+	int abr_ceiling_kbps;    /* fixed ceiling = max(max_bitrate, bitrate) */
+	bool abr_session_loaded; /* per-open: session budget latched this open */
+	abr_gov_state abr_state;  /* cumulative bits/time + governed cur_rate (bits/sec) */
 };
+
+/* Forward declaration: also called from obs_qsv_destroy, which precedes the definition. */
+static void free_scale_buffers(struct obs_qsv *obsqsv);
+static void qsv_pending_free(struct obs_qsv *obsqsv);
 
 /* ------------------------------------------------------------------------- */
 
@@ -206,7 +286,16 @@ static void obs_qsv_destroy(void *data)
 
 	if (obsqsv) {
 		os_end_high_performance(obsqsv->performance_token);
-		clear_data(obsqsv);
+		clear_data(obsqsv); /* blocks on g_QsvLock until a running re-init worker finishes */
+		abr_gov_session_save(obsqsv->encoder, obsqsv->abr_active, &obsqsv->abr_state);
+		if (obsqsv->reinit_in_progress) {
+			pthread_join(obsqsv->reinit_thread, NULL);
+			os_event_destroy(obsqsv->reinit_done);
+			obsqsv->reinit_done = NULL;
+			obsqsv->reinit_in_progress = false;
+		}
+		free_scale_buffers(obsqsv);
+		qsv_pending_free(obsqsv);
 		da_free(obsqsv->packet_data);
 		bfree(obsqsv);
 	}
@@ -217,6 +306,10 @@ static void obs_qsv_defaults(obs_data_t *settings, int ver, enum qsv_codec codec
 	obs_data_set_default_string(settings, "target_usage", "TU4");
 	obs_data_set_default_int(settings, "bitrate", 2500);
 	obs_data_set_default_int(settings, "max_bitrate", 3000);
+	obs_data_set_default_int(settings, "qvbr_quality", 25);
+	obs_data_set_default_double(settings, "deadband", 0.5);
+	obs_data_set_default_string(settings, "abr_strategy", "target");
+	obs_data_set_default_bool(settings, "abr_low_latency", false);
 	obs_data_set_default_string(settings, "profile", codec == QSV_CODEC_AVC ? "high" :
 	                                      (codec == QSV_CODEC_VP9 ? "profile0" : "main"));
 
@@ -332,6 +425,10 @@ static inline void add_translated_strings(obs_property_t *list, const char *cons
 #define TEXT_LATENCY obs_module_text("Latency")
 #define TEXT_RATE_CONTROL obs_module_text("RateControl")
 #define TEXT_ICQ_QUALITY obs_module_text("ICQQuality")
+#define TEXT_QVBR_QUALITY obs_module_text("QVBRQuality")
+#define TEXT_DEADBAND obs_module_text("Deadband")
+#define TEXT_ABR_STRATEGY obs_module_text("ABRStrategy")
+#define TEXT_ABR_LOW_LATENCY obs_module_text("ABRLowLatency")
 #define TEXT_KEYINT_SEC obs_module_text("KeyframeIntervalSec")
 #define TEXT_BFRAMES obs_module_text("BFrames")
 
@@ -420,7 +517,7 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs
 {
 	const char *rate_control = obs_data_get_string(settings, "rate_control");
 
-	bool bVisible = astrcmpi(rate_control, "VBR") == 0;
+	bool bVisible = astrcmpi(rate_control, "VBR") == 0 || astrcmpi(rate_control, "ABR") == 0;
 	p = obs_properties_get(ppts, "max_bitrate");
 	obs_property_set_visible(p, bVisible);
 
@@ -445,6 +542,20 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs
 	bVisible = astrcmpi(rate_control, "ICQ") == 0;
 	p = obs_properties_get(ppts, "icq_quality");
 	obs_property_set_visible(p, bVisible);
+
+	bVisible = astrcmpi(rate_control, "ABR") == 0;
+	p = obs_properties_get(ppts, "qvbr_quality");
+	if (p)
+		obs_property_set_visible(p, bVisible);
+	p = obs_properties_get(ppts, "deadband");
+	if (p)
+		obs_property_set_visible(p, bVisible);
+	p = obs_properties_get(ppts, "abr_strategy");
+	if (p)
+		obs_property_set_visible(p, bVisible);
+	p = obs_properties_get(ppts, "abr_low_latency");
+	if (p)
+		obs_property_set_visible(p, bVisible);
 
 	update_latency(settings);
 	update_targetusage(settings);
@@ -479,6 +590,11 @@ static obs_properties_t *obs_qsv_props(enum qsv_codec codec, void *unused, int v
 	else
 		add_rate_controls(prop, qsv_ratecontrols);
 
+	/* ABR (quality-anchored VBR with a live governor) is offered for H.264/HEVC first; VP9/AV1 follow
+	 * once proven on those hardware paths. */
+	if (codec == QSV_CODEC_AVC || codec == QSV_CODEC_HEVC)
+		obs_property_list_add_string(prop, "ABR", "ABR");
+
 	obs_property_set_modified_callback(prop, rate_control_modified);
 
 	prop = obs_properties_add_int(props, "bitrate", TEXT_TARGET_BITRATE, 50, 10000000, 50);
@@ -496,6 +612,22 @@ static obs_properties_t *obs_qsv_props(enum qsv_codec codec, void *unused, int v
 	}
 
 	obs_properties_add_int(props, "icq_quality", TEXT_ICQ_QUALITY, 1, 51, 1);
+	obs_properties_add_int(props, "qvbr_quality", TEXT_QVBR_QUALITY, 1, 51, 1);
+
+	prop = obs_properties_add_float(props, "deadband", TEXT_DEADBAND, 0.1, 10.0, 0.1);
+	obs_property_float_set_suffix(prop, "%");
+
+	/* ABR comparison controls: which rate parameter the governor steers, and a low-latency (no B-frame)
+	 * architecture. Both are ABR-only and default to the validated baseline behavior. */
+	prop = obs_properties_add_list(props, "abr_strategy", TEXT_ABR_STRATEGY, OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(prop, "target", "Target (QVBR)");
+	obs_property_list_add_string(prop, "ceiling", "Ceiling (MaxKbps)");
+	obs_property_set_long_description(prop, obs_module_text("ABRStrategy.ToolTip"));
+
+	obs_properties_add_bool(props, "abr_low_latency", TEXT_ABR_LOW_LATENCY);
+	obs_property_set_long_description(obs_properties_get(props, "abr_low_latency"),
+					  obs_module_text("ABRLowLatency.ToolTip"));
 
 	prop = obs_properties_add_list(props, "target_usage", TEXT_SPEED, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	add_translated_strings(prop, qsv_usage_translation_keys, qsv_usage_names);
@@ -578,6 +710,10 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 	int cqp = (int)obs_data_get_int(settings, "cqp");
 	int ver = (int)obs_data_get_int(settings, "__ver");
 	int icq_quality = (int)obs_data_get_int(settings, "icq_quality");
+	int qvbr_quality = (int)obs_data_get_int(settings, "qvbr_quality");
+	double deadband = obs_data_get_double(settings, "deadband");
+	const char *abr_strategy = obs_data_get_string(settings, "abr_strategy");
+	bool abr_low_latency = obs_data_get_bool(settings, "abr_low_latency");
 	int keyint_sec = (int)obs_data_get_int(settings, "keyint_sec");
 	bool cbr_override = obs_data_get_bool(settings, "cbr");
 	int bFrames = (int)obs_data_get_int(settings, "bframes");
@@ -775,6 +911,8 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 		obsqsv->params.nRateControl = MFX_RATECONTROL_CQP;
 	else if (astrcmpi(rate_control, "ICQ") == 0)
 		obsqsv->params.nRateControl = MFX_RATECONTROL_ICQ;
+	else if (astrcmpi(rate_control, "ABR") == 0)
+		obsqsv->params.nRateControl = MFX_RATECONTROL_QVBR;
 
 	obsqsv->params.nLADEPTH = (mfxU16)0;
 	if (astrcmpi(latency, "ultra-low") == 0) {
@@ -843,6 +981,46 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 	obsqsv->params.nICQQuality = (mfxU16)icq_quality;
 	obsqsv->params.bRepeatHeaders = repeat_headers;
 
+	/* ABR (QVBR): quality-anchored VBR with a live governor. The governor steers one rate parameter around
+	 * the user's "bitrate" so the long-term average converges to it - TargetKbps in target mode, MaxKbps in
+	 * ceiling mode; QVBRQuality is set once here and a live reconfig only ever touches the steered param. */
+	obsqsv->abr_active = (obsqsv->params.nRateControl == MFX_RATECONTROL_QVBR);
+	if (obsqsv->abr_active) {
+		obsqsv->abr_target_kbps = target_bitrate;
+		/* The ceiling must never be below the target: it is both the governor's absolute cap (it may
+		 * raise Target up to here) and the basis for the VBV buffer sizing, so a max_bitrate set below
+		 * the target would clamp the stream at its own average. Fall back to the target when unset or
+		 * too low. */
+		obsqsv->abr_ceiling_kbps = (max_bitrate > target_bitrate ? max_bitrate : target_bitrate);
+		obsqsv->abr_deadband = deadband / 100.0;
+		obsqsv->params.nQVBRQuality = (mfxU16)qvbr_quality;
+		obsqsv->params.nABRCeilingKbps = (mfxU16)obsqsv->abr_ceiling_kbps;
+
+		/* ABR comparison strategy: which rate parameter the governor steers. "target" (default) is the
+		 * validated baseline; "ceiling" is the Agent-1 model that moves MaxKbps instead of TargetKbps. */
+		obsqsv->params.nABRStrategy = (astrcmpi(abr_strategy, "ceiling") == 0) ? QSV_ABR_STRATEGY_CEILING
+		                                                                        : QSV_ABR_STRATEGY_TARGET;
+
+		if (obsqsv->params.nABRStrategy == QSV_ABR_STRATEGY_CEILING) {
+			/* Ceiling steering: TargetKbps is a fixed base anchor; the governor moves MaxKbps. */
+			obsqsv->params.nTargetBitRate = (mfxU16)target_bitrate;
+			obsqsv->params.nMaxBitRate = (mfxU16)obsqsv->abr_ceiling_kbps; /* latch sets governed rate */
+		} else {
+			/* Target steering: MaxKbps is the fixed session ceiling. */
+			obsqsv->params.nMaxBitRate = (mfxU16)obsqsv->abr_ceiling_kbps;
+		}
+
+		/* Low-latency comparison mode (Agent-2 architecture): drop B-frames and the async depth so the
+		 * encoder has no reorder buffer to flush, making a live reset cheap. LowDelayBRC is set in Init. */
+		obsqsv->params.bABRLowLatency = abr_low_latency;
+		if (abr_low_latency) {
+			obsqsv->params.nbFrames = 0;
+			obsqsv->params.nAsyncDepth = 1;
+		}
+	} else {
+		obsqsv->abr_session_loaded = false; /* a non-ABR open resets the per-open latch flag */
+	}
+
 	info("settings:\n"
 	     "\tcodec:          %s\n"
 	     "\trate_control:   %s",
@@ -853,6 +1031,12 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 
 	if (obsqsv->params.nRateControl == MFX_RATECONTROL_VBR)
 		blog(LOG_INFO, "\tmax_bitrate:    %d", (int)obsqsv->params.nMaxBitRate);
+
+	if (obsqsv->params.nRateControl == MFX_RATECONTROL_QVBR)
+		blog(LOG_INFO, "\tQVBR Quality:   %d (ABR, ceiling %d kbps, strategy=%s, low-latency=%s)",
+		     (int)obsqsv->params.nQVBRQuality, (int)obsqsv->abr_ceiling_kbps,
+		     obsqsv->params.nABRStrategy == QSV_ABR_STRATEGY_CEILING ? "ceiling(MaxKbps)" : "target",
+		     obsqsv->params.bABRLowLatency ? "on" : "off");
 
 	if (obsqsv->params.nRateControl == MFX_RATECONTROL_ICQ)
 		blog(LOG_INFO, "\tICQ Quality:    %d", (int)obsqsv->params.nICQQuality);
@@ -883,9 +1067,137 @@ static void update_params(struct obs_qsv *obsqsv, obs_data_t *settings)
 	blog(LOG_DEBUG, "debug info:");
 }
 
+/* ------------------------------------------------------------------------- */
+/* ABR (QVBR) governor glue                                                    */
+/*                                                                             */
+/* ABR runs QSV in MFX_RATECONTROL_QVBR (quality-anchored VBR). The shared      */
+/* governor (shared/abr-gov) computes a governed rate from the session-         */
+/* cumulative average; we apply it as a live TargetKbps re-anchor, staged to the */
+/* next keyframe boundary (qsv_check_staged). The reset starts a new sequence    */
+/* (StartNewSequence=ON, one IDR) so the driver's BRC/VBV state re-anchors to the*/
+/* new target immediately - a non-IDR reset would leave HEVC drifting toward it  */
+/* for ~20 s. Firing on the boundary keeps multitrack keyframes aligned. MaxKbps */
+/* stays the fixed ceiling.                                                      */
+/* ------------------------------------------------------------------------- */
+
+/* QSV-specific anti-churn gate. A re-anchor is a full pipeline flush + StartNewSequence=ON reset (tens of ms),
+ * far costlier than the cheap per-tick parameter update the other encoders apply, so batch it: only stage a
+ * keyframe-boundary re-anchor when the governed rate has moved at least this fraction from the currently-applied
+ * value. Smaller moves are absorbed until they accumulate past the threshold (the boundary gate in
+ * qsv_check_staged then limits frequency to at most one re-anchor per GOP). Kept below the overshoot floor's
+ * 2.5% drop so a full correction always passes the gate. */
+#define QSV_ABR_MIN_DELTA_FRAC 0.01
+
+/* Convert the governor's current rate (bits/sec) into the kbps value this ABR strategy applies. In ceiling
+ * mode the result is clamped to [base target, hard ceiling] so MaxKbps never drops below the fixed TargetKbps
+ * anchor (an invalid QVBR config) nor above the session ceiling. */
+static mfxU16 qsv_abr_governed_kbps(struct obs_qsv *obsqsv, bool ceiling)
+{
+	int64_t r = obsqsv->abr_state.cur_rate;
+
+	if (ceiling) {
+		const int64_t lo = (int64_t)obsqsv->abr_target_kbps * 1000;
+		const int64_t hi = (int64_t)obsqsv->abr_ceiling_kbps * 1000;
+		if (r < lo)
+			r = lo;
+		if (r > hi)
+			r = hi;
+	}
+
+	return (mfxU16)(r / 1000);
+}
+
+static void qsv_abr_latch(struct obs_qsv *obsqsv)
+{
+	if (!obsqsv->abr_active)
+		return;
+
+	const int64_t target_bps = (int64_t)obsqsv->abr_target_kbps * 1000;
+	const int64_t ceiling_bps = (int64_t)obsqsv->abr_ceiling_kbps * 1000;
+	if (target_bps <= 0)
+		return;
+
+	abr_gov_config cfg = abr_gov_default_config();
+	cfg.deadband_frac = obsqsv->abr_deadband;
+
+	if (!obsqsv->abr_session_loaded) {
+		abr_gov_session_load(obsqsv->encoder, true, target_bps, ceiling_bps, &cfg, &obsqsv->abr_state);
+		obsqsv->abr_session_loaded = true;
+	} else {
+		const int64_t floor_bps = (int64_t)((double)target_bps * cfg.overshoot_floor_frac);
+		if (obsqsv->abr_state.cur_rate < floor_bps)
+			obsqsv->abr_state.cur_rate = floor_bps;
+		if (obsqsv->abr_state.cur_rate > ceiling_bps)
+			obsqsv->abr_state.cur_rate = ceiling_bps;
+	}
+
+	/* Anchor the governed rate onto the parameter this strategy steers, so a restored budget continues
+	 * smoothly. Target mode moves TargetKbps; ceiling mode moves MaxKbps (kept >= the base target). */
+	if (obsqsv->params.nABRStrategy == QSV_ABR_STRATEGY_CEILING)
+		obsqsv->params.nMaxBitRate = qsv_abr_governed_kbps(obsqsv, true);
+	else
+		obsqsv->params.nTargetBitRate = qsv_abr_governed_kbps(obsqsv, false);
+}
+
+static void qsv_abr_tick(struct obs_qsv *obsqsv, uint32_t frame_bytes)
+{
+	if (!obsqsv->abr_active || !obsqsv->abr_session_loaded)
+		return;
+
+	const int64_t target_bps = (int64_t)obsqsv->abr_target_kbps * 1000;
+	if (target_bps <= 0)
+		return;
+
+	/* Nominal per-frame duration from the effective FPS (the frame-rate divisor is already folded into
+	 * nFpsDen, see update_params). */
+	if (obsqsv->params.nFpsNum == 0 || obsqsv->params.nFpsDen == 0)
+		return;
+	const double dt = (double)obsqsv->params.nFpsDen / obsqsv->params.nFpsNum;
+	if (dt <= 0.0)
+		return;
+
+	const int64_t ceiling_bps = (int64_t)obsqsv->abr_ceiling_kbps * 1000;
+
+	abr_gov_config cfg = abr_gov_default_config();
+	cfg.deadband_frac = obsqsv->abr_deadband;
+
+	if (abr_gov_tick(&obsqsv->abr_state, &cfg, target_bps, ceiling_bps, dt, frame_bytes, NULL)) {
+		/* cur_rate moved. The shared governor is a continuous law (restored for parity with the other encoders),
+		 * so it nudges cur_rate on most ticks; QSV cannot afford to re-anchor on every one of those (a flush +
+		 * StartNewSequence=ON reset costs tens of ms). Stage a keyframe-boundary re-anchor only when the governed
+		 * rate has moved at least QSV_ABR_MIN_DELTA_FRAC from what is currently applied - smaller moves accumulate
+		 * until they cross the threshold. Target mode steers TargetKbps; ceiling mode steers MaxKbps (clamped to stay
+		 * >= the base target). The reset then fires at the next keyframe boundary (qsv_check_staged), at most once
+		 * per GOP, so it re-anchors the BRC on-grid. */
+		const bool ceiling = (obsqsv->params.nABRStrategy == QSV_ABR_STRATEGY_CEILING);
+		const mfxU16 new_kbps = qsv_abr_governed_kbps(obsqsv, ceiling);
+		const mfxU16 old_kbps = ceiling ? obsqsv->params.nMaxBitRate : obsqsv->params.nTargetBitRate;
+		if (old_kbps > 0) {
+			const int64_t diff = (new_kbps > old_kbps) ? (int64_t)(new_kbps - old_kbps)
+			                                         : (int64_t)(old_kbps - new_kbps);
+			if ((double)diff / (double)old_kbps >= QSV_ABR_MIN_DELTA_FRAC) {
+				if (ceiling) {
+					obsqsv->params.nMaxBitRate = new_kbps;
+					debug("ABR governor (ceiling): MaxKbps %lld -> %lld kbps (re-anchor at next keyframe)",
+					      (long long)old_kbps, (long long)new_kbps);
+				} else {
+					obsqsv->params.nTargetBitRate = new_kbps;
+					debug("ABR governor: target %lld -> %lld kbps (re-anchor at next keyframe)",
+					      (long long)old_kbps, (long long)new_kbps);
+				}
+				obsqsv->abr_reconfig_pending = true;
+			}
+		}
+	}
+}
+
 static bool update_settings(struct obs_qsv *obsqsv, obs_data_t *settings)
 {
 	update_params(obsqsv, settings);
+
+	/* ABR: (re-)latch the governor's session budget on every open/update and anchor the effective
+	 * target at the governed rate (fresh start == user target; a restored budget continues smoothly). */
+	qsv_abr_latch(obsqsv);
 	return true;
 }
 
@@ -950,6 +1262,27 @@ static void load_headers(struct obs_qsv *obsqsv)
 	obsqsv->sei_size = 1;
 }
 
+/* Reset the output-timestamp correction state after any live re-init (RC Reset,
+ * Close+Init FPS re-init, or resize). MFX keeps echoing the per-frame TimeStamp we
+ * submit (encoder->cur_pts) as its output PresentationTimeStamp and continues its
+ * DecodeTimeStamp base from where it left off, so no PTS offset is needed (ts_offset
+ * stays 0). We only drop the DTS anchor and arm the post-reinit suppression window so
+ * MFX's initial out-of-order B-frame DTS can't shift the offset (qsv_fix_timestamps). */
+static void qsv_reset_ts_state(struct obs_qsv *obsqsv)
+{
+	obsqsv->ts_offset = 0;
+	obsqsv->have_last_dts = false;
+	obsqsv->dts_suppress = QSV_REINIT_DTS_SUPPRESS;
+}
+
+/* Mirror the MFX GopPicSize that InitParams()/UpdateParams() compute for the session
+ * (nKeyIntSec * effective fps, in frames). Used to time staged reconfigure boundaries. */
+static void qsv_refresh_gop_frames(struct obs_qsv *obsqsv)
+{
+	obsqsv->gop_frames = obsqsv->params.nKeyIntSec ?
+			(int64_t)((mfxU16)(obsqsv->params.nKeyIntSec * obsqsv->params.nFpsNum / (float)obsqsv->params.nFpsDen)) : 0;
+}
+
 /* Live RC reconfig: mfxVideoEncoder::Reset() resets state; next frame is IDR. */
 static bool qsv_apply_reconfigure(struct obs_qsv *obsqsv)
 {
@@ -962,46 +1295,502 @@ static bool qsv_apply_reconfigure(struct obs_qsv *obsqsv)
 		load_hevc_headers(obsqsv);
 	else
 		load_headers(obsqsv);
+	qsv_reset_ts_state(obsqsv);
 	return true;
+}
+
+/* ABR live RC re-anchor: changes TargetKbps via a StartNewSequence=ON Reset (ReconfigureEncoderSoft), which
+ * first does a full pipeline flush (safe mid-stream) and then re-anchors the driver's BRC to the new target.
+ * Because ON emits an IDR on the next frame, this restarts the GOP counter and reloads SPS/PPS + re-syncs
+ * timestamps exactly like qsv_apply_reconfigure. The caller (qsv_check_staged) fires it at a keyframe
+ * boundary so that IDR lands on-grid and multitrack siblings stay aligned. The underlying call logs failures. */
+static bool qsv_apply_reconfigure_soft(struct obs_qsv *obsqsv)
+{
+	if (!qsv_encoder_reconfig_soft(obsqsv->context, &obsqsv->params)) {
+		warn("ABR re-anchor failed");
+		return false;
+	}
+	obsqsv->frames_since_idr = 0;
+	if (obsqsv->codec == QSV_CODEC_HEVC)
+		load_hevc_headers(obsqsv);
+	else
+		load_headers(obsqsv);
+	qsv_reset_ts_state(obsqsv);
+	return true;
+}
+
+/* Full-session re-init (Close+Init) for a live effective-FPS change. Unlike qsv_apply_reconfigure
+ * (Reset only), this reapplies FrameInfo so the new frame rate actually takes effect, and it is used
+ * when the effective FPS changes because libobs has already switched the frame-delivery cadence -
+ * Reset() alone cannot change FrameRateExtN/Den in place. */
+static bool qsv_apply_reconfigure_full(struct obs_qsv *obsqsv)
+{
+	if (!qsv_encoder_reconfig_full(obsqsv->context, &obsqsv->params)) {
+		warn("live FPS re-init failed");
+		return false;
+	}
+	/* The fresh session's MFX GopPicSize now follows the (possibly new) effective fps, so refresh the
+	 * local mirror used to time staged reconfigure boundaries (qsv_check_staged). */
+	qsv_refresh_gop_frames(obsqsv);
+	obsqsv->frames_since_idr = 0;
+	if (obsqsv->codec == QSV_CODEC_HEVC)
+		load_hevc_headers(obsqsv);
+	else
+		load_headers(obsqsv);
+	qsv_reset_ts_state(obsqsv);
+	return true;
+}
+
+/* Nearest-neighbor NV12 scaler for the multitrack timed-resize transition period. Scales a
+ * frame from the NEW resolution (the encoder's current width/height) down to the OLD one
+ * (cx/cy, the size of the live MFX session) into pre-allocated buffers. Only used for the
+ * short window between resize detection and the keyframe-boundary re-init, so quality is
+ * not a concern (mirrors scale_frame_to_old_size in obs-x264.c). */
+static void free_scale_buffers(struct obs_qsv *obsqsv)
+{
+	bfree(obsqsv->scale_buf[0]);
+	bfree(obsqsv->scale_buf[1]);
+	obsqsv->scale_buf[0] = NULL;
+	obsqsv->scale_buf[1] = NULL;
+	obsqsv->scale_stride[0] = 0;
+	obsqsv->scale_stride[1] = 0;
+}
+
+static bool alloc_scale_buffers(struct obs_qsv *obsqsv)
+{
+	free_scale_buffers(obsqsv);
+	const uint32_t w = obsqsv->cx;
+	const uint32_t h = obsqsv->cy;
+	/* P010 (AV1 10-bit) carries u16 samples: plane rows are 2 bytes/pixel. */
+	const int bpp = (obsqsv->delivery_format == VIDEO_FORMAT_P010) ? 2 : 1;
+
+	obsqsv->scale_stride[0] = ((w * bpp) + 15u) & ~15u;
+	obsqsv->scale_buf[0] = bzalloc((size_t)obsqsv->scale_stride[0] * h);
+	obsqsv->scale_stride[1] = obsqsv->scale_stride[0];
+	obsqsv->scale_buf[1] = bzalloc((size_t)obsqsv->scale_stride[1] * (h / 2));
+	return obsqsv->scale_buf[0] != NULL && obsqsv->scale_buf[1] != NULL;
+}
+
+static void qsv_scale_nv12_to_old_size(struct obs_qsv *obsqsv, const struct encoder_frame *frame)
+{
+	const uint32_t src_w = obs_encoder_get_width(obsqsv->encoder);
+	const uint32_t src_h = obs_encoder_get_height(obsqsv->encoder);
+	const uint32_t dst_w = obsqsv->cx;
+	const uint32_t dst_h = obsqsv->cy;
+
+	if (src_w == dst_w && src_h == dst_h)
+		return; /* no scaling needed */
+
+	/* Plane 0: Y (full res) */
+	for (uint32_t y = 0; y < dst_h; y++) {
+		const uint8_t *srow = frame->data[0] + (size_t)((y * src_h) / dst_h) * frame->linesize[0];
+		uint8_t *drow = obsqsv->scale_buf[0] + (size_t)y * obsqsv->scale_stride[0];
+		for (uint32_t x = 0; x < dst_w; x++)
+			drow[x] = srow[(x * src_w) / dst_w];
+	}
+
+	/* Plane 1: interleaved UV (half res) */
+	const uint32_t src_uv_w = src_w / 2, src_uv_h = src_h / 2;
+	const uint32_t dst_uv_w = dst_w / 2, dst_uv_h = dst_h / 2;
+	for (uint32_t y = 0; y < dst_uv_h; y++) {
+		const uint8_t *srow = frame->data[1] + (size_t)((y * src_uv_h) / dst_uv_h) * frame->linesize[1];
+		uint8_t *drow = obsqsv->scale_buf[1] + (size_t)y * obsqsv->scale_stride[1];
+		for (uint32_t x = 0; x < dst_uv_w; x++) {
+			const uint32_t sx = (x * src_uv_w) / dst_uv_w;
+			drow[x * 2]     = srow[sx * 2];     /* U */
+			drow[x * 2 + 1] = srow[sx * 2 + 1]; /* V */
+		}
+	}
+}
+
+/* P010 (u16) variant of the above for the AV1 10-bit delivery format. Same NV12-style layout
+ * (Y plane + interleaved UV at half res), just 16-bit samples. */
+static void qsv_scale_p010_to_old_size(struct obs_qsv *obsqsv, const struct encoder_frame *frame)
+{
+	const uint32_t src_w = obs_encoder_get_width(obsqsv->encoder);
+	const uint32_t src_h = obs_encoder_get_height(obsqsv->encoder);
+	const uint32_t dst_w = obsqsv->cx;
+	const uint32_t dst_h = obsqsv->cy;
+
+	if (src_w == dst_w && src_h == dst_h)
+		return; /* no scaling needed */
+
+	/* Plane 0: Y (full res, u16 samples) */
+	for (uint32_t y = 0; y < dst_h; y++) {
+		const uint16_t *srow = (const uint16_t *)(frame->data[0] + (size_t)((y * src_h) / dst_h) * frame->linesize[0]);
+		uint16_t *drow = (uint16_t *)(obsqsv->scale_buf[0] + (size_t)y * obsqsv->scale_stride[0]);
+		for (uint32_t x = 0; x < dst_w; x++)
+			drow[x] = srow[(x * src_w) / dst_w];
+	}
+
+	/* Plane 1: interleaved UV (half res, u16 pairs) */
+	const uint32_t src_uv_w = src_w / 2, src_uv_h = src_h / 2;
+	const uint32_t dst_uv_w = dst_w / 2, dst_uv_h = dst_h / 2;
+	for (uint32_t y = 0; y < dst_uv_h; y++) {
+		const uint16_t *srow = (const uint16_t *)(frame->data[1] + (size_t)((y * src_uv_h) / dst_uv_h) * frame->linesize[1]);
+		uint16_t *drow = (uint16_t *)(obsqsv->scale_buf[1] + (size_t)y * obsqsv->scale_stride[1]);
+		for (uint32_t x = 0; x < dst_uv_w; x++) {
+			const uint32_t sx = (x * src_uv_w) / dst_uv_w;
+			drow[x * 2]     = srow[sx * 2];     /* U */
+			drow[x * 2 + 1] = srow[sx * 2 + 1]; /* V */
+		}
+	}
 }
 
 static bool qsv_apply_resize(struct obs_qsv *obsqsv, uint32_t w, uint32_t h)
 {
-	info("live resize: %ux%u -> %ux%u (forced IDR)", obsqsv->cx, obsqsv->cy, w, h);
+	info("live resize: %ux%u -> %ux%u (session re-init)", obsqsv->cx, obsqsv->cy, w, h);
 	obsqsv->params.nWidth = (mfxU16)w;
 	obsqsv->params.nHeight = (mfxU16)h;
-	obsqsv->cx = w;
-	obsqsv->cy = h;
 
 	if (!qsv_encoder_reset_full(obsqsv->context, &obsqsv->params, obsqsv->codec)) {
 		warn("live resize failed, restart required");
-		return false;
+		return false; /* cx/cy unchanged - the pending resize is retried on the next frame */
 	}
+	obsqsv->cx = w;
+	obsqsv->cy = h;
+	/* The fresh session restarts its GOP at this point. */
+	obsqsv->frames_since_idr = 0;
 	if (obsqsv->codec == QSV_CODEC_HEVC)
 		load_hevc_headers(obsqsv);
 	else
 		load_headers(obsqsv);
 	info("resize reconfigure accepted");
+	qsv_reset_ts_state(obsqsv);
 	return true;
 }
 
-static bool qsv_maybe_resize(struct obs_qsv *obsqsv, uint32_t frame_linesize_y)
+/* Next shared multitrack keyframe boundary strictly ahead of frame_pts, from the measured
+ * on-grid keyframe cadence (last_keyframe_pts + gop_pts). Requires gop_pts > 0. */
+static int64_t qsv_next_boundary_pts(const struct obs_qsv *obsqsv, int64_t frame_pts)
+{
+	int64_t target = obsqsv->last_keyframe_pts + obsqsv->gop_pts;
+	while (target <= frame_pts)
+		target += obsqsv->gop_pts;
+	return target;
+}
+
+/* Apply a staged full re-init at the shared keyframe boundary: carries any pending size
+ * change and the current effective FPS (params already updated at staging time) in one
+ * Close+Init so the session-start IDR lands exactly on-grid. On failure the pending state
+ * is kept so the next frame retries. */
+static bool qsv_apply_timed_reinit(struct obs_qsv *obsqsv)
+{
+	if (obsqsv->resize_pending) {
+		info("live resize: %ux%u -> %ux%u (session re-init)", obsqsv->cx, obsqsv->cy, obsqsv->pending_width,
+		     obsqsv->pending_height);
+		obsqsv->params.nWidth = (mfxU16)obsqsv->pending_width;
+		obsqsv->params.nHeight = (mfxU16)obsqsv->pending_height;
+	}
+
+	bool ok;
+	if (obsqsv->fps_pending) {
+		/* UpdateParams() syncs FrameRateExtN/Den and the fps-derived GopPicSize into the MFX params
+		 * before the Close+Init, so both take effect in the fresh session. */
+		info("live FPS re-init: %u/%u (session re-init)", obsqsv->params.nFpsNum, obsqsv->params.nFpsDen);
+		ok = qsv_encoder_reconfig_full(obsqsv->context, &obsqsv->params);
+	} else {
+		ok = qsv_encoder_reset_full(obsqsv->context, &obsqsv->params, obsqsv->codec);
+	}
+
+	if (!ok) {
+		warn("timed re-init failed");
+		return false;
+	}
+
+	if (obsqsv->resize_pending) {
+		obsqsv->cx = obsqsv->pending_width;
+		obsqsv->cy = obsqsv->pending_height;
+		info("resize reconfigure accepted");
+	} else {
+		info("FPS re-init accepted");
+	}
+
+	/* The fresh session restarts its GOP at this point. */
+	obsqsv->frames_since_idr = 0;
+	if (obsqsv->fps_pending)
+		qsv_refresh_gop_frames(obsqsv);
+	if (obsqsv->codec == QSV_CODEC_HEVC)
+		load_hevc_headers(obsqsv);
+	else
+		load_headers(obsqsv);
+	qsv_reset_ts_state(obsqsv);
+	return true;
+}
+
+/* Timed multitrack re-init (staged in qsv_maybe_resize / qsv_check_staged): at the shared
+ * keyframe boundary, re-init the MFX session carrying any pending size and/or effective-FPS
+ * change. The first frame of the fresh session is a session-start IDR that lands exactly
+ * on-grid, so this track's keyframes stay aligned with its sibling tracks. Returns true if
+ * the current frame may be encoded (nothing due, or the re-init just succeeded); false if
+ * it must be skipped because the re-init failed (pending state kept for the next frame). */
+static bool qsv_maybe_apply_timed_reinit(struct obs_qsv *obsqsv, int64_t frame_pts)
+{
+	if (frame_pts < 0 || (!obsqsv->resize_pending && !obsqsv->fps_pending))
+		return true;
+
+	if (frame_pts < obsqsv->reinit_target_pts)
+		return true; // boundary not reached yet - keep encoding with the current session
+
+	if (frame_pts > obsqsv->reinit_target_pts) {
+		/* The boundary frame was dropped (encoder queue overflow while the encoder was busy).
+		 * Re-initialising now would land the session-start IDR off-grid, so advance to the next
+		 * shared boundary instead; give up after two misses. */
+		obsqsv->reinit_misses++;
+		if (obsqsv->reinit_misses < 2) {
+			obsqsv->reinit_target_pts += obsqsv->gop_pts;
+			warn("timed re-init missed keyframe boundary (pts %lld), retrying at pts %lld",
+			     (long long)frame_pts, (long long)obsqsv->reinit_target_pts);
+		} else {
+			warn("timed re-init missed two keyframe boundaries - applying late at pts %lld (off-grid)",
+			     (long long)frame_pts);
+		}
+	}
+
+	if (frame_pts == obsqsv->reinit_target_pts || obsqsv->reinit_misses >= 2) {
+		if (obsqsv->resize_pending)
+			info("timed resize: applying %ux%u -> %ux%u at pts %lld (target %lld)",
+			     obsqsv->cx, obsqsv->cy, obsqsv->pending_width, obsqsv->pending_height,
+			     (long long)frame_pts, (long long)obsqsv->reinit_target_pts);
+		if (obsqsv->fps_pending)
+			info("timed FPS re-init: applying at pts %lld (target %lld)", (long long)frame_pts,
+			     (long long)obsqsv->reinit_target_pts);
+
+		bool ok = qsv_apply_timed_reinit(obsqsv);
+		free_scale_buffers(obsqsv);
+		if (!ok) {
+			error("timed re-init failed - restart required");
+			return false; // skip this frame - the pending change is retried on the next frame
+		}
+		obsqsv->resize_pending = false;
+		obsqsv->fps_pending = false;
+		/* The full re-init already applied the current RC/bitrate, so drop any staged
+		 * RC-only reconfigure to avoid a redundant Reset (and extra IDR) right after. */
+		obsqsv->reconfig_pending = false;
+		/* The session-start IDR re-anchors the grid; update tracking. */
+		obsqsv->last_keyframe_pts = frame_pts;
+	}
+
+	return true;
+}
+
+/* Common completion bookkeeping for a timed re-init (synchronous path or background worker):
+ * frees the staging scale buffers and, on success, clears the pending flags and re-anchors the
+ * keyframe grid tracking at the boundary pts. On failure the pending state is kept so the next
+ * frame retries (matches the synchronous path's semantics). */
+static void qsv_timed_reinit_done(struct obs_qsv *obsqsv, bool ok, int64_t boundary_pts)
+{
+	free_scale_buffers(obsqsv);
+	if (!ok) {
+		error("timed re-init failed - restart required");
+		return;
+	}
+	obsqsv->resize_pending = false;
+	obsqsv->fps_pending = false;
+	/* The full re-init already applied the current RC/bitrate, so drop any staged RC-only
+	 * reconfigure to avoid a redundant Reset (and extra IDR) right after. */
+	obsqsv->reconfig_pending = false;
+	/* The session-start IDR re-anchors the grid; update tracking. */
+	obsqsv->last_keyframe_pts = boundary_pts;
+}
+
+/* Background worker for qsv_maybe_apply_timed_reinit_bg: runs the ~400 ms MFX Close+Init off
+ * the encode thread. Takes g_QsvLock so it is mutually exclusive with every other MFX access
+ * (encode calls, reconfig, close); the mix thread never waits on this worker, so no deadlock. */
+static void *qsv_reinit_worker(void *data)
+{
+	struct obs_qsv *obsqsv = data;
+
+	pthread_mutex_lock(&g_QsvLock);
+	bool ok = qsv_apply_timed_reinit(obsqsv);
+	qsv_timed_reinit_done(obsqsv, ok, obsqsv->reinit_boundary_pts);
+	pthread_mutex_unlock(&g_QsvLock);
+
+	os_event_signal(obsqsv->reinit_done);
+	return NULL;
+}
+
+/* CPU-frame path variant of qsv_maybe_apply_timed_reinit: at the shared keyframe boundary,
+ * start the re-init on a background worker instead of blocking the encode thread (see
+ * reinit_in_progress). Returns true if the current frame may be encoded normally; false if it
+ * must be queued by the caller because a re-init is starting or already in progress. */
+static bool qsv_maybe_apply_timed_reinit_bg(struct obs_qsv *obsqsv, int64_t frame_pts)
+{
+	if (frame_pts < 0 || (!obsqsv->resize_pending && !obsqsv->fps_pending))
+		return true;
+
+	if (frame_pts < obsqsv->reinit_target_pts)
+		return true; // boundary not reached yet - keep encoding with the current session
+
+	if (frame_pts > obsqsv->reinit_target_pts) {
+		/* The boundary frame was dropped (encoder queue overflow while the encoder was busy).
+		 * Re-initialising now would land the session-start IDR off-grid, so advance to the next
+		 * shared boundary instead; give up after two misses. */
+		obsqsv->reinit_misses++;
+		if (obsqsv->reinit_misses < 2) {
+			obsqsv->reinit_target_pts += obsqsv->gop_pts;
+			warn("timed re-init missed keyframe boundary (pts %lld), retrying at pts %lld",
+			     (long long)frame_pts, (long long)obsqsv->reinit_target_pts);
+		} else {
+			warn("timed re-init missed two keyframe boundaries - applying late at pts %lld (off-grid)",
+			     (long long)frame_pts);
+		}
+	}
+
+	if (frame_pts == obsqsv->reinit_target_pts || obsqsv->reinit_misses >= 2) {
+		if (obsqsv->resize_pending)
+			info("timed resize: applying %ux%u -> %ux%u at pts %lld (target %lld, background)",
+			     obsqsv->cx, obsqsv->cy, obsqsv->pending_width, obsqsv->pending_height,
+			     (long long)frame_pts, (long long)obsqsv->reinit_target_pts);
+		if (obsqsv->fps_pending)
+			info("timed FPS re-init: applying at pts %lld (target %lld, background)",
+			     (long long)frame_pts, (long long)obsqsv->reinit_target_pts);
+
+		obsqsv->reinit_boundary_pts = frame_pts;
+		os_event_init(&obsqsv->reinit_done, OS_EVENT_TYPE_MANUAL);
+		if (pthread_create(&obsqsv->reinit_thread, NULL, qsv_reinit_worker, obsqsv) != 0) {
+			/* Thread spawn failed: fall back to the synchronous re-init on this thread. */
+			os_event_destroy(obsqsv->reinit_done);
+			obsqsv->reinit_done = NULL;
+			pthread_mutex_lock(&g_QsvLock);
+			bool ok = qsv_apply_timed_reinit(obsqsv);
+			qsv_timed_reinit_done(obsqsv, ok, frame_pts);
+			pthread_mutex_unlock(&g_QsvLock);
+			return ok; // false -> skip this frame (pending state kept for retry)
+		}
+		obsqsv->reinit_in_progress = true;
+		return false; // caller queues this frame - it becomes the first frame of the new session
+	}
+
+	return true;
+}
+
+/* Deep-copy one incoming frame into the re-init queue (see reinit_in_progress). NV12/P010 are
+ * both two-plane 4:2:0, so plane sizes follow from linesize and the current target height. */
+static void qsv_pending_enqueue(struct obs_qsv *obsqsv, const struct encoder_frame *frame)
+{
+	if (obsqsv->pending_frames.num >= 128) {
+		warn("background re-init queue full - dropping frame pts %lld", (long long)frame->pts);
+		return;
+	}
+
+	const uint32_t h = obs_encoder_get_height(obsqsv->encoder);
+	const size_t y_size  = (size_t)frame->linesize[0] * h;
+	const size_t uv_size = (size_t)frame->linesize[1] * (h / 2);
+
+	struct qsv_pending_frame *pf = da_push_back_new(obsqsv->pending_frames);
+	pf->y  = bmalloc(y_size);
+	pf->uv = bmalloc(uv_size);
+	memcpy(pf->y, frame->data[0], y_size);
+	memcpy(pf->uv, frame->data[1], uv_size);
+	pf->ls0 = frame->linesize[0];
+	pf->ls1 = frame->linesize[1];
+	pf->pts = frame->pts;
+}
+
+/* Pop the oldest queued frame (FIFO - DTS order) and transfer ownership of its copies out. */
+static void qsv_pending_dequeue(struct obs_qsv *obsqsv, struct qsv_pending_frame *out)
+{
+	*out = obsqsv->pending_frames.array[0];
+	/* Shift the remaining entries one slot toward the front. The dequeued head is now owned by
+	 * the caller (who releases its copies); every other entry stays live in the queue and must
+	 * NOT be freed here - that would double-free / use-after-free the still-queued frames. */
+	for (size_t i = 1; i < obsqsv->pending_frames.num; i++)
+		obsqsv->pending_frames.array[i - 1] = obsqsv->pending_frames.array[i];
+	da_resize(obsqsv->pending_frames, obsqsv->pending_frames.num - 1);
+}
+
+/* Free any frames still buffered in the re-init queue (called on destroy). */
+static void qsv_pending_free(struct obs_qsv *obsqsv)
+{
+	for (size_t i = 0; i < obsqsv->pending_frames.num; i++) {
+		bfree(obsqsv->pending_frames.array[i].y);
+		bfree(obsqsv->pending_frames.array[i].uv);
+	}
+	da_free(obsqsv->pending_frames);
+}
+
+static bool qsv_maybe_resize(struct obs_qsv *obsqsv, int64_t frame_pts, uint32_t frame_linesize_y,
+			     enum video_format frame_format)
 {
 	uint32_t w = obs_encoder_get_width(obsqsv->encoder);
 	uint32_t h = obs_encoder_get_height(obsqsv->encoder);
 	if (w == obsqsv->cx && h == obsqsv->cy)
 		return true; // no resize needed - safe to encode
 
+	/* The CPU scaler covers the frame delivery formats NV12 and P010 (AV1 10-bit). */
+	const bool scalable = (frame_format == VIDEO_FORMAT_NV12 || frame_format == VIDEO_FORMAT_P010);
+
 	/* Race guard: obs_encoder_set_scaled_size updates scaled_width/height
 	 * immediately, but the GPU mix rebind takes effect on the next tick.
 	 * If the incoming frame's Y-plane stride is smaller than the target
-	 * width, the frame is still at the old size — defer to next tick. */
-	if (frame_linesize_y < w)
+	 * width, the frame is still at the old size — defer to next tick.
+	 * Compare in pixels: P010 plane-0 strides are 2 bytes/pixel. */
+	const uint32_t ls0_px = (frame_format == VIDEO_FORMAT_P010) ? frame_linesize_y / 2 : frame_linesize_y;
+	if (ls0_px < w)
 		return true; // not yet at new size, will retry next frame
+
+	/* Multitrack (encoder group): never re-init off-grid. Group members keep keyframes
+	 * aligned on a shared GOP grid anchored at stream start; an MFX session re-init
+	 * mid-GOP emits its session-start IDR at the resize point and re-anchors this track's
+	 * GOP phase there, so every subsequent keyframe would sit off-grid and libobs would
+	 * report "Missing keyframe" for the whole group until the stream restarts. Instead,
+	 * stage a TIMED resize (mirrors obs_x264_maybe_resize): defer the re-init to the next
+	 * shared keyframe boundary so that session-start IDR lands exactly on-grid, and keep
+	 * encoding new-size frames scaled down to the old resolution until then. No off-grid
+	 * keyframe is ever emitted. */
+	if (obs_encoder_is_in_group(obsqsv->encoder) && scalable &&
+	    obsqsv->last_keyframe_pts >= 0 && obsqsv->gop_pts > 0) {
+		if (!obsqsv->resize_pending) {
+			/* If a staged FPS re-init already holds the shared boundary, keep it so both
+			 * changes are carried by the same Close+Init. */
+			int64_t target = obsqsv->fps_pending ? obsqsv->reinit_target_pts :
+			                  qsv_next_boundary_pts(obsqsv, frame_pts);
+
+			if (alloc_scale_buffers(obsqsv)) {
+				obsqsv->resize_pending    = true;
+				obsqsv->pending_width     = w;
+				obsqsv->pending_height    = h;
+				if (!obsqsv->fps_pending) {
+					obsqsv->reinit_target_pts = target;
+					obsqsv->reinit_misses     = 0;
+				}
+				/* A timed resize is starting: any frames still queued from an earlier
+				 * background re-init are at the OLD size and cannot be encoded by the
+				 * upcoming session - drop them (one-time gap; the first resize of a session
+				 * always starts with an empty queue and stays clean). */
+				if (obsqsv->pending_frames.num > 0) {
+					warn("dropping %zu queued frame(s) of the previous size for a new timed resize",
+					     obsqsv->pending_frames.num);
+					qsv_pending_free(obsqsv);
+				}
+				info("live resize %ux%u -> %ux%u staged (will apply at pts %lld, current pts %lld)",
+				     obsqsv->cx, obsqsv->cy, w, h, (long long)target, (long long)frame_pts);
+			} else {
+				warn("live resize staging failed to allocate scale buffers - falling back to immediate re-init");
+			}
+		} else {
+			/* A newer size arrived mid-wait: re-target the staged re-init. */
+			obsqsv->pending_width  = w;
+			obsqsv->pending_height = h;
+		}
+
+		if (obsqsv->resize_pending)
+			return true; // keep encoding (scaled) with the current session
+	}
 
 	if (!qsv_apply_resize(obsqsv, w, h)) {
 		error("live resize to %ux%u failed - restart required", w, h);
 		return false; // resize FAILED - encoder is broken
+	}
+
+	/* Multitrack fallback (resize within the first GOP, before any keyframe cadence was
+	 * observed, or a delivery format the CPU scaler cannot handle): the re-init landed off-grid.
+	 * Never force a realignment IDR here - that would desync this track from its siblings; accept
+	 * the one-time grid shift instead (the session-start IDR is the only keyframe emitted). */
+	if (obs_encoder_is_in_group(obsqsv->encoder)) {
+		info("resize applied off-grid (no timed staging possible); skipping IDR realignment (multitrack)");
+		return true;
 	}
 
 	video_t *video = obs_encoder_video(obsqsv->encoder);
@@ -1033,41 +1822,124 @@ static bool qsv_maybe_resize(struct obs_qsv *obsqsv, uint32_t frame_linesize_y)
 	return true;
 }
 
-static bool qsv_check_staged(struct obs_qsv *obsqsv, uint32_t frame_linesize_y)
+static bool qsv_check_staged(struct obs_qsv *obsqsv, int64_t frame_pts, uint32_t frame_linesize_y,
+			     enum video_format frame_format)
 {
 	++obsqsv->frames_since_idr;
-	if (!qsv_maybe_resize(obsqsv, frame_linesize_y))
+	if (!qsv_maybe_resize(obsqsv, frame_pts, frame_linesize_y, frame_format))
 		return false; // resize failed - encoder is broken, skip this frame
 
-	/* Detect a live effective-FPS change (base rate or frame-rate divisor)
-	 * and stage a reconfigure so it is applied at the next IDR boundary.
-	 * This runs per-frame on the encode thread so it catches divisor changes
-	 * made via obs_encoder_update_frame_rate_divisor(), which do NOT go
-	 * through update() and would otherwise never be detected (leaving MFX at
-	 * the old frame rate while receiving more/fewer frames -> wrong bitrate). */
-	{
-		uint32_t fps_num = obs_encoder_get_fps_num(obsqsv->encoder);
-		uint32_t fps_den = obs_encoder_get_fps_den(obsqsv->encoder) *
-		                   obs_encoder_get_frame_rate_divisor(obsqsv->encoder);
-		if (fps_num != 0 && fps_den != 0 &&
-		    ((mfxU16)fps_num != obsqsv->params.nFpsNum ||
-		     (mfxU16)fps_den != obsqsv->params.nFpsDen)) {
-			info("live FPS change %u/%u -> %u/%u, staging reconfigure at next keyframe",
-			     obsqsv->params.nFpsNum, obsqsv->params.nFpsDen, fps_num, fps_den);
+	/* Detect a live effective-FPS change (base rate or frame-rate divisor). This runs per-frame on the
+	 * encode thread so it catches divisor changes made via obs_encoder_update_frame_rate_divisor(), which
+	 * do NOT go through update() and would otherwise never be detected. */
+	const uint32_t pending_div = obs_encoder_get_pending_frame_rate_divisor(obsqsv->encoder);
+
+	/* (a) A divisor change staged by the frontend via obs_encoder_set_pending_frame_rate_divisor()
+	 * (multitrack live FPS change): apply it exactly on the next shared keyframe boundary. libobs switches
+	 * the delivery rate there (set_frame_rate_divisor_at_pts) and we re-init the MFX session there, so the
+	 * session-start IDR lands on-grid. While waiting, frames keep arriving at the OLD rate, which matches
+	 * the current MFX session - no transient mismatch (mirrors obs_x264_check_fps). */
+	if (pending_div != 0 && pending_div != obs_encoder_get_frame_rate_divisor(obsqsv->encoder) &&
+	    !obsqsv->fps_pending && !obsqsv->fps_reinit_pending) {
+		const uint32_t fps_num = obs_encoder_get_fps_num(obsqsv->encoder);
+		const uint32_t fps_den = obs_encoder_get_fps_den(obsqsv->encoder) * pending_div;
+
+		if (fps_num != 0 && fps_den != 0) {
+			info("live FPS change %u/%u -> %u/%u, staging boundary-aligned re-init", obsqsv->params.nFpsNum,
+			     obsqsv->params.nFpsDen, fps_num, fps_den);
 			obsqsv->params.nFpsNum = (mfxU16)fps_num;
 			obsqsv->params.nFpsDen = (mfxU16)fps_den;
-			obsqsv->reconfig_pending = true;
+
+			int64_t target;
+			if (obs_encoder_active(obsqsv->encoder) && obsqsv->last_keyframe_pts >= 0 &&
+			    obsqsv->gop_pts > 0) {
+				target = qsv_next_boundary_pts(obsqsv, frame_pts);
+			} else {
+				/* No on-grid cadence measured yet (change within the first GOP): best effort at
+				 * the next frame. */
+				info("no keyframe cadence observed yet; applying FPS change at the next frame");
+				target = frame_pts + 1;
+			}
+
+			obs_encoder_set_frame_rate_divisor_at_pts(obsqsv->encoder, pending_div, target);
+			if (!obsqsv->resize_pending) {
+				obsqsv->reinit_target_pts = target;
+				obsqsv->reinit_misses     = 0;
+			}
+			obsqsv->fps_pending = true;
+			info("live FPS change staged (will apply at pts %lld, current pts %lld)", (long long)target,
+			     (long long)frame_pts);
+			obs_encoder_set_pending_frame_rate_divisor(obsqsv->encoder, 0);
 		}
 	}
 
-	/* Use the MFX GopPicSize fixed at create time (see gop_frames). The
-	 * encoder's actual GOP does not change on a live reconfigure, so timing
-	 * the boundary off the current effective FPS would desync it - notably
-	 * after an FPS increase, where the computed length exceeds the real GOP
-	 * and frames_since_idr never reaches the boundary. */
+	/* (b) Any other effective-FPS change (base-rate change, or a divisor set immediately via
+	 * obs_encoder_update_frame_rate_divisor): the delivery rate has ALREADY switched. A grouped encoder
+	 * still stages the full re-init at the next shared boundary; others apply it now. */
+	if (!obsqsv->fps_pending && !obsqsv->fps_reinit_pending && pending_div == 0) {
+		const uint32_t fps_num = obs_encoder_get_fps_num(obsqsv->encoder);
+		const uint32_t fps_den = obs_encoder_get_fps_den(obsqsv->encoder) *
+		                          obs_encoder_get_frame_rate_divisor(obsqsv->encoder);
+		if (fps_num != 0 && fps_den != 0 &&
+		    ((mfxU16)fps_num != obsqsv->params.nFpsNum || (mfxU16)fps_den != obsqsv->params.nFpsDen)) {
+			info("live FPS change %u/%u -> %u/%u while streaming", obsqsv->params.nFpsNum,
+			     obsqsv->params.nFpsDen, fps_num, fps_den);
+			obsqsv->params.nFpsNum = (mfxU16)fps_num;
+			obsqsv->params.nFpsDen = (mfxU16)fps_den;
+			obsqsv->fps_reinit_pending = true;
+		}
+	}
+
+	if (obsqsv->fps_reinit_pending) {
+		if (!obsqsv->fps_pending) {
+			if (obs_encoder_is_in_group(obsqsv->encoder) && obsqsv->last_keyframe_pts >= 0 &&
+			    obsqsv->gop_pts > 0) {
+				/* Grouped: an immediate Close+Init would emit its session-start IDR off-grid and
+				 * re-anchor this track's GOP phase there, desyncing every subsequent keyframe from
+				 * its siblings. Defer the re-init to the next shared keyframe boundary (same
+				 * mechanism as the timed resize); never force a realignment IDR. */
+				if (!obsqsv->resize_pending) {
+					obsqsv->reinit_target_pts = qsv_next_boundary_pts(obsqsv, frame_pts);
+					obsqsv->reinit_misses     = 0;
+				}
+				obsqsv->fps_pending = true;
+				info("live FPS change staged (will apply at pts %lld, current pts %lld)",
+				     (long long)obsqsv->reinit_target_pts, (long long)frame_pts);
+			} else {
+				if (obs_encoder_is_in_group(obsqsv->encoder))
+					info("FPS re-init applied off-grid (no timed staging possible); skipping IDR realignment (multitrack)");
+				else
+					info("applying live FPS re-init now");
+				bool ok = qsv_apply_reconfigure_full(obsqsv);
+				if (!ok)
+					warn("live FPS re-init failed - restart required");
+			}
+		}
+		obsqsv->fps_reinit_pending = false;
+		/* The full re-init already applied the current RC/bitrate, so drop any staged
+		 * RC-only reconfigure to avoid a redundant Reset (and extra IDR) right after. */
+		obsqsv->reconfig_pending = false;
+	}
+
+	/* Use the MFX GopPicSize mirrored in gop_frames (keyint_sec * effective fps, as set for the
+	 * live session; qsv_refresh_gop_frames() keeps it in sync after a live FPS re-init). Timing the
+	 * boundary off this value matches the encoder's actual GOP, so the staged Reset lands exactly on
+	 * MFX's own IDR. */
 	const int64_t gop_length = obsqsv->gop_frames;
 	const int64_t pipeline_delay = (int64_t)obsqsv->output_delay - 1;
 	const int64_t keyframe_boundary = gop_length - pipeline_delay;
+
+	/* ABR re-anchor fire point, tuned separately from the manual-reconfig boundary above.
+	 *
+	 * The StartNewSequence=ON reset emits its IDR a few frames after Reset(); fired at
+	 * keyframe_boundary that lands ~6 frames AFTER the natural grid IDR in the live QSV pipeline,
+	 * and the flush re-delivers the still-in-flight natural IDR on top of it => double IDR. Firing
+	 * that many frames EARLIER keeps the natural IDR out of the flush and makes the ON-reset's IDR
+	 * land exactly on the grid slot (re-anchoring the GOP counter, so no competing natural IDR):
+	 * a single on-grid IDR. Empirically tuned for the live pipeline (see abr-findings §37); re-measure
+	 * if gop/fps/output_delay change. */
+	const int64_t abr_early_fire = 6;
+	const int64_t abr_keyframe_boundary = keyframe_boundary - abr_early_fire;
 
 	if (obsqsv->align_pending) {
 		if (--obsqsv->align_remaining == 0) {
@@ -1084,6 +1956,17 @@ static bool qsv_check_staged(struct obs_qsv *obsqsv, uint32_t frame_linesize_y)
 		obsqsv->reconfig_pending = false;
 		if (!ok)
 			warn("staged reconfigure failed - restart required");
+	} else if (obsqsv->abr_reconfig_pending &&
+	           (gop_length <= 0 || obsqsv->frames_since_idr >= abr_keyframe_boundary)) {
+		/* ABR re-anchor: fire the StartNewSequence=ON reset here so its IDR lands on the natural GOP
+		 * keyframe slot (multitrack-safe); see the abr_keyframe_boundary note above. With no GOP there
+		 * is no grid to align to, so apply immediately. */
+		info("firing ABR re-anchor at keyframe boundary (counter=%lld gop=%lld abr_boundary=%lld)",
+		     (long long)obsqsv->frames_since_idr, (long long)gop_length, (long long)abr_keyframe_boundary);
+		bool ok = qsv_apply_reconfigure_soft(obsqsv);
+		obsqsv->abr_reconfig_pending = false;
+		if (!ok)
+			warn("ABR re-anchor failed - keeping previous target");
 	}
 	return true; // safe to proceed with encoding
 }
@@ -1099,6 +1982,11 @@ static bool obs_qsv_update(void *data, obs_data_t *settings)
 	 * like nvenc. */
 	mfxU16 old_fps_num = obsqsv->params.nFpsNum;
 	mfxU16 old_fps_den = obsqsv->params.nFpsDen;
+	/* Capture the RC/bitrate currently active BEFORE update_settings() overwrites params: it
+	 * unconditionally writes the new bitrate into params, so reading params afterwards would only
+	 * ever compare a value against itself. These are what was last applied to the MFX session. */
+	mfxU16 old_target = obsqsv->params.nTargetBitRate;
+	mfxU16 old_max    = obsqsv->params.nMaxBitRate;
 
 	update_settings(obsqsv, settings);
 
@@ -1112,19 +2000,26 @@ static bool obs_qsv_update(void *data, obs_data_t *settings)
 		     old_fps_num, old_fps_den, obsqsv->params.nFpsNum, obsqsv->params.nFpsDen);
 	}
 
-	mfxU16 new_bitrate = (mfxU16)obs_data_get_int(settings, "bitrate");
 	const char *rc_name = obs_data_get_string(settings, "rate_control");
 
 	bool rc_changed = false;
 	bool br_changed = false;
 
+	/* Compare the freshly-updated params against the values captured above (what was last applied to the
+	 * MFX session). CBR tracks TargetKbps only; VBR tracks both TargetKbps and MaxKbps. Quality-based modes
+	 * (CQP/ICQ) always need a reconfigure on any update, matching prior behavior. */
 	switch (obsqsv->params.nRateControl) {
 	case MFX_RATECONTROL_CBR:
-		br_changed = (obsqsv->params.nTargetBitRate != new_bitrate);
+		br_changed = (obsqsv->params.nTargetBitRate != old_target);
 		break;
 	case MFX_RATECONTROL_VBR:
-		br_changed = (obsqsv->params.nTargetBitRate != new_bitrate) ||
-		             (obsqsv->params.nMaxBitRate != (mfxU16)obs_data_get_int(settings, "max_bitrate"));
+		br_changed = (obsqsv->params.nTargetBitRate != old_target) ||
+		             (obsqsv->params.nMaxBitRate != old_max);
+		break;
+	case MFX_RATECONTROL_QVBR:
+		/* ABR: the governor owns TargetKbps; a user settings change re-anchors it, so track like VBR. */
+		br_changed = (obsqsv->params.nTargetBitRate != old_target) ||
+		             (obsqsv->params.nMaxBitRate != old_max);
 		break;
 	case MFX_RATECONTROL_ICQ:
 	case MFX_RATECONTROL_CQP:
@@ -1143,8 +2038,31 @@ static bool obs_qsv_update(void *data, obs_data_t *settings)
 	else if (astrcmpi(rc_name, "CQP") == 0 && obsqsv->params.nRateControl != MFX_RATECONTROL_CQP)
 		rc_changed = true;
 
-	if (!rc_changed && !br_changed && !fps_changed)
+	/* A live effective-FPS change needs a full session re-init: QSV's BRC derives per-frame bit
+	 * budgets from FrameRateExtN/Den, and Reset() alone cannot change FrameInfo. qsv_check_staged
+	 * applies it - staged at the next shared keyframe boundary for grouped encoders (an off-grid
+	 * session-start IDR would desync the whole group), immediately otherwise. The full re-init also
+	 * carries any concurrent RC/bitrate change, so nothing else needs staging here. */
+	if (fps_changed) {
+		obsqsv->fps_reinit_pending = true;
 		return true;
+	}
+
+	if (!rc_changed && !br_changed)
+		return true;
+
+	/* ABR (QVBR): the governor owns TargetKbps and its changes are applied with a StartNewSequence=ON
+	 * re-anchor. A manual settings change has already re-anchored the governor in qsv_abr_latch
+	 * (update_settings), so this just pushes the new target to the driver: immediately when not streaming,
+	 * otherwise staged to the next keyframe boundary (qsv_check_staged) so the inserted IDR lands on-grid. */
+	if (obsqsv->params.nRateControl == MFX_RATECONTROL_QVBR) {
+		if (!obs_encoder_active(obsqsv->encoder)) {
+			info("applying ABR re-anchor immediately (not streaming)");
+			return qsv_apply_reconfigure_soft(obsqsv);
+		}
+		obsqsv->abr_reconfig_pending = true;
+		return true;
+	}
 
 	video_t *video = obs_encoder_video(obsqsv->encoder);
 	const struct video_output_info *voi = video_output_get_info(video);
@@ -1298,14 +2216,10 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 		warn("bad settings specified");
 	}
 
-	/* Mirror the GopPicSize that InitParams() computes for the MFX session
-	 * (nKeyIntSec * effective_fps at create time). This value is fixed for the
-	 * life of the encoder, so it is the correct GOP length to use when timing
-	 * live reconfigure boundaries in qsv_check_staged. */
-	if (obsqsv->context != NULL) {
-		obsqsv->gop_frames = obsqsv->params.nKeyIntSec ?
-			(int64_t)((mfxU16)(obsqsv->params.nKeyIntSec * obsqsv->params.nFpsNum / (float)obsqsv->params.nFpsDen)) : 0;
-	}
+	/* Mirror the GopPicSize that InitParams() computes for the MFX session (nKeyIntSec * effective
+	 * fps, in frames). qsv_refresh_gop_frames() keeps it in sync after a live FPS re-init as well. */
+	if (obsqsv->context != NULL)
+		qsv_refresh_gop_frames(obsqsv);
 
 	qsv_encoder_version(&g_verMajor, &g_verMinor);
 
@@ -1323,6 +2237,7 @@ static void *obs_qsv_create(enum qsv_codec codec, obs_data_t *settings, obs_enco
 	obsqsv->cx = obs_encoder_get_width(encoder);
 	obsqsv->cy = obs_encoder_get_height(encoder);
 	obsqsv->output_delay = (int)obsqsv->params.nAsyncDepth;
+	obsqsv->last_keyframe_pts = -1; /* no keyframe cadence observed yet */
 
 	obsqsv->performance_token = os_request_high_performance("qsv encoding");
 
@@ -1495,6 +2410,11 @@ static void obs_qsv_video_info(void *data, struct video_scale_info *info)
 
 	info->format = pref_format;
 	cap_resolution(info);
+
+	/* Remember the format libobs delivers to this encoder: the multitrack timed-resize
+	 * CPU scaler covers NV12 and P010 (see qsv_maybe_resize). */
+	if (obsqsv)
+		obsqsv->delivery_format = info->format;
 }
 
 static void obs_qsv_video_plus_hdr_info(void *data, struct video_scale_info *info)
@@ -1512,6 +2432,11 @@ static void obs_qsv_video_plus_hdr_info(void *data, struct video_scale_info *inf
 
 	info->format = pref_format;
 	cap_resolution(info);
+
+	/* Remember the format libobs delivers to this encoder: the multitrack timed-resize
+	 * CPU scaler covers NV12 and P010 (see qsv_maybe_resize). */
+	if (obsqsv)
+		obsqsv->delivery_format = info->format;
 }
 
 static void obs_qsv_video_info_hevc_tex(void *data, struct video_scale_info *info)
@@ -1612,30 +2537,44 @@ static mfxU64 ts_obs_to_mfx(int64_t ts, const struct video_output_info *voi)
 
 static int64_t ts_mfx_to_obs(mfxI64 ts, const struct video_output_info *voi)
 {
-	int64_t div = 90000 * (int64_t)voi->fps_den;
-	/* Round to the nearest integer multiple of `voi->fps_den`. */
+	/* Exact inverse of ts_obs_to_mfx(): convert MFX's 90 kHz ticks back to the OBS
+	 * timebase (1 tick per 1/fps_num second). The previous form rounded the result to
+	 * a multiple of fps_den, which is only lossless when cur_pts already lies on that
+	 * grid - after a live FPS change it does not (at 60/4 an off-grid cur_pts such as
+	 * 6375 round-tripped to 6376), so no emitted packet matched encoder->cur_pts and
+	 * libobs lost the frame-timing association for every frame after the change. */
 	if (ts < 0)
-		return (ts * voi->fps_num - div / 2) / div * voi->fps_den;
+		return (ts * voi->fps_num - 45000) / 90000;
 	else
-		return (ts * voi->fps_num + div / 2) / div * voi->fps_den;
+		return (ts * voi->fps_num + 45000) / 90000;
 }
 
-/* Enforce monotonic, continuous output timestamps across a live reconfigure.
- * See the ts_offset/last_dts fields in struct obs_qsv for the rationale. The
- * same offset is added to PTS and DTS so B-frame presentation reordering is
- * preserved; only the regression introduced by MFX Reset() is removed. */
+/* Keep output timestamps on the OBS timeline across a live reconfigure.
+ * MFX echoes back the per-frame TimeStamp we submit (encoder->cur_pts) as its output
+ * PresentationTimeStamp and continues its DecodeTimeStamp base, so pkt->pts already
+ * equals encoder->cur_pts and no PTS offset is needed (ts_offset stays 0). The one
+ * anomaly: right after a re-init MFX emits its initial B-frame window with non-
+ * monotonic DecodeTimeStamps, which must not trip the DTS-regression check below (it
+ * would shift ts_offset and desync PTS from cur_pts) - so the check is suppressed for
+ * the first packets after a re-init (dts_suppress, set by qsv_reset_ts_state). After
+ * that window the check resumes as a safety net against a genuine DTS base restart. */
 static void qsv_fix_timestamps(struct obs_qsv *obsqsv, struct encoder_packet *packet)
 {
 	int64_t dts = packet->dts + obsqsv->ts_offset;
 	int64_t pts = packet->pts + obsqsv->ts_offset;
 
-	if (obsqsv->have_last_dts && dts <= obsqsv->last_dts) {
-		/* Regression: MFX restarted its timestamp base. Grow the offset so this
+	if (obsqsv->dts_suppress > 0) {
+		/* Initial B-frame window after a re-init: pass through untouched. */
+		obsqsv->dts_suppress--;
+	} else if (obsqsv->have_last_dts && dts <= obsqsv->last_dts) {
+		/* Regression outside the post-reinit window: grow the offset so this
 		 * frame continues from where the previous one left off (+1 tick). */
 		int64_t shift = obsqsv->last_dts - dts + 1;
 		obsqsv->ts_offset += shift;
 		dts += shift;
 		pts += shift;
+		blog(LOG_DEBUG, "[qsv] DTS regression at raw_dts=%lld: +%lld -> ts_offset=%lld (pts shifted to %lld)",
+		     (long long)packet->dts, (long long)shift, (long long)obsqsv->ts_offset, (long long)pts);
 	}
 
 	if (pts < dts)
@@ -1720,8 +2659,21 @@ static void parse_packet(struct obs_qsv *obsqsv, struct encoder_packet *packet, 
 #endif
 
 	*received_packet = true;
-	if (pBS->FrameType & MFX_FRAMETYPE_IDR)
+	if (pBS->FrameType & MFX_FRAMETYPE_IDR) {
 		obsqsv->frames_since_idr = 0;
+		/* Track the steady-state on-grid keyframe cadence for multitrack timed re-init.
+		 * Only update when not mid-resize/FPS-reinit/realignment so an off-grid session-start IDR
+		 * cannot corrupt the shared grid phase. */
+		if (!obsqsv->resize_pending && !obsqsv->fps_pending && !obsqsv->align_pending) {
+			const int64_t kpts = packet->pts;
+			if (obsqsv->last_keyframe_pts >= 0) {
+				int64_t delta = kpts - obsqsv->last_keyframe_pts;
+				if (delta > 0)
+					obsqsv->gop_pts = delta;
+			}
+			obsqsv->last_keyframe_pts = kpts;
+		}
+	}
 	pBS->DataLength = 0;
 }
 
@@ -1766,8 +2718,19 @@ static void parse_packet_av1(struct obs_qsv *obsqsv, struct encoder_packet *pack
 #endif
 
 	*received_packet = true;
-	if (pBS->FrameType & MFX_FRAMETYPE_IDR)
+	if (pBS->FrameType & MFX_FRAMETYPE_IDR) {
 		obsqsv->frames_since_idr = 0;
+		/* Track the steady-state on-grid keyframe cadence for multitrack timed re-init. */
+		if (!obsqsv->resize_pending && !obsqsv->fps_pending && !obsqsv->align_pending) {
+			const int64_t kpts = packet->pts;
+			if (obsqsv->last_keyframe_pts >= 0) {
+				int64_t delta = kpts - obsqsv->last_keyframe_pts;
+				if (delta > 0)
+					obsqsv->gop_pts = delta;
+			}
+			obsqsv->last_keyframe_pts = kpts;
+		}
+	}
 	pBS->DataLength = 0;
 }
 
@@ -1818,8 +2781,19 @@ static void parse_packet_vp9(struct obs_qsv *obsqsv, struct encoder_packet *pack
 	qsv_fix_timestamps(obsqsv, packet);
 
 	*received_packet = true;
-	if (pBS->FrameType & MFX_FRAMETYPE_IDR)
+	if (pBS->FrameType & MFX_FRAMETYPE_IDR) {
 		obsqsv->frames_since_idr = 0;
+		/* Track the steady-state on-grid keyframe cadence for multitrack timed re-init. */
+		if (!obsqsv->resize_pending && !obsqsv->fps_pending && !obsqsv->align_pending) {
+			const int64_t kpts = packet->pts;
+			if (obsqsv->last_keyframe_pts >= 0) {
+				int64_t delta = kpts - obsqsv->last_keyframe_pts;
+				if (delta > 0)
+					obsqsv->gop_pts = delta;
+			}
+			obsqsv->last_keyframe_pts = kpts;
+		}
+	}
 	pBS->DataLength = 0;
 }
 
@@ -1869,8 +2843,19 @@ static void parse_packet_hevc(struct obs_qsv *obsqsv, struct encoder_packet *pac
 		iType, packet->pts, packet->dts);
 #endif
 	*received_packet = true;
-	if (pBS->FrameType & MFX_FRAMETYPE_IDR)
+	if (pBS->FrameType & MFX_FRAMETYPE_IDR) {
 		obsqsv->frames_since_idr = 0;
+		/* Track the steady-state on-grid keyframe cadence for multitrack timed re-init. */
+		if (!obsqsv->resize_pending && !obsqsv->fps_pending && !obsqsv->align_pending) {
+			const int64_t kpts = packet->pts;
+			if (obsqsv->last_keyframe_pts >= 0) {
+				int64_t delta = kpts - obsqsv->last_keyframe_pts;
+				if (delta > 0)
+					obsqsv->gop_pts = delta;
+			}
+			obsqsv->last_keyframe_pts = kpts;
+		}
+	}
 	pBS->DataLength = 0;
 }
 
@@ -1912,8 +2897,6 @@ static bool obs_qsv_encode(void *data, struct encoder_frame *frame, struct encod
 	if (!frame || !packet || !received_packet)
 		return false;
 
-	pthread_mutex_lock(&g_QsvLock);
-
 	video_t *video = obs_encoder_video(obsqsv->encoder);
 	const struct video_output_info *voi = video_output_get_info(video);
 
@@ -1921,9 +2904,60 @@ static bool obs_qsv_encode(void *data, struct encoder_frame *frame, struct encod
 
 	int ret;
 
-	mfxU64 qsvPTS = ts_obs_to_mfx(frame->pts, voi);
+	/* --- Background timed re-init (see reinit_in_progress). Queue handling below is
+	 * lock-free: while the worker holds g_QsvLock for the ~400 ms MFX Close+Init, encode calls
+	 * must not block on it - they only deep-copy frames into pending_frames and return. --- */
 
-	if (!qsv_check_staged(obsqsv, frame ? frame->linesize[0] : 0)) {
+	/* (a) At the shared keyframe boundary, start the re-init on a background worker instead of
+	 * blocking this thread (see qsv_maybe_apply_timed_reinit_bg). The queued frame becomes the
+	 * first frame of the fresh session, so its session-start IDR lands exactly on-grid. */
+	if (!obsqsv->reinit_in_progress && !qsv_maybe_apply_timed_reinit_bg(obsqsv, frame->pts)) {
+		qsv_pending_enqueue(obsqsv, frame);
+		*received_packet = false;
+		return true; // queued - re-fed after the background reset completes
+	}
+
+	/* (b) While the worker runs: queue this frame and emit nothing. */
+	if (obsqsv->reinit_in_progress) {
+		qsv_pending_enqueue(obsqsv, frame);
+		if (os_event_try(obsqsv->reinit_done)) {
+			pthread_join(obsqsv->reinit_thread, NULL); /* worker already finished */
+			os_event_destroy(obsqsv->reinit_done);
+			obsqsv->reinit_done = NULL;
+			obsqsv->reinit_in_progress = false;
+			info("background re-init complete - draining %zu queued frame(s)", obsqsv->pending_frames.num);
+		}
+		if (obsqsv->reinit_in_progress) {
+			*received_packet = false;
+			return true; // worker still running - this frame is queued
+		}
+	}
+
+	/* (c) While queued frames remain, re-feed the oldest one (DTS order) through the normal
+	 * path and keep queueing incoming frames, so no frame is dropped and DTS stays continuous
+	 * across the boundary. (See the reinit_in_progress comment for the 1-in/1-out trade-off.) */
+	struct encoder_frame queued;
+	const struct encoder_frame *enc = frame;
+	if (obsqsv->pending_frames.num > 0) {
+		qsv_pending_enqueue(obsqsv, frame);
+		struct qsv_pending_frame pf;
+		qsv_pending_dequeue(obsqsv, &pf);
+		memset(&queued, 0, sizeof(queued));
+		queued.data[0]     = pf.y;
+		queued.data[1]     = pf.uv;
+		queued.linesize[0] = pf.ls0;
+		queued.linesize[1] = pf.ls1;
+		queued.pts          = pf.pts;
+		enc = &queued;
+	}
+
+	pthread_mutex_lock(&g_QsvLock);
+
+	if (!qsv_check_staged(obsqsv, enc->pts, enc->linesize[0], obsqsv->delivery_format)) {
+		if (enc != frame) {
+			bfree(queued.data[0]); /* dequeued frame is dropped - release its copies */
+			bfree(queued.data[1]);
+		}
 		pthread_mutex_unlock(&g_QsvLock);
 		*received_packet = false;
 		return true; // skip this frame - encoder is transitioning
@@ -1932,16 +2966,34 @@ static bool obs_qsv_encode(void *data, struct encoder_frame *frame, struct encod
 	if (obs_encoder_has_roi(obsqsv->encoder))
 		obs_qsv_setup_rois(obsqsv);
 
-	// FIXME: remove null check from the top of this function
-	// if we actually do expect null frames to complete output.
-	if (frame)
-		ret = qsv_encoder_encode(obsqsv->context, qsvPTS, frame->data[0], frame->data[1], frame->linesize[0],
-					 frame->linesize[1], &pBS);
-	else
-		ret = qsv_encoder_encode(obsqsv->context, qsvPTS, NULL, NULL, 0, 0, &pBS);
+	/* While a timed resize is pending, the MFX session is still at the OLD size: scale
+	 * the incoming new-size frame down so it can be encoded by the current session with
+	 * continuous DTS (mirrors obs_x264_encode's timed-resize transition). Queued frames
+	 * are already at session size and must not be scaled - the scaler reads the frame at
+	 * the encoder's target dimensions, which would be out of bounds for them. */
+	uint8_t *enc_y = enc->data[0];
+	uint8_t *enc_uv = enc->data[1];
+	uint32_t enc_ls0 = enc->linesize[0];
+	uint32_t enc_ls1 = enc->linesize[1];
+	if (obsqsv->resize_pending && obsqsv->scale_buf[0] && enc == frame) {
+		if (obsqsv->delivery_format == VIDEO_FORMAT_P010)
+			qsv_scale_p010_to_old_size(obsqsv, enc);
+		else
+			qsv_scale_nv12_to_old_size(obsqsv, enc);
+		enc_y   = obsqsv->scale_buf[0];
+		enc_uv  = obsqsv->scale_buf[1];
+		enc_ls0 = obsqsv->scale_stride[0];
+		enc_ls1 = obsqsv->scale_stride[1];
+	}
+
+	ret = qsv_encoder_encode(obsqsv->context, ts_obs_to_mfx(enc->pts, voi), enc_y, enc_uv, enc_ls0, enc_ls1, &pBS);
 
 	if (ret < 0) {
 		warn("encode failed: mfxStatus=%d", ret);
+		if (enc != frame) {
+			bfree(queued.data[0]); /* dequeued frame was not encoded - release its copies */
+			bfree(queued.data[1]);
+		}
 		pthread_mutex_unlock(&g_QsvLock);
 		return false;
 	}
@@ -1954,6 +3006,14 @@ static bool obs_qsv_encode(void *data, struct encoder_frame *frame, struct encod
 		parse_packet_hevc(obsqsv, packet, pBS, voi, received_packet);
 	else if (obsqsv->codec == QSV_CODEC_VP9)
 		parse_packet_vp9(obsqsv, packet, pBS, voi, received_packet);
+
+	if (*received_packet)
+		qsv_abr_tick(obsqsv, (uint32_t)obsqsv->packet_data.num);
+
+	if (enc != frame) {
+		bfree(queued.data[0]); /* re-fed frame was encoded - release its copies */
+		bfree(queued.data[1]);
+	}
 
 	pthread_mutex_unlock(&g_QsvLock);
 
@@ -1989,9 +3049,22 @@ static bool obs_qsv_encode_tex(void *data, struct encoder_texture *tex, int64_t 
 
 	mfxU64 qsvPTS = ts_obs_to_mfx(pts, voi);
 
+	/* Timed multitrack FPS re-init (staged in qsv_check_staged): a texture cannot be CPU-scaled to
+	 * the old size, so only effective-FPS changes can be staged on this path - no scaling is needed,
+	 * the Close+Init simply lands on the shared keyframe boundary. */
+	if (!qsv_maybe_apply_timed_reinit(obsqsv, pts)) {
+		pthread_mutex_unlock(&g_QsvLock);
+		*next_key = lock_key;
+		*received_packet = false;
+		return true; // skip this frame - encoder is transitioning
+	}
+
 	/* Texture path: dimensions are self-describing in the D3D11 texture,
-	 * so no linesize guard needed (pass UINT32_MAX to skip the check). */
-	if (!qsv_check_staged(obsqsv, UINT32_MAX)) {
+	 * so no linesize guard needed (pass UINT32_MAX to skip the check). The
+	 * timed multitrack resize is not available here (a texture cannot be
+	 * CPU-scaled to the old size), so a grouped texture encoder re-inits
+	 * immediately like before. */
+	if (!qsv_check_staged(obsqsv, pts, UINT32_MAX, VIDEO_FORMAT_NONE)) {
 		pthread_mutex_unlock(&g_QsvLock);
 		*next_key = lock_key;
 		*received_packet = false;
@@ -2017,6 +3090,9 @@ static bool obs_qsv_encode_tex(void *data, struct encoder_texture *tex, int64_t 
 		parse_packet_hevc(obsqsv, packet, pBS, voi, received_packet);
 	else if (obsqsv->codec == QSV_CODEC_VP9)
 		parse_packet_vp9(obsqsv, packet, pBS, voi, received_packet);
+
+	if (*received_packet)
+		qsv_abr_tick(obsqsv, (uint32_t)obsqsv->packet_data.num);
 
 	pthread_mutex_unlock(&g_QsvLock);
 

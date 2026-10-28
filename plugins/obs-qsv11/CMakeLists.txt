@@ -12,6 +12,10 @@ add_library(OBS::qsv11 ALIAS obs-qsv11)
 
 find_package(VPL 2.9 REQUIRED)
 
+if(NOT TARGET OBS::abr-gov)
+  add_subdirectory("${CMAKE_SOURCE_DIR}/shared/abr-gov" "${CMAKE_BINARY_DIR}/shared/abr-gov")
+endif()
+
 if(OS_LINUX)
   find_package(Libva REQUIRED)
 endif()
@@ -44,6 +48,7 @@ target_link_libraries(
   obs-qsv11
   PRIVATE
     OBS::libobs
+    OBS::abr-gov
     VPL::VPL
     $<$<PLATFORM_ID:Linux>:Libva::va>
     $<$<PLATFORM_ID:Linux>:Libva::drm>

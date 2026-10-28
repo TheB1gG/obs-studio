@@ -96,6 +96,15 @@ static const char *const qsv_usage_translation_keys[] = {"TargetUsage.TU1", "Tar
 							 "TargetUsage.TU7", 0};
 static const char *const qsv_usage_names[] = {"TU1", "TU2", "TU3", "TU4", "TU5", "TU6", "TU7", 0};
 static const char *const qsv_latency_names[] = {"ultra-low", "low", "normal", 0};
+
+/* ABR (QVBR) rate-steering strategy. Both are exposed in the UI so a live stream can be compared
+ * against each implementation with real-world experience. The transport (the §23 NULL-frame pre-flush +
+ * StartNewSequence=ON Reset) is identical; only WHICH mfx parameter the governor moves differs. */
+enum qsv_abr_strategy {
+	QSV_ABR_STRATEGY_TARGET = 0,   /* default: steer TargetKbps (validated baseline, abr-findings §23) */
+	QSV_ABR_STRATEGY_CEILING = 1,  /* comparison: steer MaxKbps (Agent-1 "push the ceiling" model) */
+};
+
 typedef struct qsv_t qsv_t;
 
 typedef struct {
@@ -119,6 +128,10 @@ typedef struct {
 	mfxU16 nKeyIntSec;
 	mfxU16 nbFrames;
 	mfxU16 nICQQuality;
+	mfxU16 nQVBRQuality;
+	int nABRStrategy;      /* enum qsv_abr_strategy (ABR/QVBR only) */
+	bool bABRLowLatency;   /* ABR low-latency comparison mode: no B-frames + AsyncDepth=1 + LowDelayBRC */
+	mfxU16 nABRCeilingKbps; /* fixed session ceiling for VBV sizing (ABR/QVBR only) */
 	mfxU16 VideoFormat;
 	mfxU16 VideoFullRange;
 	mfxU16 ColourPrimaries;
@@ -163,6 +176,10 @@ int qsv_param_parse(qsv_param_t *, const char *name, const char *value);
 int qsv_param_apply_profile(qsv_param_t *, const char *profile);
 int qsv_param_default_preset(qsv_param_t *, const char *preset, const char *tune);
 int qsv_encoder_reconfig(qsv_t *, qsv_param_t *);
+int qsv_encoder_reconfig_soft(qsv_t *, qsv_param_t *);
+/* Full-session re-init (Close+Init) that also applies a changed frame rate / RC. Reset() alone
+ * cannot change FrameInfo (FrameRateExtN/Den), so live effective-FPS changes must go through this. */
+int qsv_encoder_reconfig_full(qsv_t *, qsv_param_t *);
 int qsv_encoder_reset_full(qsv_t *, qsv_param_t *, enum qsv_codec);
 void qsv_encoder_force_idr(qsv_t *);
 void qsv_encoder_version(unsigned short *major, unsigned short *minor);

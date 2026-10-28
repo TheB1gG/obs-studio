@@ -61,6 +61,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "common_utils.h"
 
 #include <vector>
+#include <deque>
+#include <algorithm>
 
 class QSV_Encoder_Internal {
 public:
@@ -77,6 +79,7 @@ public:
 	mfxStatus ClearData();
 	mfxStatus Reset(qsv_param_t *pParams, enum qsv_codec codec);
 	mfxStatus ReconfigureEncoder();
+	mfxStatus ReconfigureEncoderSoft();
 	mfxStatus Resize(qsv_param_t *pParams);
 	void ForceIDR() { m_force_idr_next = true; }
 	bool UpdateParams(qsv_param_t *pParams);
@@ -95,6 +98,12 @@ protected:
 	mfxStatus LoadY410(mfxFrameSurface1 *pSurface, uint8_t *pDataY, uint32_t strideY);
 	mfxStatus Drain();
 	int GetFreeTaskIndex(Task *pTaskPool, mfxU16 nPoolSize);
+	// Live ABR re-anchor reset actuator: fully empty the encoder before Reset() and keep the
+	// flushed packets available for ordered re-delivery. See abr-findings §23/§28.
+	mfxStatus FlushPipeline();
+	mfxStatus HarvestSlot(int idx);
+	void ClearFlushQueue();
+	void DeliverWithFlushQueue(mfxBitstream **pBS);
 
 private:
 	mfxVersion m_ver;
@@ -132,6 +141,18 @@ private:
 	int m_nTaskIdx;
 	int m_nFirstSyncTask;
 	mfxBitstream m_outBitstream;
+
+	// Packets harvested by FlushPipeline() during a live ABR re-anchor reset. They are the in-flight
+	// frames pushed out of the encoder before Reset(); they must be delivered BEFORE post-reset frames
+	// to preserve timestamp order. Each entry owns its payload copy. See abr-findings §23/§28.
+	struct FlushPacket {
+		mfxU8 *data;      // owned copy of Data[DataOffset..+DataLength]
+		mfxU32 data_length;
+		mfxU64 time_stamp;  // TimeStamp (PTS)
+		mfxI64 decode_ts;   // DecodeTimeStamp (DTS)
+		mfxU16 frame_type;  // FrameType
+	};
+	std::deque<FlushPacket> m_flushQueue;
 	bool m_bUseD3D11;
 	bool m_bUseTexAlloc;
 	static mfxU16 g_numEncodersOpen;

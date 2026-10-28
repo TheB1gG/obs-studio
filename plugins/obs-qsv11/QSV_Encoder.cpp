@@ -227,8 +227,68 @@ int qsv_param_apply_profile(qsv_param_t *, const char *profile)
 int qsv_encoder_reconfig(qsv_t *pContext, qsv_param_t *pParams)
 {
 	QSV_Encoder_Internal *pEncoder = (QSV_Encoder_Internal *)pContext;
-	pEncoder->UpdateParams(pParams);
+
+	/* UpdateParams() syncs the requested RC/bitrate values into m_mfxEncParams and reports whether any
+	 * relevant value actually changed. MFXVideoENCODE::Reset() is itself a reconfiguration (it forces an
+	 * IDR and resets the BRC), so skip it entirely when nothing relevant moved - this avoids an
+	 * unnecessary IDR / bitrate disturbance for a no-op update. */
+	if (!pEncoder->UpdateParams(pParams))
+		return true; /* success: nothing to apply */
+
 	mfxStatus sts = pEncoder->ReconfigureEncoder();
+
+	/* Negative mfxStatus values are hard errors (MFX_ERR_*). Zero is success and positive values are
+	 * non-fatal warnings (e.g. MFX_WRN_VALUE_NOT_CHANGED when a value is clipped to its valid range, or
+	 * MFX_WRN_INCOMPATIBLE_VIDEO_PARAM). Only a genuine error means the encoder rejected the new
+	 * configuration; never report success in that case. */
+	if (sts < 0) {
+		do_log(LOG_ERROR, "MFXVideoENCODE::Reset failed (mfxStatus=%d)", (int)sts);
+		return false;
+	}
+	if (sts != MFX_ERR_NONE)
+		do_log(LOG_WARNING, "MFXVideoENCODE::Reset returned a warning (mfxStatus=%d)", (int)sts);
+
+	return true;
+}
+
+/* Live re-anchor for ABR: UpdateParams() syncs the governed TargetKbps into m_mfxEncParams (the QVBR case
+ * touches TargetKbps only), then ReconfigureEncoderSoft() does a full pipeline flush followed by a
+ * StartNewSequence=ON Reset that re-anchors the driver's BRC to the new target. The ON reset inserts an IDR,
+ * so the caller (qsv_check_staged) fires it at a keyframe boundary: the IDR coincides with the natural GOP
+ * keyframe, keeping multitrack sibling keyframes aligned. */
+int qsv_encoder_reconfig_soft(qsv_t *pContext, qsv_param_t *pParams)
+{
+	QSV_Encoder_Internal *pEncoder = (QSV_Encoder_Internal *)pContext;
+
+	/* UpdateParams() reports whether any relevant value actually moved; skip the Reset entirely for a
+	 * no-op so a repeated governor tick does not churn the encoder. */
+	if (!pEncoder->UpdateParams(pParams))
+		return true; /* success: nothing to apply */
+
+	mfxStatus sts = pEncoder->ReconfigureEncoderSoft();
+
+	/* Negative mfxStatus values are hard errors (MFX_ERR_*). Zero is success and positive values are
+	 * non-fatal warnings. Only a genuine error means the encoder rejected the new rate; never report
+	 * success in that case (the caller keeps the previous target and the governor re-steers). */
+	if (sts < 0) {
+		do_log(LOG_ERROR, "MFXVideoENCODE::Reset (ABR re-anchor) failed (mfxStatus=%d)", (int)sts);
+		return false;
+	}
+	if (sts != MFX_ERR_NONE)
+		do_log(LOG_WARNING, "MFXVideoENCODE::Reset (ABR re-anchor) returned a warning (mfxStatus=%d)", (int)sts);
+
+	return true;
+}
+
+/* Full-session re-init for a live effective-FPS change. UpdateParams() syncs the new
+ * FrameRateExtN/Den (and any concurrent RC change) into m_mfxEncParams; Resize() then does a
+ * full Close+Init so the frame-rate change actually takes effect (Reset() cannot change
+ * FrameInfo in place). Dimensions are preserved because pParams still carries the current size. */
+int qsv_encoder_reconfig_full(qsv_t *pContext, qsv_param_t *pParams)
+{
+	QSV_Encoder_Internal *pEncoder = (QSV_Encoder_Internal *)pContext;
+	pEncoder->UpdateParams(pParams);
+	mfxStatus sts = pEncoder->Resize(pParams);
 
 	if (sts != MFX_ERR_NONE)
 		return false;

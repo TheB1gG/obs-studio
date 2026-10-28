@@ -60,6 +60,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <vpl/mfxvideo++.h>
 #include <vpl/mfxdispatcher.h>
 #include <obs-module.h>
+#include <chrono>
+#include <cstdlib>
 #ifdef _WIN32
 #include "common_directx11.h"
 #endif
@@ -330,6 +332,23 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 		m_mfxEncParams.mfx.BufferSizeInKB = (pParams->nTargetBitRate / 8) * 2;
 		m_mfxEncParams.mfx.InitialDelayInKB = (pParams->nTargetBitRate / 8) * 1;
 		break;
+	case MFX_RATECONTROL_QVBR: {
+		/* ABR base mode: quality-anchored VBR. The live governor steers ONE rate parameter (TargetKbps in
+		 * target mode, MaxKbps in ceiling mode) around the user's bitrate while the other stays fixed.
+		 * Size the VBV buffer for the SESSION CEILING rather than the current rate, so that raising the
+		 * steered parameter toward the ceiling is accepted without a live buffer resize; resizing the VBV
+		 * buffer makes this driver reject the Reset with MFX_ERR_INVALID_VIDEO_PARAM (-14). QVBRQuality is
+		 * carried in m_co3 (set below) and never changed on a live reconfig. */
+		m_mfxEncParams.mfx.TargetKbps = pParams->nTargetBitRate;
+		m_mfxEncParams.mfx.MaxKbps = pParams->nMaxBitRate;
+		const mfxU16 abr_buf_kbps = (pParams->nABRCeilingKbps > 0) ? pParams->nABRCeilingKbps
+		                                                             : ((pParams->nMaxBitRate > pParams->nTargetBitRate)
+								      ? pParams->nMaxBitRate
+								      : pParams->nTargetBitRate);
+		m_mfxEncParams.mfx.BufferSizeInKB = (abr_buf_kbps / 8) * 2;
+		m_mfxEncParams.mfx.InitialDelayInKB = (abr_buf_kbps / 8) * 1;
+		break;
+	}
 	case MFX_RATECONTROL_CQP:
 		m_mfxEncParams.mfx.QPI = pParams->nQPI;
 		m_mfxEncParams.mfx.QPB = pParams->nQPB;
@@ -399,10 +418,21 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 	extendedBuffers.push_back((mfxExtBuffer *)&m_co2);
 
 	const bool optBrcSupport = HasOptimizedBRCSupport(platform, m_ver, pParams->nRateControl);
-	if (pParams->video_fmt_ayuv || pParams->video_fmt_y410 || optBrcSupport || codec == QSV_CODEC_VP9) {
+	if (pParams->video_fmt_ayuv || pParams->video_fmt_y410 || optBrcSupport || codec == QSV_CODEC_VP9 ||
+	    pParams->nRateControl == MFX_RATECONTROL_QVBR) {
 		memset(&m_co3, 0, sizeof(mfxExtCodingOption3));
 		m_co3.Header.BufferId = MFX_EXTBUFF_CODING_OPTION3;
 		m_co3.Header.BufferSz = sizeof(m_co3);
+
+		if (pParams->nRateControl == MFX_RATECONTROL_QVBR) {
+			m_co3.QVBRQuality = pParams->nQVBRQuality;
+
+			/* Low-latency ABR comparison mode: make the BRC re-regulate faster after a live
+			 * TargetKbps/MaxKbps change. Set once at Init (never changed on a live reset - that
+			 * parameter is not in the driver's mid-stream-changeable set, abr-findings §15). */
+			if (pParams->bABRLowLatency)
+				m_co3.LowDelayBRC = MFX_CODINGOPTION_ON;
+		}
 
 		if (optBrcSupport) {
 			m_co3.WinBRCSize = pParams->nFpsNum / pParams->nFpsDen;
@@ -703,27 +733,70 @@ mfxStatus QSV_Encoder_Internal::InitParams(qsv_param_t *pParams, enum qsv_codec 
 
 bool QSV_Encoder_Internal::UpdateParams(qsv_param_t *pParams)
 {
+	/* m_mfxEncParams is the configuration last applied via Init()/Reset(), i.e. the currently-effective
+	 * session parameters. Track whether this update actually changes any relevant field before mutating:
+	 * MFXVideoENCODE::Reset() is itself a reconfiguration (it forces an IDR and resets the BRC), so a no-op
+	 * update must skip it. Only the relevant fields are touched below; every other parameter and extension
+	 * buffer is left exactly as-is. */
+	bool changed = (m_mfxEncParams.mfx.RateControlMethod != pParams->nRateControl);
+
 	/* Update rate control method */
 	m_mfxEncParams.mfx.RateControlMethod = pParams->nRateControl;
 
 	switch (pParams->nRateControl) {
 	case MFX_RATECONTROL_CBR:
+		/* Only the rate may change on a live reconfig. The VBV buffer
+		 * (BufferSizeInKB/InitialDelayInKB) is fixed at Init; this QSV driver rejects any
+		 * Reset() that resizes it with MFX_ERR_INVALID_VIDEO_PARAM (-14). Recomputing it here
+		 * (with the *2 formula, which differs from the optimized-BRC *1 used in InitParams)
+		 * made every live CBR change fail except the coincidental case where the new *2 buffer
+		 * happened to equal the old *1 buffer. True CBR also keeps max == target: at open the
+		 * in-place Query (see Open()) lets the driver write MaxKbps back into m_mfxEncParams (=
+		 * the old target), so it must be refreshed to the new target too. */
+		if (m_mfxEncParams.mfx.TargetKbps != pParams->nTargetBitRate ||
+		    m_mfxEncParams.mfx.MaxKbps != pParams->nTargetBitRate)
+			changed = true;
 		m_mfxEncParams.mfx.TargetKbps = pParams->nTargetBitRate;
-		m_mfxEncParams.mfx.BufferSizeInKB = (pParams->nTargetBitRate / 8) * 2;
-		m_mfxEncParams.mfx.InitialDelayInKB = m_mfxEncParams.mfx.BufferSizeInKB / 2;
+		m_mfxEncParams.mfx.MaxKbps = pParams->nTargetBitRate;
 		break;
 	case MFX_RATECONTROL_VBR:
+		/* Same VBV-buffer constraint as CBR: keep BufferSizeInKB/InitialDelayInKB at their
+		 * initialized values and only change the target/max rate on a live reconfig. */
+		if (m_mfxEncParams.mfx.TargetKbps != pParams->nTargetBitRate ||
+		    m_mfxEncParams.mfx.MaxKbps != pParams->nMaxBitRate)
+			changed = true;
 		m_mfxEncParams.mfx.TargetKbps = pParams->nTargetBitRate;
 		m_mfxEncParams.mfx.MaxKbps = pParams->nMaxBitRate;
-		m_mfxEncParams.mfx.BufferSizeInKB = (pParams->nTargetBitRate / 8) * 2;
-		m_mfxEncParams.mfx.InitialDelayInKB = (pParams->nTargetBitRate / 8) * 1;
+		break;
+	case MFX_RATECONTROL_QVBR:
+		/* ABR: the governor steers ONE rate parameter on a live reconfig; QVBRQuality and the VBV buffer
+		 * are fixed at Init and must not be touched here (changing them makes this driver reject the
+		 * Reset with MFX_ERR_INVALID_VIDEO_PARAM (-14)). Which parameter moves depends on the strategy:
+		 *  - target  (default): move TargetKbps only; MaxKbps stays the fixed ceiling. Validated §23.
+		 *  - ceiling (compare): move MaxKbps only; TargetKbps stays the fixed base anchor. NOTE: this
+		 *    driver may treat a MaxKbps change as sequence-affecting (abr-findings §15) - that is exactly
+		 *    what this comparison mode exists to expose in a real stream. */
+		if (pParams->nABRStrategy == QSV_ABR_STRATEGY_CEILING) {
+			if (m_mfxEncParams.mfx.MaxKbps != pParams->nMaxBitRate)
+				changed = true;
+			m_mfxEncParams.mfx.MaxKbps = pParams->nMaxBitRate;
+		} else {
+			if (m_mfxEncParams.mfx.TargetKbps != pParams->nTargetBitRate)
+				changed = true;
+			m_mfxEncParams.mfx.TargetKbps = pParams->nTargetBitRate;
+		}
 		break;
 	case MFX_RATECONTROL_CQP:
+		if (m_mfxEncParams.mfx.QPI != pParams->nQPI || m_mfxEncParams.mfx.QPB != pParams->nQPB ||
+		    m_mfxEncParams.mfx.QPP != pParams->nQPP)
+			changed = true;
 		m_mfxEncParams.mfx.QPI = pParams->nQPI;
 		m_mfxEncParams.mfx.QPB = pParams->nQPB;
 		m_mfxEncParams.mfx.QPP = pParams->nQPP;
 		break;
 	case MFX_RATECONTROL_ICQ:
+		if (m_mfxEncParams.mfx.ICQQuality != pParams->nICQQuality)
+			changed = true;
 		m_mfxEncParams.mfx.ICQQuality = pParams->nICQQuality;
 		break;
 	default:
@@ -736,30 +809,153 @@ bool QSV_Encoder_Internal::UpdateParams(qsv_param_t *pParams)
 	 * the per-frame bit budget / bitrate calculation correct after a live FPS
 	 * change. It takes effect from the forced IDR of the following Reset(). */
 	if (pParams->nFpsNum != 0 && pParams->nFpsDen != 0) {
+		if (m_mfxEncParams.mfx.FrameInfo.FrameRateExtN != pParams->nFpsNum ||
+		    m_mfxEncParams.mfx.FrameInfo.FrameRateExtD != pParams->nFpsDen)
+			changed = true;
 		m_mfxEncParams.mfx.FrameInfo.FrameRateExtN = pParams->nFpsNum;
 		m_mfxEncParams.mfx.FrameInfo.FrameRateExtD = pParams->nFpsDen;
 
 		/* Refresh the fps-derived BRC window size (frames/second) so it keeps
 		 * representing ~1 second of video at the new effective rate. */
 		m_co3.WinBRCSize = pParams->nFpsNum / pParams->nFpsDen;
+
+		/* Refresh the GOP length for the new effective rate (in frames). GopPicSize is otherwise
+		 * frozen at its create-time value, so after a live FPS change MFX would keep emitting IDRs
+		 * every old_rate*keyint_sec frames - e.g. 240 frames = 16 s of video at 15 fps instead of
+		 * 60 frames = 4 s - desyncing this track's keyframe cadence from its multitrack siblings. */
+		if (pParams->nKeyIntSec) {
+			const mfxU16 new_gop = (mfxU16)(pParams->nKeyIntSec * pParams->nFpsNum / (float)pParams->nFpsDen);
+			if (m_mfxEncParams.mfx.GopPicSize != new_gop)
+				changed = true;
+			m_mfxEncParams.mfx.GopPicSize = new_gop;
+		}
 	}
 
-	return true;
+	return changed;
 }
 
 	mfxStatus QSV_Encoder_Internal::ReconfigureEncoder()
 {
+	/* Live RC reconfig for a manual (non-ABR) settings change. A plain Reset() forces an IDR and resets the
+	 * BRC; the caller (qsv_check_staged) fires it at a keyframe boundary so the new sequence starts on-grid.
+	 * The ABR path uses ReconfigureEncoderSoft() instead, which re-anchors via StartNewSequence=ON after a
+	 * full pipeline flush. */
 	return m_pmfxENC->Reset(&m_mfxEncParams);
+}
+
+/* ABR live reconfigure: change the rate-control target via Reset() (not a full Close+Init) and RE-ANCHOR
+ * the BRC to it.
+ *
+ * We use StartNewSequence=ON: a plain Reset() keeps the driver's BRC/VBV state, so on HEVC the rate
+ * controller drifts toward a changed TargetKbps for ~20 s (measured on a 2560x1440@30 multitrack stream)
+ * without re-anchoring. ON snaps the BRC to the new target immediately. The cost of ON is that it inserts
+ * an IDR, so the caller (qsv_check_staged) fires this exactly at a keyframe boundary: the explicit IDR then
+ * coincides with the natural GOP keyframe, keeping this track's keyframe grid aligned with multitrack
+ * siblings (validated in the 2-encoder harness, abr-findings §38). Only TargetKbps may move on an ABR
+ * reconfig - a MaxKbps change is sequence-affecting too (abr-findings §15), which is why UpdateParams' QVBR
+ * case touches TargetKbps only.
+ *
+ * QSV has no in-place rate update: TargetKbps only takes effect via Reset(). Reset() with in-flight
+ * frames corrupts the async pipeline (stall / MFX_ERR_NOT_ENOUGH_BUFFER), so we must first fully empty
+ * it. Sequence (validated by the standalone probe V5, abr-findings §23):
+ *   1. FlushPipeline(): feed NULL frames until the encoder stops producing output, harvesting every
+ *      emitted packet (owned) into m_flushQueue. This pushes out BOTH the task-bound in-flight frames
+ *      AND the driver's internal B-frame reordering residual - a plain Drain() leaves the reorder queue
+ *      full (lost frames) and stale DataLength/DataOffset (-5).
+ *   2. Drain(): residual safety sync of any remaining sync point.
+ *   3. Re-anchor the delivery ring to slot 0: submissions allocate by index order, so a non-zero cursor
+ *      left by the harvest would deliver post-reset tasks out of call order (DTS/PTS scrambling, §28).
+ *   4. Reset(StartNewSequence=ON): apply the new TargetKbps (already in m_mfxEncParams via the C wrapper's
+ *      UpdateParams) and re-anchor the BRC; the inserted IDR lands on the keyframe boundary.
+ * The harvested packets are re-delivered in order by DeliverWithFlushQueue() on subsequent Encode calls. */
+static inline int64_t qsv_now_ms()
+{
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+mfxStatus QSV_Encoder_Internal::ReconfigureEncoderSoft()
+{
+	const int64_t t0 = qsv_now_ms();   // ms, for per-phase reset-cost timing
+
+	mfxStatus sts = FlushPipeline();
+	const int64_t t1 = qsv_now_ms();
+	if (sts < MFX_ERR_NONE) {
+		blog(LOG_WARNING, "[qsv] ABR re-anchor: flush failed (mfxStatus=%d) - aborting, keeping previous target",
+		     (int)sts);
+		ClearFlushQueue();   // discard any partial harvest; encoder state is unknown
+		return sts;
+	}
+
+	sts = Drain();
+	const int64_t t2 = qsv_now_ms();
+	if (sts < MFX_ERR_NONE) {
+		blog(LOG_WARNING, "[qsv] ABR re-anchor: drain failed (mfxStatus=%d)", (int)sts);
+		ClearFlushQueue();
+		return sts;
+	}
+
+	m_nFirstSyncTask = 0;   // §28 ring re-anchor (see abr-findings §28.4)
+
+	mfxExtEncoderResetOption reset_opt;
+	memset(&reset_opt, 0, sizeof(reset_opt));
+	reset_opt.Header.BufferId = MFX_EXTBUFF_ENCODER_RESET_OPTION;
+	reset_opt.Header.BufferSz = sizeof(reset_opt);
+	/* Re-anchor the BRC to the new TargetKbps. A plain Reset keeps the driver's BRC/VBV state and drifts
+	 * toward the target for ~20 s on HEVC (E5); ON snaps it immediately. The inserted IDR is fired at a
+	 * keyframe boundary by the caller, so it coincides with the natural GOP keyframe (multitrack-safe). */
+	reset_opt.StartNewSequence = MFX_CODINGOPTION_ON;
+
+	/* Attach the reset option to the encoder params for this one Reset call only, then restore the ext-
+	 * buffer list. Runs on the encode thread under g_QsvLock, so no locking is needed. */
+	extendedBuffers.push_back((mfxExtBuffer *)&reset_opt);
+	m_mfxEncParams.ExtParam = extendedBuffers.data();
+	m_mfxEncParams.NumExtParam = (mfxU16)extendedBuffers.size();
+
+	const int64_t t3 = qsv_now_ms();
+	const mfxStatus rsts = m_pmfxENC->Reset(&m_mfxEncParams);
+	const int64_t t4 = qsv_now_ms();
+
+	extendedBuffers.pop_back();
+	m_mfxEncParams.ExtParam = extendedBuffers.data();
+	m_mfxEncParams.NumExtParam = (mfxU16)extendedBuffers.size();
+
+	/* Post-reset read-back: MFX_WRN_INCOMPATIBLE_VIDEO_PARAM (5) means "incompatibility resolved", i.e. the
+	 * driver may have CORRECTED our params. Read back the effective TargetKbps/MaxKbps to detect a silent
+	 * revert - the prime suspect for a HEVC re-target not taking effect (see abr-findings §36). */
+	mfxVideoParam eff;
+	memset(&eff, 0, sizeof(eff));
+	const mfxStatus gests = m_pmfxENC->GetVideoParam(&eff);
+
+	blog(LOG_INFO, "[qsv] ABR re-anchor: phases flush=%lldms drain=%lldms reset=%lldms | "
+	     "requested TargetKbps=%u MaxKbps=%u -> effective (GetVideoParam sts=%d) TargetKbps=%u MaxKbps=%u BufferSizeInKB=%u",
+	     (long long)(t1 - t0), (long long)(t2 - t1), (long long)(t4 - t3),
+	     (unsigned)m_mfxEncParams.mfx.TargetKbps, (unsigned)m_mfxEncParams.mfx.MaxKbps,
+	     (int)gests, (unsigned)eff.mfx.TargetKbps, (unsigned)eff.mfx.MaxKbps, (unsigned)eff.mfx.BufferSizeInKB);
+
+	if (rsts == MFX_WRN_INCOMPATIBLE_VIDEO_PARAM)
+		blog(LOG_INFO, "[qsv] ABR re-anchor: Reset returned MFX_WRN_INCOMPATIBLE_VIDEO_PARAM "
+		     "(mfxStatus=5) - 'incompatibility resolved' by driver (see read-back above for effective values)");
+
+	blog(LOG_INFO, "[qsv] ABR re-anchor complete: TargetKbps=%u MaxKbps=%u (StartNewSequence=ON, %zu flushed "
+	     "packet(s) queued for ordered delivery)",
+	     (unsigned)m_mfxEncParams.mfx.TargetKbps, (unsigned)m_mfxEncParams.mfx.MaxKbps, m_flushQueue.size());
+
+	return rsts;
 }
 
 mfxStatus QSV_Encoder_Internal::Resize(qsv_param_t *pParams)
 {
 	mfxStatus sts;
 
+	/* A full session teardown invalidates any held-back flushed packets and the delivery-ring cursor. */
+	ClearFlushQueue();
+
 	/* Drain any pending encode operations */
 	sts = Drain();
 	if (sts < MFX_ERR_NONE)
 		return sts;
+	m_nFirstSyncTask = 0;   // §28 ring re-anchor after a full flush
 
 	/* Flush GPU to ensure all D3D11 work referencing old surfaces is complete */
 #ifdef _WIN32
@@ -1262,6 +1458,7 @@ mfxStatus QSV_Encoder_Internal::Encode(uint64_t ts, uint8_t *pDataY, uint8_t *pD
 	}
 
 	m_ctrl.FrameType = MFX_FRAMETYPE_UNKNOWN; // reset for next frame
+	DeliverWithFlushQueue(pBS);   // honor flush-queue ordering (no-op in steady state)
 	return sts;
 }
 
@@ -1330,6 +1527,7 @@ mfxStatus QSV_Encoder_Internal::Encode_tex(uint64_t ts, void *tex, uint64_t lock
 	}
 
 	m_ctrl.FrameType = MFX_FRAMETYPE_UNKNOWN; // reset for next frame
+	DeliverWithFlushQueue(pBS);   // honor flush-queue ordering (no-op in steady state)
 	return sts;
 }
 
@@ -1348,8 +1546,190 @@ mfxStatus QSV_Encoder_Internal::Drain()
 	return sts;
 }
 
+/* Complete one task-pool slot and buffer its output into m_flushQueue, then clear the slot so no stale
+ * DataLength/DataOffset can reach a later EncodeFrameAsync (the -5 failure mode, abr-findings §23 V6). */
+mfxStatus QSV_Encoder_Internal::HarvestSlot(int idx)
+{
+	Task &t = m_pTaskPool[idx];
+
+	if (t.syncp) {
+		mfxStatus sts = MFXVideoCORE_SyncOperation(m_session, t.syncp, 60000);
+		if (sts < MFX_ERR_NONE)
+			return sts;
+	}
+
+	if (t.mfxBS.DataLength > 0) {
+		FlushPacket fp;
+		fp.data = new mfxU8[t.mfxBS.DataLength];
+		memcpy(fp.data, &t.mfxBS.Data[t.mfxBS.DataOffset], t.mfxBS.DataLength);
+		fp.data_length = t.mfxBS.DataLength;
+		fp.time_stamp = t.mfxBS.TimeStamp;
+		fp.decode_ts = t.mfxBS.DecodeTimeStamp;
+		fp.frame_type = t.mfxBS.FrameType;
+		m_flushQueue.push_back(fp);
+	}
+
+	t.syncp = NULL;
+	t.mfxBS.DataLength = 0;
+	t.mfxBS.DataOffset = 0;
+	return MFX_ERR_NONE;
+}
+
+/* Fully empty the encoder before a live Reset by feeding a BOUNDED burst of NULL frames and then
+ * draining every pending task, harvesting each emitted packet (owned) into m_flushQueue. Mirrors the
+ * standalone probe V5 (abr-findings §23): NULL frames are routed through free task-pool slots exactly like
+ * real frames, so both the task-bound in-flight frames AND the driver's internal B-frame reordering residual
+ * are pushed out and captured.
+ *
+ * Why bounded rather than "inject until quiescent": when EncodeFrameAsync completes asynchronously - the
+ * normal case with B-frames or a busy device - a NULL submitted each iteration immediately re-marks its slot
+ * pending, so a whole-pool quiescence counter never advances and the loop burns the entire 256-iteration cap,
+ * blocking the encode thread for hundreds of ms (the visible stream stall + A/V desync seen with B-frames).
+ * We instead submit just enough NULLs to cover the pipeline depth (AsyncDepth in-flight tasks + the B-frame
+ * reorder residual) and then drain by syncing whatever is pending; that converges because we stop injecting. */
+mfxStatus QSV_Encoder_Internal::FlushPipeline()
+{
+	mfxEncodeCtrl ctrl;
+	memset(&ctrl, 0, sizeof(ctrl));
+	ctrl.FrameType = MFX_FRAMETYPE_UNKNOWN;
+
+	mfxStatus ret = MFX_ERR_NONE;
+
+	// Phase 1: bounded NULL burst to push out the B-frame reorder residual. Pipeline depth is ~AsyncDepth
+	// in-flight tasks + the B-frame reorder depth (GopRefDist) held inside the driver; add margin and cap it
+	// hard so a busy device can never drive this into a long blocking stall.
+	int burst = m_mfxEncParams.AsyncDepth + m_mfxEncParams.mfx.GopRefDist + 2;
+	if (burst < 4)
+		burst = 4;
+	if (burst > 32)
+		burst = 32;
+
+	int submitted = 0;
+	for (int i = 0; i < burst; i++) {
+		// Prefer a fully-free slot (no pending op AND no unharvested output) so we never clobber a frame
+		// whose bitstream is already waiting to be delivered.
+		int nTaskIdx = -1;
+		for (int k = 0; k < m_nTaskPool; k++)
+			if (!m_pTaskPool[k].syncp && m_pTaskPool[k].mfxBS.DataLength == 0) {
+				nTaskIdx = k;
+				break;
+			}
+		if (nTaskIdx < 0) {
+			// No fully-free slot - harvest a slot with pending work to free one.
+			int found = -1;
+			for (int k = 0; k < m_nTaskPool; k++)
+				if (m_pTaskPool[k].syncp || m_pTaskPool[k].mfxBS.DataLength > 0) {
+					found = k;
+					break;
+				}
+			if (found < 0)
+				break;   // nothing pending and no free slot - nothing left to push
+			mfxStatus hsts = HarvestSlot(found);
+			if (hsts < MFX_ERR_NONE) {
+				ret = hsts;
+				break;
+			}
+			nTaskIdx = found;
+		}
+
+		Task &task = m_pTaskPool[nTaskIdx];
+		mfxStatus sts = m_pmfxENC->EncodeFrameAsync(&ctrl, NULL, &task.mfxBS, &task.syncp);
+		if (sts == MFX_WRN_DEVICE_BUSY) {
+			MSDK_SLEEP(1);   // device busy - brief wait and retry once
+			sts = m_pmfxENC->EncodeFrameAsync(&ctrl, NULL, &task.mfxBS, &task.syncp);
+		} else if (sts < MFX_ERR_NONE && sts != MFX_ERR_MORE_DATA) {
+			blog(LOG_WARNING, "[qsv] ABR flush: EncodeFrameAsync(NULL) hard error mfxStatus=%d", (int)sts);
+			ret = sts;
+			break;
+		}
+		submitted++;
+	}
+
+	// Phase 2: drain - sync/harvest every pending slot until the pool is fully empty. We no longer inject
+	// work, so this converges quickly (bounded by the real in-flight encode time, not an iteration cap). The
+	// safety cap guards against a pathological encoder that never quiesces.
+	int drained = 0;
+	const int max_drain = m_nTaskPool + m_mfxEncParams.mfx.GopRefDist + 16;
+	while (drained < max_drain) {
+		int found = -1;
+		for (int k = 0; k < m_nTaskPool; k++)
+			if (m_pTaskPool[k].syncp || m_pTaskPool[k].mfxBS.DataLength > 0) {
+				found = k;
+				break;
+			}
+		if (found < 0)
+			break;   // pool fully drained
+		mfxStatus hsts = HarvestSlot(found);
+		if (hsts < MFX_ERR_NONE) {
+			ret = hsts;
+			break;
+		}
+		drained++;
+	}
+
+	// Deliver the flushed packets in display order (ascending PTS) so their DTS is monotonic and no
+	// spurious DTS-base regression is detected at the reconfigure point.
+	if (m_flushQueue.size() > 1) {
+		std::vector<FlushPacket> v(m_flushQueue.begin(), m_flushQueue.end());
+		std::sort(v.begin(), v.end(), [](const FlushPacket &a, const FlushPacket &b) {
+			return a.time_stamp < b.time_stamp;
+		});
+		m_flushQueue.assign(v.begin(), v.end());
+	}
+
+	blog(LOG_INFO, "[qsv] ABR flush complete: %d NULL frame(s) submitted, %d slot(s) drained, %zu packet(s) harvested into delivery queue",
+	     submitted, drained, m_flushQueue.size());
+	return ret;
+}
+
+void QSV_Encoder_Internal::ClearFlushQueue()
+{
+	while (!m_flushQueue.empty()) {
+		if (m_flushQueue.front().data)
+			delete[] m_flushQueue.front().data;
+		m_flushQueue.pop_front();
+	}
+}
+
+/* Reorder delivery so the flushed (older-timestamp) packets in m_flushQueue are emitted before the
+ * just-produced live packet. In steady state the queue is empty and this is a no-op. The live packet is
+ * deferred to the back of the queue so every frame is delivered exactly once, in timestamp order. */
+void QSV_Encoder_Internal::DeliverWithFlushQueue(mfxBitstream **pBS)
+{
+	if (m_flushQueue.empty())
+		return;
+
+	// Defer the just-produced live packet behind the older flushed packets.
+	if (*pBS && (*pBS)->DataLength > 0) {
+		mfxBitstream *live = *pBS;
+		FlushPacket fp;
+		fp.data = new mfxU8[live->DataLength];
+		memcpy(fp.data, &live->Data[live->DataOffset], live->DataLength);
+		fp.data_length = live->DataLength;
+		fp.time_stamp = live->TimeStamp;
+		fp.decode_ts = live->DecodeTimeStamp;
+		fp.frame_type = live->FrameType;
+		m_flushQueue.push_back(fp);
+	}
+
+	// Deliver the queue front (oldest) via the persistent m_outBitstream buffer, then free its copy.
+	FlushPacket &fp = m_flushQueue.front();
+	memcpy(m_outBitstream.Data, fp.data, fp.data_length);
+	m_outBitstream.DataOffset = 0;
+	m_outBitstream.DataLength = fp.data_length;
+	m_outBitstream.MaxLength = fp.data_length;
+	m_outBitstream.TimeStamp = fp.time_stamp;
+	m_outBitstream.DecodeTimeStamp = fp.decode_ts;
+	m_outBitstream.FrameType = fp.frame_type;
+	delete[] fp.data;
+	m_flushQueue.pop_front();
+	*pBS = &m_outBitstream;
+}
+
 mfxStatus QSV_Encoder_Internal::ClearData()
 {
+	ClearFlushQueue();   // free any held-back flushed packets (also covers the destructor path)
+
 	mfxStatus sts = MFX_ERR_NONE;
 	sts = Drain();
 
