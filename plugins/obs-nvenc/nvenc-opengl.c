@@ -118,6 +118,15 @@ bool cuda_opengl_encode(void *data, struct encoder_texture *tex, int64_t pts, ui
 		return false;
 	}
 
+	/* Multitrack live changes (staged FPS change, timed re-init at the shared keyframe boundary):
+	 * handled before any input copy so a boundary re-init can recreate the session and surfaces at
+	 * the new size before this frame is copied. Note: staged resize scaling is not available on
+	 * this backend, so live resizes fall back to an immediate in-place re-init there. */
+	if (!nvenc_prepare_frame(enc, pts)) {
+		*received_packet = false;
+		return true; // skip this frame - encoder is transitioning
+	}
+
 	bs = &enc->bitstreams.array[enc->next_bitstream];
 	surf = &enc->surfaces.array[enc->next_bitstream];
 

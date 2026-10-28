@@ -294,14 +294,183 @@ unmap:
 	return success;
 }
 
+/* Bilinear-scale an NV12 frame from the source (new) size into destination buffers of the
+ * current session (old) size. Used while a staged multitrack resize waits for the shared
+ * keyframe boundary, so every frame is encoded with continuous DTS (mirrors obs-x264).
+ * Shared with the D3D11 CPU readback scaler (see nvenc-internal.h). */
+void nvenc_scale_nv12(const uint8_t *src_y, const uint8_t *src_uv, int src_w, int src_h, int src_ls0,
+		      int src_ls1, uint8_t *dst_y, uint8_t *dst_uv, int dst_w, int dst_h, int dst_ls0,
+		      int dst_ls1)
+{
+	const double x_ratio = (double)src_w / dst_w;
+	const double y_ratio = (double)src_h / dst_h;
+
+	for (int y = 0; y < dst_h; y++) {
+		double sy = (y + 0.5) * y_ratio - 0.5;
+		if (sy < 0)
+			sy = 0;
+		const int y0 = (int)sy;
+		const int y1 = (y0 + 1 < src_h) ? y0 + 1 : y0;
+		const double fy = sy - y0;
+		const uint8_t *s0 = src_y + (size_t)y0 * src_ls0;
+		const uint8_t *s1 = src_y + (size_t)y1 * src_ls0;
+		uint8_t *d = dst_y + (size_t)y * dst_ls0;
+		for (int x = 0; x < dst_w; x++) {
+			double sx = (x + 0.5) * x_ratio - 0.5;
+			if (sx < 0)
+				sx = 0;
+			const int x0 = (int)sx;
+			const int x1 = (x0 + 1 < src_w) ? x0 + 1 : x0;
+			const double fx = sx - x0;
+			const double top = s0[x0] * (1.0 - fx) + s0[x1] * fx;
+			const double bot = s1[x0] * (1.0 - fx) + s1[x1] * fx;
+			d[x] = (uint8_t)(top * (1.0 - fy) + bot * fy + 0.5);
+		}
+	}
+
+	/* UV plane: half resolution, interleaved U/V pairs */
+	const int src_uv_w = src_w / 2, src_uv_h = src_h / 2;
+	const int dst_uv_w = dst_w / 2, dst_uv_h = dst_h / 2;
+	const double ux_ratio = (double)src_uv_w / dst_uv_w;
+	const double uy_ratio = (double)src_uv_h / dst_uv_h;
+	for (int y = 0; y < dst_uv_h; y++) {
+		double sy = (y + 0.5) * uy_ratio - 0.5;
+		if (sy < 0)
+			sy = 0;
+		const int y0 = (int)sy;
+		const int y1 = (y0 + 1 < src_uv_h) ? y0 + 1 : y0;
+		const double fy = sy - y0;
+		for (int x = 0; x < dst_uv_w; x++) {
+			double sx = (x + 0.5) * ux_ratio - 0.5;
+			if (sx < 0)
+				sx = 0;
+			const int x0 = (int)sx;
+			const int x1 = (x0 + 1 < src_uv_w) ? x0 + 1 : x0;
+			const double fx = sx - x0;
+			for (int c = 0; c < 2; c++) {
+				const size_t off = (size_t)y * dst_ls1 + x * 2 + c;
+				const double top = src_uv[(size_t)y0 * src_ls1 + x0 * 2 + c] * (1.0 - fx) +
+						   src_uv[(size_t)y0 * src_ls1 + x1 * 2 + c] * fx;
+				const double bot = src_uv[(size_t)y1 * src_ls1 + x0 * 2 + c] * (1.0 - fx) +
+						   src_uv[(size_t)y1 * src_ls1 + x1 * 2 + c] * fx;
+				dst_uv[off] = (uint8_t)(top * (1.0 - fy) + bot * fy + 0.5);
+			}
+		}
+	}
+}
+
+/* Bilinear-scale a P010 frame (u16 Y + interleaved u16 UV) from the source (new) size into
+ * destination buffers of the current session (old) size. Strides are in bytes. Used while a
+ * staged multitrack resize waits for the shared keyframe boundary. Shared with the D3D11
+ * CPU readback scaler (see nvenc-internal.h). */
+void nvenc_scale_p010(const uint8_t *src_y, const uint8_t *src_uv, int src_w, int src_h, int src_ls0,
+		      int src_ls1, uint8_t *dst_y, uint8_t *dst_uv, int dst_w, int dst_h, int dst_ls0,
+		      int dst_ls1)
+{
+	const double x_ratio = (double)src_w / dst_w;
+	const double y_ratio = (double)src_h / dst_h;
+
+	for (int y = 0; y < dst_h; y++) {
+		double sy = (y + 0.5) * y_ratio - 0.5;
+		if (sy < 0)
+			sy = 0;
+		const int y0 = (int)sy;
+		const int y1 = (y0 + 1 < src_h) ? y0 + 1 : y0;
+		const double fy = sy - y0;
+		const uint16_t *s0 = (const uint16_t *)(src_y + (size_t)y0 * src_ls0);
+		const uint16_t *s1 = (const uint16_t *)(src_y + (size_t)y1 * src_ls0);
+		uint16_t *d = (uint16_t *)(dst_y + (size_t)y * dst_ls0);
+		for (int x = 0; x < dst_w; x++) {
+			double sx = (x + 0.5) * x_ratio - 0.5;
+			if (sx < 0)
+				sx = 0;
+			const int x0 = (int)sx;
+			const int x1 = (x0 + 1 < src_w) ? x0 + 1 : x0;
+			const double fx = sx - x0;
+			const double top = s0[x0] * (1.0 - fx) + s0[x1] * fx;
+			const double bot = s1[x0] * (1.0 - fx) + s1[x1] * fx;
+			d[x] = (uint16_t)(top * (1.0 - fy) + bot * fy + 0.5);
+		}
+	}
+
+	/* UV plane: half resolution, interleaved U/V u16 pairs */
+	const int src_uv_w = src_w / 2, src_uv_h = src_h / 2;
+	const int dst_uv_w = dst_w / 2, dst_uv_h = dst_h / 2;
+	const double ux_ratio = (double)src_uv_w / dst_uv_w;
+	const double uy_ratio = (double)src_uv_h / dst_uv_h;
+	for (int y = 0; y < dst_uv_h; y++) {
+		double sy = (y + 0.5) * uy_ratio - 0.5;
+		if (sy < 0)
+			sy = 0;
+		const int y0 = (int)sy;
+		const int y1 = (y0 + 1 < src_uv_h) ? y0 + 1 : y0;
+		const double fy = sy - y0;
+		for (int x = 0; x < dst_uv_w; x++) {
+			double sx = (x + 0.5) * ux_ratio - 0.5;
+			if (sx < 0)
+				sx = 0;
+			const int x0 = (int)sx;
+			const int x1 = (x0 + 1 < src_uv_w) ? x0 + 1 : x0;
+			const double fx = sx - x0;
+			for (int c = 0; c < 2; c++) {
+				const size_t off = (size_t)y * (dst_ls1 / 2) + x * 2 + c;
+				const uint16_t *u0 = (const uint16_t *)(src_uv + (size_t)y0 * src_ls1);
+				const uint16_t *u1 = (const uint16_t *)(src_uv + (size_t)y1 * src_ls1);
+				const double top = u0[x0 * 2 + c] * (1.0 - fx) + u0[x1 * 2 + c] * fx;
+				const double bot = u1[x0 * 2 + c] * (1.0 - fx) + u1[x1 * 2 + c] * fx;
+				((uint16_t *)dst_uv)[off] = (uint16_t)(top * (1.0 - fy) + bot * fy + 0.5);
+			}
+		}
+	}
+}
+
+/* Bilinear-scale an I444 frame (three full-resolution u8 planes) from the source (new) size
+ * into destination buffers of the current session (old) size. Strides are in bytes. */
+static void nvenc_scale_i444(const uint8_t *src[3], int src_w, int src_h, const int src_ls[3], uint8_t *dst[3],
+			     int dst_w, int dst_h, const int dst_ls[3])
+{
+	const double x_ratio = (double)src_w / dst_w;
+	const double y_ratio = (double)src_h / dst_h;
+
+	for (int plane = 0; plane < 3; plane++) {
+		for (int y = 0; y < dst_h; y++) {
+			double sy = (y + 0.5) * y_ratio - 0.5;
+			if (sy < 0)
+				sy = 0;
+			const int y0 = (int)sy;
+			const int y1 = (y0 + 1 < src_h) ? y0 + 1 : y0;
+			const double fy = sy - y0;
+			const uint8_t *s0 = src[plane] + (size_t)y0 * src_ls[plane];
+			const uint8_t *s1 = src[plane] + (size_t)y1 * src_ls[plane];
+			uint8_t *d = dst[plane] + (size_t)y * dst_ls[plane];
+			for (int x = 0; x < dst_w; x++) {
+				double sx = (x + 0.5) * x_ratio - 0.5;
+				if (sx < 0)
+					sx = 0;
+				const int x0 = (int)sx;
+				const int x1 = (x0 + 1 < src_w) ? x0 + 1 : x0;
+				const double fx = sx - x0;
+				const double top = s0[x0] * (1.0 - fx) + s0[x1] * fx;
+				const double bot = s1[x0] * (1.0 - fx) + s1[x1] * fx;
+				d[x] = (uint8_t)(top * (1.0 - fy) + bot * fy + 0.5);
+			}
+		}
+	}
+}
+
 bool cuda_encode(void *data, struct encoder_frame *frame, struct encoder_packet *packet, bool *received_packet)
 {
 	struct nvenc_data *enc = data;
 	struct nv_cuda_surface *surf;
 	struct nv_bitstream *bs;
 
-	/* Live resolution changes: this frame already carries the new size. */
-	nvenc_maybe_resize(enc);
+	/* Multitrack live changes (staged resize / staged FPS change, timed re-init at the shared
+	 * keyframe boundary): handled before any input copy so a boundary re-init can recreate the
+	 * session and surfaces at the new size before this frame is copied. */
+	if (!nvenc_prepare_frame(enc, frame->pts)) {
+		*received_packet = false;
+		return true; // skip this frame - encoder is transitioning
+	}
 
 	bs = &enc->bitstreams.array[enc->next_bitstream];
 	surf = &enc->surfaces.array[enc->next_bitstream];
@@ -311,8 +480,50 @@ bool cuda_encode(void *data, struct encoder_frame *frame, struct encoder_packet 
 	/* ------------------------------------ */
 	/* copy to CUDA surface                 */
 
-	if (!copy_frame(enc, frame, surf))
+	if (enc->resize_pending && enc->scale_buf[0]) {
+		/* Staged resize waiting for the shared keyframe boundary: scale the new-size frame
+		 * down to the current session size so it can be encoded with the old-size session.
+		 * A frame that still carries the old size (one-tick mix rebind race - its plane-0
+		 * stride is still the session width) is encoded as-is. */
+		const uint32_t old_ls0 = enc->in_format == VIDEO_FORMAT_P010 ? 2 * enc->cx : enc->cx;
+		if ((uint32_t)frame->linesize[0] == old_ls0) {
+			if (!copy_frame(enc, frame, surf))
+				return false;
+		} else {
+			const int src_w = (int)obs_encoder_get_width(enc->encoder);
+			const int src_h = (int)obs_encoder_get_height(enc->encoder);
+			struct encoder_frame scaled = *frame;
+			for (int i = 0; i < 3; i++) {
+				scaled.data[i] = enc->scale_buf[i];
+				scaled.linesize[i] = enc->scale_stride[i];
+			}
+			switch (enc->in_format) {
+			case VIDEO_FORMAT_P010:
+				nvenc_scale_p010(frame->data[0], frame->data[1], src_w, src_h, (int)frame->linesize[0],
+						 (int)frame->linesize[1], enc->scale_buf[0], enc->scale_buf[1], (int)enc->cx, (int)enc->cy,
+						 enc->scale_stride[0], enc->scale_stride[1]);
+				break;
+			case VIDEO_FORMAT_I444: {
+				const uint8_t *src_planes[3] = {frame->data[0], frame->data[1], frame->data[2]};
+				uint8_t *dst_planes[3] = {enc->scale_buf[0], enc->scale_buf[1], enc->scale_buf[2]};
+				const int src_ls[3] = {(int)frame->linesize[0], (int)frame->linesize[1],
+						       (int)frame->linesize[2]};
+				nvenc_scale_i444(src_planes, src_w, src_h, src_ls, dst_planes, (int)enc->cx, (int)enc->cy,
+						 enc->scale_stride);
+				break;
+			}
+			default: /* NV12 */
+				nvenc_scale_nv12(frame->data[0], frame->data[1], src_w, src_h, (int)frame->linesize[0],
+						 (int)frame->linesize[1], enc->scale_buf[0], enc->scale_buf[1], (int)enc->cx, (int)enc->cy,
+						 enc->scale_stride[0], enc->scale_stride[1]);
+				break;
+			}
+			if (!copy_frame(enc, &scaled, surf))
+				return false;
+		}
+	} else if (!copy_frame(enc, frame, surf)) {
 		return false;
+	}
 
 	/* ------------------------------------ */
 	/* map output tex so nvenc can use it   */

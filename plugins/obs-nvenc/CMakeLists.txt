@@ -19,6 +19,10 @@ if(NOT TARGET OBS::opts-parser)
   add_subdirectory("${CMAKE_SOURCE_DIR}/shared/opts-parser" "${CMAKE_BINARY_DIR}/shared/opts-parser")
 endif()
 
+if(NOT TARGET OBS::abr-gov)
+  add_subdirectory("${CMAKE_SOURCE_DIR}/shared/abr-gov" "${CMAKE_BINARY_DIR}/shared/abr-gov")
+endif()
+
 if(OS_LINUX AND NOT TARGET OBS::glad)
   add_subdirectory("${CMAKE_SOURCE_DIR}/deps/glad" "${CMAKE_BINARY_DIR}/deps/glad")
 endif()
@@ -51,7 +55,7 @@ target_sources(
 
 target_link_libraries(
   obs-nvenc
-  PRIVATE OBS::libobs OBS::opts-parser FFnvcodec::FFnvcodec $<$<PLATFORM_ID:Linux>:OBS::glad>
+  PRIVATE OBS::libobs OBS::opts-parser OBS::abr-gov FFnvcodec::FFnvcodec $<$<PLATFORM_ID:Linux>:OBS::glad>
 )
 
 target_compile_definitions(obs-nvenc PRIVATE $<$<BOOL:${ENABLE_NVENC_FFMPEG_IDS}>:REGISTER_FFMPEG_IDS>)

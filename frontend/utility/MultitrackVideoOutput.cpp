@@ -940,10 +940,13 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 
 		if (supports_live_resize) {
 			// NVENC/QSV/x264/x265 apply scale type and resolution changes live: the libobs setter re-points the
-			// rescale mix right away (see live_rebind_encoder_mix in obs-encoder.c), and the encoder
-			// detects input size changes on its encode side, resizing the session in place. The forced
-			// keyframe realignment happens at the next shared GOP boundary so the multitrack tracks stay
-			// keyframe-aligned (see nvenc_maybe_resize / qsv_maybe_resize / obs_x264_maybe_resize / obs_x265_maybe_resize).
+			// rescale mix right away (see live_rebind_encoder_mix in obs-encoder.c), and the encoder detects
+			// input size changes on its encode side. All four defer the session re-open to the next shared
+			// keyframe boundary so the new session's starting IDR lands exactly on-grid (while waiting, frames
+			// are scaled to the old resolution), keeping all multitrack tracks keyframe-aligned. NVENC falls
+			// back to an immediate in-place re-init when it is not grouped, has no keyframe cadence yet, or the
+			// backend cannot scale incoming frames (see nvenc_maybe_resize / qsv_maybe_resize /
+			// obs_x264_maybe_resize / obs_x265_maybe_resize).
 			// Colorspace/range/format changes stay deferred until a stream restart: live rebinding does
 			// not update the encoder session's color parameters mid-stream, so the encoded output would
 			// not reflect them reliably.
@@ -1030,13 +1033,14 @@ bool MultitrackVideoOutput::ApplyConfigOverride(const std::string &custom_config
 				}
 			}
 
-			// x264/x265 consume a *pending* divisor (obs_encoder_get_pending_frame_rate_divisor) and apply it exactly
+			// x264/x265/QSV/NVENC consume a *pending* divisor (obs_encoder_get_pending_frame_rate_divisor) and apply it exactly
 			// on the next shared keyframe boundary, so stage it there: an immediate change would reset the frame-skip
 			// counter without frame-boundary synchronisation and shift this track's PTS phase by an arbitrary amount,
-			// desyncing its keyframes from sibling tracks. Other encoders (NVENC/QSV) apply the divisor immediately -
-			// they ride their natural GOP boundary and do not consume the pending value.
+			// desyncing its keyframes from sibling tracks. Other encoders (AMF) apply the divisor immediately as before.
 			const bool boundary_divisor = strstr(new_encoder_config.type.c_str(), "x264") != nullptr ||
-			                              strstr(new_encoder_config.type.c_str(), "x265") != nullptr;
+			                              strstr(new_encoder_config.type.c_str(), "x265") != nullptr ||
+			                              strstr(new_encoder_config.type.c_str(), "qsv11") != nullptr ||
+			                              strstr(new_encoder_config.type.c_str(), "nvenc") != nullptr;
 
 			if (divisor_ok) {
 				char line[160];

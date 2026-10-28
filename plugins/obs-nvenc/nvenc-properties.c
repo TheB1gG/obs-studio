@@ -44,6 +44,7 @@ static void nvenc_defaults_base(enum codec_type codec, obs_data_t *settings)
 
 	obs_data_set_default_int(settings, "bitrate", 10000);
 	obs_data_set_default_int(settings, "max_bitrate", 10000);
+	obs_data_set_default_double(settings, "deadband", 0.5); /* +/-0.5% band (percent) */
 	obs_data_set_default_int(settings, "target_quality", 20);
 	obs_data_set_default_int(settings, "keyint_sec", 0);
 	obs_data_set_default_int(settings, "cqp", 20);
@@ -100,6 +101,8 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs
 	obs_property_set_visible(p, !cqp && !lossless && !cqvbr);
 	p = obs_properties_get(ppts, "max_bitrate");
 	obs_property_set_visible(p, vbr || cqvbr || abr);
+	p = obs_properties_get(ppts, "deadband");
+	obs_property_set_visible(p, abr);
 	p = obs_properties_get(ppts, "target_quality");
 	obs_property_set_visible(p, cqvbr || abr);
 	p = obs_properties_get(ppts, "cqp");
@@ -150,6 +153,10 @@ obs_properties_t *nvenc_properties_internal(enum codec_type codec)
 
 	p = obs_properties_add_int(props, "max_bitrate", obs_module_text("MaxBitrate"), 0, UINT32_MAX / 1000, 50);
 	obs_property_int_set_suffix(p, " Kbps");
+
+	/* ABR governor deadband (percent): how far the cumulative average may drift from target before
+	 * the governor corrects. Only shown for ABR. */
+	p = obs_properties_add_float_slider(props, "deadband", obs_module_text("Deadband"), 0.1, 10.0, 0.1);
 
 	/* AV1 uses 0-255 instead of 0-51 for QP, and most implementations just
 	 * multiply the value by 4 to keep the range smaller. */

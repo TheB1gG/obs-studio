@@ -3,6 +3,7 @@
 
 #include <util/darray.h>
 #include <util/dstr.h>
+#include <abr-gov.h>
 
 /* ========================================================================= */
 
@@ -216,6 +217,43 @@ static bool apply_nvenc_reconfigure_soft(struct nvenc_data *enc)
 	return true;
 }
 
+/* Re-derive the session GOP length (keyint_sec x effective fps, in frames) from the
+ * current params frameRate and mirror it into the per-codec IDR period. GopLength is
+ * otherwise only set at create time (init_encoder_base), so a live FPS change would
+ * leave NVENC emitting IDRs every old_rate*keyint_sec frames - e.g. 240 frames = 16 s
+ * of video at 15 fps instead of 60 frames = 4 s - desyncing this track's keyframe
+ * cadence from its multitrack siblings. The computation mirrors init_encoder_base,
+ * including the "keyint" user-arg override and the 250-frame fallback. */
+static void nvenc_refresh_gop(struct nvenc_data *enc)
+{
+	if (enc->props.keyint_sec <= 0)
+		return;
+
+	const uint32_t num = enc->params.frameRateNum;
+	const uint32_t den = enc->params.frameRateDen;
+	if (num == 0 || den == 0)
+		return;
+
+	int keyint = (int)((double)enc->props.keyint_sec * num / den);
+	get_user_arg_int(enc, "keyint", &keyint);
+	const uint32_t gop = keyint > 0 ? (uint32_t)keyint : 250;
+
+	enc->config.gopLength = gop;
+	switch (enc->codec) {
+	case CODEC_H264:
+		enc->config.encodeCodecConfig.h264Config.idrPeriod = gop;
+		break;
+#ifdef ENABLE_HEVC
+	case CODEC_HEVC:
+		enc->config.encodeCodecConfig.hevcConfig.idrPeriod = gop;
+		break;
+#endif
+	case CODEC_AV1:
+		enc->config.encodeCodecConfig.av1Config.idrPeriod = gop;
+		break;
+	}
+}
+
 /* ------------------------------------------------------------------------- */
 /* ABR (Adaptive Bitrate) governor                                            */
 /*                                                                           */
@@ -226,7 +264,7 @@ static bool apply_nvenc_reconfigure_soft(struct nvenc_data *enc)
 /* so the long-term average converges to props.bitrate: complex scenes may     */
 /* spend up to the cap, easy scenes stay low, and the average tracks target.   */
 
-static void abr_gov_apply(struct nvenc_data *enc, uint32_t new_max_bps)
+static bool nvenc_abr_apply(struct nvenc_data *enc, uint32_t new_max_bps)
 {
 	NV_ENC_RECONFIGURE_PARAMS params = {0};
 	params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
@@ -238,20 +276,20 @@ static void abr_gov_apply(struct nvenc_data *enc, uint32_t new_max_bps)
 	enc->config.rcParams.maxBitRate = new_max_bps;
 
 	NVENCSTATUS err = nv.nvEncReconfigureEncoder(enc->session, &params);
-	nvenc_trace_reconfigure(enc, "abr_gov_apply", &params, err);
+	nvenc_trace_reconfigure(enc, "nvenc_abr_apply", &params, err);
 	if (NV_FAILED(err)) {
 		enc->config.rcParams.maxBitRate = old; // revert: driver kept previous value
 		warn("ABR governor: reconfigure failed, keeping previous max bitrate");
-		return;
+		return false;
 	}
 
 	debug("ABR governor: maxBitRate %u -> %u kbps", old / 1000, new_max_bps / 1000);
-	enc->abr_max_rate = new_max_bps;
+	return true;
 }
 
-static void abr_gov_update(struct nvenc_data *enc, uint32_t frame_size_bytes)
+static void nvenc_abr_tick(struct nvenc_data *enc, uint32_t frame_size_bytes)
 {
-	if (!enc->abr_active)
+	if (!enc->abr_active || !enc->can_change_bitrate)
 		return;
 
 	const int64_t target_bps = enc->props.bitrate * 1000;
@@ -267,74 +305,61 @@ static void abr_gov_update(struct nvenc_data *enc, uint32_t frame_size_bytes)
 	if (dt <= 0.0)
 		return;
 
-	/* x264-style integral control: track the CUMULATIVE output (total bits used)
-	 * against the target rate. The long-term average = total_bits / total_time is
-	 * exactly what a file's reported bitrate reflects, so driving the cap from it
-	 * makes that average converge to props.bitrate. (An EMA of the instantaneous
-	 * rate instead tracks recent complexity and misfires on complex bursts.) */
-	enc->abr_total_bits += (double)frame_size_bytes * 8.0;
-	enc->abr_total_time += dt;
-	enc->abr_acc_time += dt;
+	const int64_t ceiling_bps =
+	    (int64_t)((enc->props.max_bitrate > 0 ? enc->props.max_bitrate : enc->props.bitrate) * 1000);
 
-	if (enc->abr_acc_time < 1.0) /* at most one governor tick per second */
-		return;
-	enc->abr_acc_time = 0.0;
+	/* Shared ABR governor (shared/abr-gov): accumulation, cadence (0.5 s), history gate (1 s) and the
+	 * control law are identical to x265/AMF. */
+	abr_gov_config cfg = abr_gov_default_config();
+	cfg.deadband_frac = enc->abr_deadband;
 
-	const double cum_avg = enc->abr_total_time > 0.0 ? enc->abr_total_bits / enc->abr_total_time : 0.0;
-
-	if (!enc->can_change_bitrate)
-		return; /* cannot adjust maxBitRate at runtime on this driver */
-
-	if (enc->abr_total_time < 2.0) /* need a little history before deciding */
-		return;
-
-	const uint32_t ceiling =
-		(uint32_t)((enc->props.max_bitrate > 0 ? enc->props.max_bitrate : enc->props.bitrate) * 1000);
-
-	double ratio;
-	uint32_t new_max;
-
-	if (cum_avg > target_bps * 1.05) {
-		/* cumulative average above target: taper the cap down toward target */
-		ratio = (double)target_bps / cum_avg;
-		if (ratio < 0.8)
-			ratio = 0.8;
-		new_max = (uint32_t)(enc->abr_max_rate * ratio);
-		if (new_max < (uint32_t)target_bps)
-			new_max = (uint32_t)target_bps;
-	} else if (cum_avg > 1.0 && cum_avg < target_bps * 0.95) {
-		/* cumulative average below target: restore headroom up to the ceiling */
-		ratio = (double)target_bps / cum_avg;
-		if (ratio > 2.0)
-			ratio = 2.0;
-		new_max = (uint32_t)(enc->abr_max_rate * ratio);
-		if (new_max > ceiling)
-			new_max = ceiling;
-	} else {
-		return; /* within +/-5% dead band: keep current cap */
+	const int64_t old_bps = enc->abr_state.cur_rate;
+	if (abr_gov_tick(&enc->abr_state, &cfg, target_bps, ceiling_bps, dt, frame_size_bytes, NULL)) {
+		if (!nvenc_abr_apply(enc, (uint32_t)enc->abr_state.cur_rate))
+			enc->abr_state.cur_rate = old_bps; /* driver rejected the change; retry next tick */
 	}
+}
 
-	if (new_max == 0 || new_max == enc->abr_max_rate)
-		return;
-
-	abr_gov_apply(enc, new_max);
+/* Load the session budget on the first ABR entry of an open (fresh at target, or restored after a kill /
+ * short disconnect); on later entries just re-latch the ceiling and keep the cumulative budget. Mirrors
+ * amf_abr_configure(). */
+static void nvenc_abr_latch(struct nvenc_data *enc, const abr_gov_config *cfg, int64_t target_bps,
+                            int64_t ceiling_bps)
+{
+	if (!enc->abr_session_loaded) {
+		abr_gov_session_load(enc->encoder, true, target_bps, ceiling_bps, cfg, &enc->abr_state);
+		enc->abr_session_loaded = true;
+	} else {
+		const int64_t floor_bps = (int64_t)((double)target_bps * cfg->overshoot_floor_frac);
+		if (enc->abr_state.cur_rate < floor_bps)
+			enc->abr_state.cur_rate = floor_bps;
+		if (enc->abr_state.cur_rate > ceiling_bps)
+			enc->abr_state.cur_rate = ceiling_bps;
+	}
 }
 
 /* ------------------------------------------------------------------------- */
 /* Live resolution changes                                                     */
 /*                                                                           */
 /* obs_encoder_set_scaled_size() makes libobs start delivering frames at the  */
-/* new size on the very next tick, so - unlike RC changes - a resize cannot   */
-/* be deferred to the GOP boundary: this frame's input texture already has    */
-/* the new dimensions.                                                       */
+/* new size on the very next tick, so this frame's input already has the new  */
+/* dimensions. Two handling paths (see nvenc_maybe_resize):                  */
 /*                                                                           */
-/* We use resetEncoder=0 + forceIDR=1 (matching NVIDIA's DRC sample):        */
-/*  - The ring buffer continues operating normally (no reset of              */
-/*    buffers_queued / cur_bitstream / next_bitstream / dts_list).           */
-/*  - In-flight frames continue encoding at the old resolution; the          */
-/*    forced IDR marks the start of the new resolution.                      */
-/*  - Old input textures are kept alive (in-flight frames reference them)    */
-/*    and freed after buf_count frames.                                      */
+/*  - Encoder group (multitrack): never re-init off-grid. The re-init is     */
+/*    staged to the next shared keyframe boundary (nvenc_maybe_apply_timed_  */
+/*    reinit) and incoming new-size frames are scaled down to the current    */
+/*    session size until then (D3D11 video processor / CPU bilinear scaler), */
+/*    so every frame is encoded with continuous DTS and the forced IDR lands */
+/*    exactly on-grid.                                                       */
+/*  - Outside a group (or no keyframe cadence observed yet, or the backend   */
+/*    cannot scale): immediate in-place re-init using resetEncoder=0 +       */
+/*    forceIDR=1 (matching NVIDIA's DRC sample):                             */
+/*      * The ring buffer continues operating normally (no reset of          */
+/*        buffers_queued / cur_bitstream / next_bitstream / dts_list).       */
+/*      * In-flight frames continue encoding at the old resolution; the      */
+/*        forced IDR marks the start of the new resolution.                  */
+/*      * Old input textures are kept alive (in-flight frames reference      */
+/*        them) and freed after buf_count frames.                            */
 
 static bool apply_nvenc_resize(struct nvenc_data *enc, uint32_t w, uint32_t h)
 {
@@ -416,30 +441,451 @@ static bool apply_nvenc_resize(struct nvenc_data *enc, uint32_t w, uint32_t h)
 	return true;
 }
 
-bool nvenc_maybe_resize(struct nvenc_data *enc)
+/* Next shared multitrack keyframe boundary strictly ahead of pts, from the measured
+ * on-grid keyframe cadence (last_keyframe_pts + gop_pts). Requires gop_pts > 0. */
+static int64_t nvenc_next_boundary_pts(struct nvenc_data *enc, int64_t pts)
+{
+	int64_t target = enc->last_keyframe_pts + enc->gop_pts;
+	while (target <= pts)
+		target += enc->gop_pts;
+	return target;
+}
+
+/* Old-resolution buffers for the raw (CPU) path's staged resize: incoming new-size
+ * frames are bilinear-scaled into them while waiting for the shared keyframe boundary
+ * (mirrors obs-x264). Only allocated when a staged resize is actually staged. */
+static void nvenc_free_scale_buffers(struct nvenc_data *enc)
+{
+	for (int i = 0; i < 3; i++) {
+		bfree(enc->scale_buf[i]);
+		enc->scale_buf[i] = NULL;
+	}
+}
+
+static void nvenc_alloc_scale_buffers(struct nvenc_data *enc)
+{
+	nvenc_free_scale_buffers(enc);
+	if (!enc->non_texture)
+		return; /* texture backends scale on-GPU (D3D11 video processor) or fall back to immediate */
+
+	const uint32_t w = enc->cx, h = enc->cy;
+	switch (enc->in_format) {
+	case VIDEO_FORMAT_NV12:
+		enc->scale_stride[0] = (int)w;
+		enc->scale_buf[0] = bmalloc((size_t)w * h);
+		/* UV is indexed as dst_uv[y*ls1 + x*2 + c] with x < w/2: the row stride must be a
+		 * full width (w), not w/2, or the last UV rows overflow the buffer. */
+		enc->scale_stride[1] = (int)w;
+		enc->scale_buf[1] = bmalloc((size_t)w * (h / 2));
+		break;
+	case VIDEO_FORMAT_P010:
+		/* u16 samples: Y plane is 2 bytes/pixel. UV is indexed as ((uint16_t *)dst_uv)[y*(ls1/2) + x*2 + c],
+		 * so the UV row stride must be 2*w bytes (a full-width row of u16 pairs). */
+		enc->scale_stride[0] = (int)(w * 2);
+		enc->scale_buf[0] = bmalloc((size_t)w * h * 2);
+		enc->scale_stride[1] = (int)(w * 2);
+		enc->scale_buf[1] = bmalloc((size_t)w * h);
+		break;
+	case VIDEO_FORMAT_I444:
+		for (int i = 0; i < 3; i++) {
+			enc->scale_stride[i] = (int)w;
+			enc->scale_buf[i] = bmalloc((size_t)w * h);
+		}
+		break;
+	default:
+		break; /* other raw formats: no staging buffers */
+	}
+}
+
+/* Whether this backend can scale new-size frames down to the current session size while
+ * a resize is staged (needed to keep encoding until the shared keyframe boundary). */
+static bool nvenc_staged_resize_supported(struct nvenc_data *enc)
+{
+	if (enc->non_texture) {
+		switch (enc->in_format) {
+		case VIDEO_FORMAT_NV12:
+		case VIDEO_FORMAT_P010:
+		case VIDEO_FORMAT_I444:
+			return true; /* CPU bilinear scaler */
+		default:
+			return false;
+		}
+	}
+#ifdef _WIN32
+	return d3d11_staged_resize_supported(enc);
+#else
+	return false; /* CUDA/OpenGL texture path: no scaling available */
+#endif
+}
+
+/* Apply the staged multitrack re-init at the shared keyframe boundary: one
+ * NV_ENC_RECONFIGURE_ENCODER carrying any pending size change and the current effective
+ * FPS (params already updated at staging time). A pure resize keeps the proven DRC path
+ * (reset=0, ring preserved); an FPS change (alone or with a resize) resets encoder state
+ * so the rate controller re-arms for the new frameRateNum/Den. The forced IDR is the
+ * session-start frame and lands exactly on-grid. On failure the pending state is kept so
+ * the next frame retries. */
+static bool nvenc_apply_timed_reinit(struct nvenc_data *enc)
+{
+	const bool do_resize = enc->resize_pending;
+	const bool do_fps = enc->fps_pending;
+
+	if (do_resize) {
+		if (nv_get_cap(enc, NV_ENC_CAPS_SUPPORT_DYN_RES_CHANGE) != 1) {
+			warn("driver does not report support for dynamic resolution change; restart required");
+			return false;
+		}
+		int max_w = nv_get_cap(enc, NV_ENC_CAPS_WIDTH_MAX);
+		int max_h = nv_get_cap(enc, NV_ENC_CAPS_HEIGHT_MAX);
+		if ((max_w > 0 && (int)enc->pending_width > max_w) || (max_h > 0 && (int)enc->pending_height > max_h)) {
+			warn("live resize to %ux%u exceeds encoder limits (%dx%d), restart required", enc->pending_width,
+			     enc->pending_height, max_w, max_h);
+			return false;
+		}
+
+		info("timed resize: %ux%u -> %ux%u (session re-init)", enc->cx, enc->cy, enc->pending_width,
+		     enc->pending_height);
+		enc->params.encodeWidth = enc->pending_width;
+		enc->params.encodeHeight = enc->pending_height;
+		enc->params.darWidth = enc->pending_width;
+		enc->params.darHeight = enc->pending_height;
+		enc->cx = enc->pending_width;
+		enc->cy = enc->pending_height;
+	}
+
+	if (do_fps)
+		info("timed FPS re-init: %u/%u (session re-init)", enc->params.frameRateNum, enc->params.frameRateDen);
+
+	NV_ENC_RECONFIGURE_PARAMS params = {0};
+	params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+	params.reInitEncodeParams = enc->params; // carries enc->config (encodeConfig)
+	params.forceIDR = 1;                     /* session-start IDR, lands on the shared boundary */
+	params.resetEncoder = do_fps ? 1 : 0;    /* FPS change needs RC re-arm; pure resize keeps ring */
+
+	NVENCSTATUS err = nv.nvEncReconfigureEncoder(enc->session, &params);
+	nvenc_trace_reconfigure(enc, __FUNCTION__, &params, err);
+	if (NV_FAILED(err)) {
+		error("timed re-init reconfigure failed (reset=%d forceIDR=1): err=%d", do_fps ? 1 : 0, (int)err);
+		return false;
+	}
+
+	if (do_fps) {
+		const uint32_t discarded = enc->buffers_queued;
+
+		/* resetEncoder flushes every in-flight frame inside NVENC. Rewind the submission
+		 * accounting so get_encoded_packet() never locks bitstreams or DTS entries that will
+		 * never be filled (same rewind as apply_nvenc_reconfigure), and re-create every ring
+		 * buffer (the driver invalidates them on reset). */
+		enc->buffers_queued = 0;
+		deque_free(&enc->dts_list);
+		deque_init(&enc->dts_list);
+		enc->cur_bitstream = enc->next_bitstream;
+
+		for (uint32_t i = 0; i < enc->bitstreams.num; i++) {
+			nv_bitstream_free(enc, &enc->bitstreams.array[i]);
+			if (!nv_bitstream_init(enc, &enc->bitstreams.array[i]))
+				return false;
+		}
+		info("timed FPS re-init: %u in-flight frame(s) discarded by reset", discarded);
+	}
+
+	if (do_resize) {
+		/* Recreate input textures/surfaces at the new size. The old ones stay alive for
+		 * in-flight frames and are freed after buf_count frames (see nvenc_encode_base). */
+#ifdef _WIN32
+		if (!enc->non_texture) {
+			da_move(enc->old_textures, enc->textures);
+			enc->textures.num = 0;
+			enc->old_tex_frames_remaining = enc->buf_count;
+			if (!d3d11_init_textures(enc)) {
+				return false;
+			}
+		} else
+#endif
+		{
+			cuda_free_surfaces(enc);
+			enc->surfaces.num = 0;
+			if (!cuda_init_surfaces(enc))
+				return false;
+		}
+	}
+
+	/* Re-arm sequence-parameter capture: the next locked frame is the forced IDR of the
+	 * reconfigured session, so muxers see the new SPS/PPS (fresh resolution and/or rate). */
+	enc->first_packet = true;
+	enc->frames_since_idr = 0; /* the forced IDR restarts the GOP */
+	info("timed re-init applied (resize=%d fps=%d reset=%d forceIDR=1): queued=%u cur_bs=%u next_bs=%u buf_count=%u",
+	     do_resize, do_fps, do_fps ? 1 : 0, (unsigned)enc->buffers_queued, (unsigned)enc->cur_bitstream,
+	     (unsigned)enc->next_bitstream, (unsigned)enc->buf_count);
+	return true;
+}
+
+/* After an off-grid (emergency or late) re-init, the session-start IDR has shifted NVENC's
+ * internal GOP phase permanently off the shared keyframe grid. Keep the pre-resize on-grid
+ * anchor (so future boundary math stays aligned with the sibling tracks) and schedule a forced
+ * IDR at the next shared boundary; the driver restarts its idrPeriod from any IDR, so that one
+ * on-grid IDR re-anchors the phase. While it is pending, observed IDRs must not move
+ * last_keyframe_pts/gop_pts (see get_encoded_packet). */
+static void nvenc_schedule_reanchor(struct nvenc_data *enc, int64_t pts)
+{
+	if (enc->last_keyframe_pts >= 0 && enc->gop_pts > 0) {
+		enc->reanchor_idr_pts = nvenc_next_boundary_pts(enc, pts);
+		warn("off-grid re-init at pts %lld: keyframes will re-anchor at the next shared boundary (pts %lld)",
+		     (long long)pts, (long long)enc->reanchor_idr_pts);
+	} else {
+		enc->reanchor_idr_pts = 0; /* no cadence observed yet - nothing to re-anchor to */
+	}
+}
+
+/* Timed multitrack re-init (staged in nvenc_maybe_resize / nvenc_check_fps): at the shared
+ * keyframe boundary, re-init the NVENC session carrying any pending size and/or effective-FPS
+ * change. The first frame of the fresh session is a forced IDR that lands exactly on-grid, so
+ * this track's keyframes stay aligned with its sibling tracks. Returns true if the current
+ * frame may be encoded (nothing due, or the re-init just succeeded); false if it must be
+ * skipped because the re-init failed (pending state kept for the next frame). */
+static bool nvenc_maybe_apply_timed_reinit(struct nvenc_data *enc, int64_t pts)
+{
+	if (!enc->resize_pending && !enc->fps_pending)
+		return true;
+
+	if (pts < enc->reinit_target_pts)
+		return true; // boundary not reached yet - keep encoding with the current session
+
+	if (pts > enc->reinit_target_pts) {
+		/* The boundary frame was dropped (encoder queue overflow while the encoder was busy).
+		 * Re-initialising now would land the forced IDR off-grid, so advance to the next shared
+		 * boundary instead; give up after two misses. */
+		enc->reinit_misses++;
+		if (enc->reinit_misses < 2) {
+			enc->reinit_target_pts += enc->gop_pts;
+			warn("timed re-init missed keyframe boundary (pts %lld), retrying at pts %lld",
+			     (long long)pts, (long long)enc->reinit_target_pts);
+		} else {
+			warn("timed re-init missed two keyframe boundaries - applying late at pts %lld (off-grid)",
+			     (long long)pts);
+		}
+	}
+
+	if (pts == enc->reinit_target_pts || enc->reinit_misses >= 2) {
+		const bool on_grid = (pts == enc->reinit_target_pts);
+
+		bool ok = nvenc_apply_timed_reinit(enc);
+		if (!ok)
+			return false; // skip this frame - the pending change is retried on the next frame
+
+		nvenc_free_scale_buffers(enc); /* no longer scaling to the old size */
+#ifdef _WIN32
+		d3d11_free_gpu_scaler(enc);    /* no longer scaling to the old size */
+		d3d11_free_cpu_scaler(enc);    /* no longer scaling to the old size */
+#endif
+
+		enc->resize_pending = false;
+		enc->fps_pending = false;
+		/* The full re-init already applied the current RC/bitrate, so drop any staged
+		 * RC-only reconfigure to avoid a redundant reset (and extra IDR) right after. */
+		enc->reconfig_pending = false;
+		if (on_grid) {
+			/* The session-start IDR lands exactly on the shared grid and re-anchors it. */
+			enc->last_keyframe_pts = pts;
+		} else {
+			/* Late off-grid apply: keep the on-grid anchor and force an IDR at the next
+			 * shared boundary to re-anchor NVENC's internal GOP phase. */
+			nvenc_schedule_reanchor(enc, pts);
+		}
+	}
+
+	return true;
+}
+
+bool nvenc_apply_staged_changes_now(struct nvenc_data *enc, int64_t pts)
+{
+	if (!enc->resize_pending && !enc->fps_pending)
+		return true;
+
+	bool ok = nvenc_apply_timed_reinit(enc);
+	if (!ok)
+		return false; // pending state kept - the staged boundary path retries next frame
+
+	nvenc_free_scale_buffers(enc); /* no longer scaling to the old size */
+#ifdef _WIN32
+	d3d11_free_gpu_scaler(enc);    /* no longer scaling to the old size */
+	d3d11_free_cpu_scaler(enc);    /* no longer scaling to the old size */
+#endif
+
+	enc->resize_pending = false;
+	enc->fps_pending = false;
+	/* The full re-init already applied the current RC/bitrate, so drop any staged
+	 * RC-only reconfigure to avoid a redundant reset (and extra IDR) right after. */
+	enc->reconfig_pending = false;
+	/* Emergency apply lands off-grid: keep the on-grid anchor and force an IDR at the next
+	 * shared boundary to re-anchor NVENC's internal GOP phase. */
+	nvenc_schedule_reanchor(enc, pts);
+
+	return true;
+}
+
+/* Detect and stage live effective-FPS changes (mirrors qsv_check_staged):
+ *  (a) A divisor change staged by the frontend via obs_encoder_set_pending_frame_rate_divisor()
+ *      (multitrack live FPS change): apply it exactly at the next shared keyframe boundary - libobs
+ *      switches the delivery rate there (set_frame_rate_divisor_at_pts) and we re-init the session
+ *      there, so the forced IDR lands on-grid. While waiting, frames keep arriving at the OLD rate,
+ *      which matches the current session - no transient mismatch.
+ *  (b) Any other effective-FPS change (base-rate change, an immediately-applied divisor, or one seen
+ *      in nvenc_update via fps_change_staged): the delivery rate has ALREADY switched, so a grouped
+ *      encoder stages the re-init at the next shared boundary and everyone else applies it now. */
+static void nvenc_check_fps(struct nvenc_data *enc, int64_t pts)
+{
+	const uint32_t cur_div = obs_encoder_get_frame_rate_divisor(enc->encoder);
+
+	/* (a) Frontend-staged divisor change (multitrack). */
+	const uint32_t pending_div = obs_encoder_get_pending_frame_rate_divisor(enc->encoder);
+	if (pending_div != 0 && pending_div != cur_div && !enc->fps_pending) {
+		const uint32_t fps_num = obs_encoder_get_fps_num(enc->encoder);
+		const uint32_t fps_den = obs_encoder_get_fps_den(enc->encoder) * pending_div;
+		if (fps_num == 0 || fps_den == 0)
+			return;
+
+		info("live FPS change %u/%u -> %u/%u, staging boundary-aligned re-init", enc->params.frameRateNum,
+		     enc->params.frameRateDen, fps_num, fps_den);
+		enc->params.frameRateNum = fps_num;
+		enc->params.frameRateDen = fps_den;
+		nvenc_refresh_gop(enc);
+
+		int64_t target = pts + 1; /* no cadence observed yet: apply at the next frame */
+		if (enc->last_keyframe_pts >= 0 && enc->gop_pts > 0)
+			target = nvenc_next_boundary_pts(enc, pts);
+		obs_encoder_set_frame_rate_divisor_at_pts(enc->encoder, pending_div, target);
+
+		if (!enc->resize_pending) { /* a staged resize already owns the boundary */
+			enc->reinit_target_pts = target;
+			enc->reinit_misses = 0;
+		}
+		enc->fps_pending = true;
+		info("live FPS change staged (will apply at pts %lld, current pts %lld)", (long long)target,
+		     (long long)pts);
+		obs_encoder_set_pending_frame_rate_divisor(enc->encoder, 0);
+		return;
+	}
+
+	/* (b) Already-applied effective-FPS change (base-rate change, an immediately-applied divisor, or one
+	 * seen in nvenc_update via fps_change_staged): the delivery rate has ALREADY switched, so a grouped
+	 * encoder stages the re-init at the next shared boundary and everyone else applies it now. Skipped
+	 * while a divisor is still pending - that belongs to path (a) and must be consumed first: rapid
+	 * consecutive changes are serialized, the second one staging at the next boundary after the first
+	 * lands (mirrors qsv_check_staged). */
+	if (pending_div != 0 || enc->fps_pending)
+		return;
+
+	const uint32_t fps_num = obs_encoder_get_fps_num(enc->encoder);
+	const uint32_t fps_den = obs_encoder_get_fps_den(enc->encoder) * cur_div;
+	if (fps_num == 0 || fps_den == 0)
+		return;
+	if (!enc->fps_change_staged && fps_num == enc->params.frameRateNum && fps_den == enc->params.frameRateDen)
+		return;
+
+	if (fps_num != enc->params.frameRateNum || fps_den != enc->params.frameRateDen)
+		info("live FPS change %u/%u -> %u/%u while streaming", enc->params.frameRateNum,
+		     enc->params.frameRateDen, fps_num, fps_den);
+	else
+		info("live FPS re-init staged by update() (session params already current)");
+
+	enc->params.frameRateNum = fps_num;
+	enc->params.frameRateDen = fps_den;
+	nvenc_refresh_gop(enc);
+	enc->fps_change_staged = false;
+
+	if (obs_encoder_is_in_group(enc->encoder) && enc->last_keyframe_pts >= 0 && enc->gop_pts > 0) {
+		if (!enc->resize_pending) { /* a staged resize already owns the boundary */
+			enc->reinit_target_pts = nvenc_next_boundary_pts(enc, pts);
+			enc->reinit_misses = 0;
+		}
+		/* The staged timed re-init re-anchors the grid with its own on-grid IDR, so a
+		 * pending off-grid re-anchor becomes moot. */
+		enc->reanchor_idr_pts = 0;
+		enc->fps_pending = true;
+		info("live FPS change staged (will apply at pts %lld, current pts %lld)", (long long)enc->reinit_target_pts,
+		     (long long)pts);
+	} else {
+		if (obs_encoder_is_in_group(enc->encoder))
+			info("FPS re-init applied now (no keyframe cadence observed yet - only possible before/at "
+			     "stream start, so the session-start IDR still lands on-grid)");
+		else
+			info("applying live FPS re-init now (reset=1 forceIDR=1)");
+		if (!apply_nvenc_reconfigure(enc)) {
+			warn("live FPS re-init failed - restart required");
+			return;
+		}
+		/* The re-init already applied the staged RC/bitrate as well. */
+		enc->reconfig_pending = false;
+		enc->frames_since_idr = 0; /* the forced IDR restarts the GOP */
+	}
+}
+
+static bool nvenc_maybe_resize(struct nvenc_data *enc, int64_t pts)
 {
 	uint32_t w = obs_encoder_get_width(enc->encoder);
 	uint32_t h = obs_encoder_get_height(enc->encoder);
 
 	if (w == enc->cx && h == enc->cy)
-		return false; // no pending change
+		return true; /* no pending change */
 
+	if (obs_encoder_is_in_group(enc->encoder) && enc->last_keyframe_pts >= 0 && enc->gop_pts > 0 &&
+	    /* Once staged, the episode owns the boundary: don't re-probe (the probe has side
+	     * effects and a transient failure must not drop us into an immediate re-init). */
+	    (enc->resize_pending || nvenc_staged_resize_supported(enc)) &&
+	    nv_get_cap(enc, NV_ENC_CAPS_SUPPORT_DYN_RES_CHANGE) == 1 &&
+	    /* The raw (CPU) path detects the new size via plane-0 stride, so it can only stage a
+	     * resize that changes the width; same-width height-only resizes fall back to immediate. */
+	    (w != enc->cx || !enc->non_texture)) {
+		if (!enc->resize_pending) {
+			int64_t target = enc->fps_pending ? enc->reinit_target_pts : nvenc_next_boundary_pts(enc, pts);
+
+			enc->resize_pending = true;
+			enc->pending_width = w;
+			enc->pending_height = h;
+			if (!enc->fps_pending) { /* a staged FPS change already owns the boundary */
+				enc->reinit_target_pts = target;
+				enc->reinit_misses = 0;
+			}
+			/* The staged timed re-init re-anchors the grid with its own on-grid IDR, so a
+			 * pending off-grid re-anchor becomes moot. */
+			enc->reanchor_idr_pts = 0;
+			info("live resize %ux%u -> %ux%u staged (will apply at pts %lld, current pts %lld)",
+			     enc->cx, enc->cy, w, h, (long long)target, (long long)pts);
+			nvenc_alloc_scale_buffers(enc); /* raw path: old-size buffers for scaling */
+		} else if (w != enc->pending_width || h != enc->pending_height) {
+			/* A newer size arrived mid-wait: re-target the staged resize. */
+			info("live resize re-staged %ux%u -> %ux%u (boundary pts %lld)", enc->pending_width,
+			     enc->pending_height, w, h, (long long)enc->reinit_target_pts);
+			enc->pending_width = w;
+			enc->pending_height = h;
+		}
+		return true; /* keep encoding (scaled) with the current session until the boundary */
+	}
+
+	/* Non-grouped, or no cadence observed yet, or backend cannot scale: immediate in-place re-init. */
 	if (!apply_nvenc_resize(enc, w, h)) {
 		error("live resize to %ux%u could not be applied - encoder left in previous state until the stream restarts",
 		      w, h);
 		return false; // caps check: nothing was touched, retried on the next frame
 	}
+	return true;
+}
 
-	/* No staged realignment needed. The forceIDR=1 in apply_nvenc_resize()
-	 * already produces an IDR that resets the GOP phase. The ring is
-	 * preserved (resetEncoder=0), so the encoder continues producing frames
-	 * in order. The next natural keyframe boundary (within gopLength frames)
-	 * will re-align this track with sibling encoders on the shared grid.
-	 *
-	 * A second nvEncReconfigureEncoder(resetEncoder=1) here was previously
-	 * used to force a realignment IDR at the shared boundary, but it breaks
-	 * the NVENC AV1 pipeline (persistent INVALID_PARAM on lock after ring
-	 * reset). The natural GOP boundary is sufficient. */
+bool nvenc_prepare_frame(struct nvenc_data *enc, int64_t pts)
+{
+	/* Timed multitrack re-init (staged resize and/or staged FPS change): at the shared
+	 * keyframe boundary, run the deferred session re-init before any input copy of this
+	 * frame so its forced IDR lands exactly on-grid. */
+	if (!nvenc_maybe_apply_timed_reinit(enc, pts))
+		return false; // re-init failed - skip this frame, retry next
+
+	/* Live resolution change: stage a timed resize (grouped) or re-init immediately. */
+	if (!nvenc_maybe_resize(enc, pts))
+		return false; // immediate resize failed - encoder is broken, skip this frame
+
+	/* Live effective-FPS change: stage a boundary-aligned re-init or apply now. */
+	nvenc_check_fps(enc, pts);
 
 	return true;
 }
@@ -523,6 +969,14 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 			  enc->params.frameRateDen, (double)fps_num / fps_den, fps_num, fps_den);
 		enc->params.frameRateNum = fps_num;
 		enc->params.frameRateDen = fps_den;
+		/* Refresh the GOP length / IDR period for the new effective rate - they are otherwise
+		 * frozen at create time and would desync this track's keyframe cadence from its
+		 * multitrack siblings. In an encoder group the encode side stages the actual re-init at
+		 * the next shared keyframe boundary (nvenc_check_fps consumes fps_change_staged) instead
+		 * of riding this track's own - now shorter - GOP counter, which could fire off-grid. */
+		nvenc_refresh_gop(enc);
+		if (obs_encoder_is_in_group(enc->encoder))
+			enc->fps_change_staged = true;
 	}
 	if (br_changed) {
 		if (change_desc.array)
@@ -598,12 +1052,18 @@ static bool nvenc_update(void *data, obs_data_t *settings)
 			config->rcParams.targetQuality = (uint8_t)tq_val;
 			config->rcParams.averageBitRate = 0;
 			config->rcParams.vbvBufferSize = 0;
-			/* Open at the target (mirror init_encoder_base): governor raises toward max. */
-			config->rcParams.maxBitRate = (uint32_t)bitrate * 1000;
-			enc->abr_total_bits = 0.0; /* restart cumulative tracking */
-			enc->abr_total_time = 0.0;
-			enc->abr_acc_time = 0.0;
-			enc->abr_max_rate = config->rcParams.maxBitRate;
+			double db = obs_data_get_double(settings, "deadband");
+			if (db < 0.1)
+				db = 0.1;
+			else if (db > 10.0)
+				db = 10.0;
+			enc->abr_deadband = db / 100.0;
+			const int64_t abr_target_bps = (int64_t)bitrate * 1000;
+			const int64_t abr_ceiling_bps = (int64_t)(max_bitrate > 0 ? max_bitrate : bitrate) * 1000;
+			abr_gov_config cfg = abr_gov_default_config();
+			cfg.deadband_frac = enc->abr_deadband;
+			nvenc_abr_latch(enc, &cfg, abr_target_bps, abr_ceiling_bps);
+			config->rcParams.maxBitRate = (uint32_t)enc->abr_state.cur_rate;
 		}
 
 		/* ABR raises the QP floor to ABR_MIN_QP (see init_encoder_base); restore the
@@ -1059,16 +1519,22 @@ static bool init_encoder_base(struct nvenc_data *enc, obs_data_t *settings)
 		config->rcParams.minQP.qpIntra = abr_min_qp;
 		config->rcParams.averageBitRate = 0;
 		config->rcParams.vbvBufferSize = 0;
-		/* Open at the target, not the max: the governor raises the cap toward the
-		 * ceiling as budget allows, so complex content can still burst, but we never
-		 * start the stream pinned at full max (which spikes the initial bitrate). */
-		config->rcParams.maxBitRate = bitrate * 1000;
-		/* Cumulative tracking starts empty; the governor waits ~2 s of history
-		 * before deciding, so the opening keyframe can't skew the average. */
-		enc->abr_total_bits = 0.0;
-		enc->abr_total_time = 0.0;
-		enc->abr_acc_time = 0.0;
-		enc->abr_max_rate = config->rcParams.maxBitRate;
+		double db = obs_data_get_double(settings, "deadband");
+		if (db < 0.1)
+			db = 0.1; /* avoid a zero band that would reconfig on every tick */
+		else if (db > 10.0)
+			db = 10.0;
+		enc->abr_deadband = db / 100.0;
+		/* Open at the governed rate: fresh sessions start at target (headroom is earned, not assumed),
+		 * a killed or briefly disconnected previous session restores its cumulative budget. The governor
+		 * waits ~1 s of history before deciding, so the opening keyframe can't skew the average. */
+		const int64_t abr_target_bps = (int64_t)bitrate * 1000;
+		const int64_t abr_ceiling_bps =
+		    (int64_t)(enc->props.max_bitrate > 0 ? enc->props.max_bitrate : bitrate) * 1000;
+		abr_gov_config cfg = abr_gov_default_config();
+		cfg.deadband_frac = enc->abr_deadband;
+		nvenc_abr_latch(enc, &cfg, abr_target_bps, abr_ceiling_bps);
+		config->rcParams.maxBitRate = (uint32_t)enc->abr_state.cur_rate;
 		if (!enc->can_change_bitrate)
 			warn("ABR: dynamic bitrate change unsupported - running as uncontrolled QVBR (cap frozen at max)");
 	}
@@ -1645,6 +2111,7 @@ static void *nvenc_create_internal(enum codec_type codec, obs_data_t *settings, 
 	enc->codec = codec;
 	enc->first_packet = true;
 	enc->non_texture = !texture;
+	enc->last_keyframe_pts = -1; /* no keyframe cadence observed yet */
 
 	nvenc_properties_read(&enc->props, settings);
 
@@ -1813,6 +2280,8 @@ static void nvenc_destroy(void *data)
 {
 	struct nvenc_data *enc = data;
 
+	abr_gov_session_save(enc->encoder, enc->abr_active, &enc->abr_state);
+
 	if (enc->encode_started) {
 		NV_ENC_PIC_PARAMS params = {NV_ENC_PIC_PARAMS_VER};
 		params.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
@@ -1839,11 +2308,15 @@ static void nvenc_destroy(void *data)
 				if (ot->mapped_res)
 					nv.nvEncUnmapInputResource(enc->session, ot->mapped_res);
 				nv.nvEncUnregisterResource(enc->session, ot->res);
+				if (ot->vp_view)
+					ot->vp_view->lpVtbl->Release(ot->vp_view);
 				ot->tex->lpVtbl->Release(ot->tex);
 			}
 		}
 		da_free(enc->old_textures);
 	}
+	d3d11_free_gpu_scaler(enc);
+	d3d11_free_cpu_scaler(enc);
 	d3d11_free(enc);
 #else
 	cuda_opengl_free(enc);
@@ -1854,6 +2327,7 @@ static void nvenc_destroy(void *data)
 	bfree(enc->header);
 	bfree(enc->sei);
 	bfree(enc->roi_map);
+	nvenc_free_scale_buffers(enc);
 
 #ifdef NVENC_13_0_OR_LATER
 	if (enc->mdi)
@@ -1984,6 +2458,28 @@ static bool get_encoded_packet(struct nvenc_data *enc, bool finalize)
 
 		if (enc->packet_keyframe) {
 			enc->frames_since_idr = 0; /* resync GOP-boundary counter */
+			/* Track the steady-state on-grid keyframe cadence for multitrack timed re-init.
+			 * Only update when not mid staged resize/FPS re-init so an off-grid session-start
+			 * IDR cannot corrupt the shared grid phase. */
+			if (!enc->resize_pending && !enc->fps_pending) {
+				const int64_t kpts = (int64_t)lock.outputTimeStamp;
+				/* While a re-anchor IDR is pending, ignore the off-grid session-start IDRs
+				 * so they cannot shift the shared grid anchor; tracking resumes at the
+				 * on-grid re-anchor IDR itself. */
+				if (!(enc->reanchor_idr_pts != 0 && kpts != enc->reanchor_idr_pts)) {
+					if (enc->last_keyframe_pts >= 0) {
+						int64_t delta = kpts - enc->last_keyframe_pts;
+						if (delta > 0)
+							enc->gop_pts = delta;
+					}
+					enc->last_keyframe_pts = kpts;
+				}
+				if (enc->reanchor_idr_pts != 0 && kpts == enc->reanchor_idr_pts) {
+					info("off-grid re-init re-anchored at shared keyframe boundary pts=%lld",
+					     (long long)kpts);
+					enc->reanchor_idr_pts = 0;
+				}
+			}
 			if (enc->reconfig_pending)
 				info("observed keyframe pts=%lld while RC change staged",
 				     (long long)lock.outputTimeStamp);
@@ -2188,8 +2684,14 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 
 		/* One reset+IDR at a shared tick re-anchors the GOP phase. */
 		enc->reconfig_pending = false;
-		if (ok)
+		if (ok) {
 			enc->frames_since_idr = 0;
+			/* The full re-init already carried any staged FPS params (updated at staging time),
+			 * so drop the timed FPS re-init to avoid a redundant reset right after. */
+			if (enc->fps_pending)
+				info("staged RC reconfigure also applied the staged FPS change; dropping timed FPS re-init");
+			enc->fps_pending = false;
+		}
 	}
 
 	NV_ENC_PIC_PARAMS params = {0};
@@ -2229,6 +2731,22 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 	/* Add ROI map if enabled */
 	if (obs_encoder_has_roi(enc->encoder))
 		add_roi(enc, &params);
+
+	/* Forced IDR at a shared boundary to re-anchor an off-grid session (see
+	 * nvenc_schedule_reanchor): the driver restarts its idrPeriod from any IDR, so one
+	 * on-grid IDR restores keyframe alignment with the sibling tracks. */
+	if (enc->reanchor_idr_pts != 0) {
+		if (pts == enc->reanchor_idr_pts) {
+			params.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
+			info("forcing IDR at shared keyframe boundary pts=%lld to re-anchor the off-grid GOP",
+			     (long long)pts);
+		} else if (pts > enc->reanchor_idr_pts) {
+			/* Boundary frame was dropped - advance to the next shared boundary. */
+			warn("re-anchor boundary pts %lld missed (pts %lld), retrying at pts %lld",
+			     (long long)enc->reanchor_idr_pts, (long long)pts,
+			     (long long)(enc->reanchor_idr_pts += enc->gop_pts));
+		}
+	}
 
 	nvenc_trace_pic(enc, &params, false);
 
@@ -2285,6 +2803,8 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 						if (ot->mapped_res)
 							nv.nvEncUnmapInputResource(enc->session, ot->mapped_res);
 						nv.nvEncUnregisterResource(enc->session, ot->res);
+						if (ot->vp_view)
+							ot->vp_view->lpVtbl->Release(ot->vp_view);
 						ot->tex->lpVtbl->Release(ot->tex);
 					}
 				}
@@ -2321,7 +2841,7 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 		packet->keyframe = enc->packet_keyframe;
 
 		/* ABR governor: feed the actual encoded size so it can adapt maxBitRate. */
-		abr_gov_update(enc, (uint32_t)enc->packet_data.num);
+		nvenc_abr_tick(enc, (uint32_t)enc->packet_data.num);
 	} else {
 		*received_packet = false;
 	}
