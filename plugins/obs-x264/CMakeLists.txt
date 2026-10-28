@@ -6,11 +6,15 @@ if(NOT TARGET OBS::opts-parser)
   add_subdirectory("${CMAKE_SOURCE_DIR}/shared/opts-parser" "${CMAKE_BINARY_DIR}/shared/opts-parser")
 endif()
 
+if(NOT TARGET OBS::abr-gov)
+  add_subdirectory("${CMAKE_SOURCE_DIR}/shared/abr-gov" "${CMAKE_BINARY_DIR}/shared/abr-gov")
+endif()
+
 add_library(obs-x264 MODULE)
 add_library(OBS::x264 ALIAS obs-x264)
 
 target_sources(obs-x264 PRIVATE obs-x264.c obs-x264-plugin-main.c)
-target_link_libraries(obs-x264 PRIVATE OBS::opts-parser Libx264::Libx264)
+target_link_libraries(obs-x264 PRIVATE OBS::opts-parser OBS::abr-gov Libx264::Libx264)
 
 if(OS_WINDOWS)
   configure_file(cmake/windows/obs-module.rc.in obs-x264.rc)

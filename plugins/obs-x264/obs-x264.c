@@ -23,6 +23,7 @@
 #include <util/platform.h>
 #include <obs-module.h>
 #include <opts-parser.h>
+#include <abr-gov.h>
 
 #ifndef _STDINT_H_INCLUDED
 #define _STDINT_H_INCLUDED
@@ -45,6 +46,17 @@
 
 /* ------------------------------------------------------------------------- */
 
+/* One encoded access unit captured while flushing a context before re-opening it (see
+ * obs_x264_flush_pending). Buffered so the in-flight frames can be re-emitted, in DTS
+ * order, across subsequent encode calls instead of being dropped by encoder_close(). */
+struct obs_x264_queued_pkt {
+	uint8_t *data; /* owned copy of the concatenated NALs */
+	size_t   size;
+	int64_t  pts;
+	int64_t  dts;
+	bool     keyframe;
+};
+
 struct obs_x264 {
 	obs_encoder_t *encoder;
 
@@ -64,6 +76,17 @@ struct obs_x264 {
 	 * live FPS change can recompute i_keyint_max for the new rate without depending on
 	 * whether a deferred update() has already rescaled it from the new fps. */
 	int keyint_sec;
+
+	/* ABR (Custom) runtime governor (active only for rate_control=ABRCustom, latched at open by
+	 * x264_abr_prepare_open - see the governor section below). The whole control law, tick cadence and
+	 * stream-session budget live in the shared abr-gov module; abr_state is the per-open latch of that
+	 * state (cur_rate in bits/sec at the shared boundary) and survives stop/start via
+	 * abr_gov_session_load/save. */
+	bool    abr_active;
+	int64_t abr_target_kbps; /* settings "bitrate" (kbps) - long-term target */
+	int64_t abr_max_kbps;    /* settings "max_bitrate" (kbps) - governor ceiling */
+	double  abr_deadband;    /* settings "deadband" as a fraction (0.005 = +/-0.5%) */
+	abr_gov_state abr_state; /* session budget + current governed rate (bps) */
 
 	DARRAY(uint8_t) packet_data;
 
@@ -104,23 +127,20 @@ struct obs_x264 {
 	/* Live resolution change (multitrack) support - mirrors nvenc/qsv. The size the
 	 * x264 context was last opened with, plus the plane-0 stride of frames at that size
 	 * (race guard: the mix rebind takes effect on the next tick). A resize is applied by
-	 * re-opening the context at a keyframe boundary so the IDR lands on-grid with no DTS gap. */
+	 * re-opening the context immediately when it is detected: in-flight frames are flushed
+	 * and re-emitted (see flush_queue) so no frame is dropped and DTS stays continuous.
+	 * The re-open emits an off-grid IDR; a second re-open on the next shared keyframe
+	 * boundary (align_pending) re-locks this track onto its siblings' keyframe grid. */
 	uint32_t inited_width;
 	uint32_t inited_height;
 	uint32_t inited_ls0;
 	int      resize_stall;
 
-	/* Timed resize: when a resolution change is detected, we defer the re-open until the next
-	 * shared keyframe boundary. Between detection and the boundary, incoming frames (at the new
-	 * size) are scaled down to the old resolution so they can be encoded by the current context
-	 * without dropping any frames or creating DTS gaps. At the boundary we re-open with the new
-	 * resolution - the IDR lands exactly on-grid. */
-	bool     resize_pending;
-	uint32_t pending_width;
-	uint32_t pending_height;
-	int64_t  resize_target_pts;
-	uint8_t *scale_buf[4];   /* old-resolution buffers for scaling incoming frames */
-	uint32_t scale_stride[4];
+	/* In-flight frames captured by flushing the context at a live re-open (see
+	 * obs_x264_flush_pending). Buffered so they can be re-emitted, in DTS order, across
+	 * subsequent encode calls instead of being dropped by encoder_close() - which would
+	 * leave a DTS gap and undecodable output at the resize point. */
+	DARRAY(struct obs_x264_queued_pkt) flush_queue;
 
 	/* Multitrack keyframe-grid realignment after a live resize. The resize re-open emits an
 	 * off-grid IDR that re-anchors this track mid-GOP; to re-lock onto the siblings' shared
@@ -136,7 +156,7 @@ struct obs_x264 {
 };
 
 /* Forward declarations */
-static void free_scale_buffers(struct obs_x264 *obsx264);
+static void obs_x264_flush_queue_free(struct obs_x264 *obsx264);
 
 /* ------------------------------------------------------------------------- */
 
@@ -235,7 +255,145 @@ static void clear_data(struct obs_x264 *obsx264)
 	bfree(obsx264->gbr_deinter);
 	obsx264->gbr_deinter = NULL;
 	obsx264->gbr_deinter_size = 0;
-	free_scale_buffers(obsx264);
+	obs_x264_flush_queue_free(obsx264);
+}
+
+/* ------------------------------------------------------------------------- */
+/* ABR (Custom) runtime governor                                              */
+/* ------------------------------------------------------------------------- */
+/* rate_control="ABRCustom" runs x264 as constant-ratefactor (CRF) with a     */
+/* runtime-steered VBV ceiling, mirroring obs-x265's governed ABR: the CRF    */
+/* field is the base quality point, and the shared abr-gov law steers         */
+/* rc.i_vbv_max_bitrate/rc.i_vbv_buffer_size at runtime within [target,       */
+/* max] so the stream's cumulative average converges toward the target        */
+/* bitrate: complex content spends up to the ceiling, easy content stays low. */
+/* Unlike x265 this needs no obs-deps patch: stock libx264 already re-derives */
+/* its RC VBV/CRF state on a deferred x264_encoder_reconfig (see              */
+/* x264_ratecontrol_init_reconfigurable) reading live from h->param.rc.       */
+
+#define X264_ABR_DEADBAND_FRAC 0.005
+
+/* Decide the session budget for this open (fresh or restored) and latch the per-context state.
+ * Must run before update_settings() in create(), so the context opens at the correct governed
+ * ceiling. No-op unless rate_control=ABRCustom with bitrate > 0 and max_bitrate > 0. */
+static void x264_abr_prepare_open(struct obs_x264 *obsx264, obs_data_t *settings)
+{
+	obsx264->abr_active = false;
+
+	const char *rc_str = obs_data_get_string(settings, "rate_control");
+	int target = (int)obs_data_get_int(settings, "bitrate");
+	int maxbr = (int)obs_data_get_int(settings, "max_bitrate");
+
+	if (strcmp(rc_str, "ABRCustom") != 0 || target <= 0 || maxbr <= 0)
+		return;
+
+	if (maxbr < target)
+		maxbr = target; /* a ceiling below the target gives no headroom; clamp it */
+
+	/* The decision law, tick cadence and session persistence live in the shared abr-gov module.
+	 * The governor works in bits/sec at the shared boundary; x264's settings/params are kbps, so
+	 * convert here. Fresh sessions start at target (headroom is earned); a killed or briefly
+	 * disconnected previous session restores its cumulative budget. */
+	abr_gov_config cfg = abr_gov_default_config();
+	abr_gov_session_load(obsx264->encoder, true, (int64_t)target * 1000, (int64_t)maxbr * 1000, &cfg,
+	                     &obsx264->abr_state);
+
+	info("x264 ABR governor: session budget ready, target %d kbps, ceiling %d kbps, governed rate -> %lld kbps",
+	     target, maxbr, (long long)(obsx264->abr_state.cur_rate / 1000));
+
+	obsx264->abr_target_kbps = target;
+	obsx264->abr_max_kbps = maxbr;
+	obsx264->abr_deadband = X264_ABR_DEADBAND_FRAC; /* fallback; update_settings latches the setting */
+	obsx264->abr_active = true;
+}
+
+/* Write the session budget back to the shared registry (called from destroy()). */
+static void x264_abr_save_session(struct obs_x264 *obsx264)
+{
+	if (!obsx264->abr_active || !obsx264->encoder)
+		return;
+
+	abr_gov_session_save(obsx264->encoder, true, &obsx264->abr_state);
+}
+
+/* Re-latch target/ceiling on a mid-stream settings update (the update() path). The budget
+ * itself is never reset here: it is a whole-stream quantity. */
+static void x264_abr_re_latch(struct obs_x264 *obsx264, int target_kbps, int max_kbps)
+{
+	if (!obsx264->abr_active)
+		return;
+
+	if (max_kbps < target_kbps)
+		max_kbps = target_kbps;
+	obsx264->abr_target_kbps = target_kbps;
+	obsx264->abr_max_kbps = max_kbps;
+
+	const abr_gov_config cfg = abr_gov_default_config();
+	const int64_t floor_bps = (int64_t)((double)target_kbps * 1000.0 * cfg.overshoot_floor_frac);
+	const int64_t ceiling_bps = (int64_t)max_kbps * 1000;
+	if (obsx264->abr_state.cur_rate < floor_bps)
+		obsx264->abr_state.cur_rate = floor_bps;
+	if (obsx264->abr_state.cur_rate > ceiling_bps)
+		obsx264->abr_state.cur_rate = ceiling_bps;
+}
+
+/* One governor tick: feed a coded packet and, if the cumulative average has drifted outside
+ * the deadband, steer the governed VBV ceiling. Accumulation, cadence (0.5 s), the history gate and
+ * the decision law all live in the shared abr-gov module; x264 only computes dt, converts kbps<->bps
+ * at the boundary, and applies the result via a deferred x264_encoder_reconfig. */
+static void x264_abr_tick(struct obs_x264 *obsx264, size_t packet_size)
+{
+	if (!obsx264->abr_active || !obsx264->context)
+		return;
+
+	double eff_fps = obs_encoder_get_effective_fps(obsx264->encoder);
+	if (eff_fps <= 0.0)
+		return;
+	const double dt = 1.0 / eff_fps;
+
+	const int64_t target_bps = obsx264->abr_target_kbps * 1000;
+	const int64_t ceiling_bps = obsx264->abr_max_kbps * 1000;
+
+	abr_gov_config cfg = abr_gov_default_config();
+	cfg.deadband_frac = obsx264->abr_deadband;
+
+	const int64_t old_rate_bps = obsx264->abr_state.cur_rate;
+	double cum_avg_bps = 0.0;
+	const bool changed =
+		abr_gov_tick(&obsx264->abr_state, &cfg, target_bps, ceiling_bps, dt, (uint32_t)packet_size, &cum_avg_bps);
+
+	if (cum_avg_bps > 0.0) {
+		blog(LOG_DEBUG, "x264 ABR governor: cumulative avg %.0f kbps (target %lld, governed ceiling %lld, t=%.1fs)",
+		     cum_avg_bps / 1000.0, (long long)obsx264->abr_target_kbps,
+		     (long long)(obsx264->abr_state.cur_rate / 1000), obsx264->abr_state.total_time);
+	}
+
+	if (!changed)
+		return;
+
+	const int new_kbps = (int)(obsx264->abr_state.cur_rate / 1000);
+
+	/* Apply: full copy of the current params with only the VBV ceiling/buffer changed. x264 flags a deferred RC
+	 * reconfig that is applied at the next frame boundary, where x264_ratecontrol_init_reconfigurable re-derives its
+	 * VBV/CRF state from these values while preserving the current buffer fill (stock libx264 already supports live
+	 * CRF/VBV reconfig - no obs-deps patch needed, unlike x265). */
+	x264_param_t newp = obsx264->params;
+	newp.rc.i_vbv_max_bitrate = new_kbps;
+	newp.rc.i_vbv_buffer_size = new_kbps;
+
+	int ret = x264_encoder_reconfig(obsx264->context, &newp);
+	if (ret != 0) {
+		warn("x264 ABR governor: reconfig to %d kbps failed (%d), keeping %lld kbps", new_kbps, ret,
+		     (long long)(old_rate_bps / 1000));
+		obsx264->abr_state.cur_rate = old_rate_bps; /* codec kept the previous ceiling; retry next tick */
+		return;
+	}
+
+	/* Keep the stored params in sync so a later user-triggered reconfig does not snap back to the open-time
+	 * ceiling. The change is deferred and lands at the next frame boundary; if it has moved on again by then, the
+	 * next tick resends. */
+	obsx264->params.rc.i_vbv_max_bitrate = new_kbps;
+	obsx264->params.rc.i_vbv_buffer_size = new_kbps;
 }
 
 static void obs_x264_destroy(void *data)
@@ -243,6 +401,7 @@ static void obs_x264_destroy(void *data)
 	struct obs_x264 *obsx264 = data;
 
 	if (obsx264) {
+		x264_abr_save_session(obsx264);
 		os_end_high_performance(obsx264->performance_token);
 		clear_data(obsx264);
 		da_free(obsx264->packet_data);
@@ -253,6 +412,16 @@ static void obs_x264_destroy(void *data)
 static void obs_x264_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "bitrate", 2500);
+	/* Max bitrate (ABR only): VBV peak cap above the target bitrate. 0 = keep capping at the
+	 * target bitrate (historical ABR behavior). */
+	obs_data_set_default_int(settings, "max_bitrate", 0);
+	/* Deadband / bitrate window (ABR Custom only): how far (in percent) the stream's cumulative
+	 * average may drift from the target before the governor corrects it. Shown for ABR (Custom) by
+	 * rate_control_modified; the tick uses it /100. */
+	obs_data_set_default_double(settings, "deadband", X264_ABR_DEADBAND_FRAC * 100);
+	/* QCompress (ABR only): quantizer curve compression, valid range 0.5-1.0; 0.6 is the
+	 * encoder default. Shown for ABR by rate_control_modified. */
+	obs_data_set_default_double(settings, "qcomp", 0.6);
 	obs_data_set_default_bool(settings, "use_bufsize", false);
 	obs_data_set_default_int(settings, "buffer_size", 2500);
 	obs_data_set_default_int(settings, "keyint_sec", 0);
@@ -284,10 +453,13 @@ static inline void add_strings(obs_property_t *list, const char *const *strings)
 
 #define TEXT_RATE_CONTROL obs_module_text("RateControl")
 #define TEXT_BITRATE obs_module_text("Bitrate")
+#define TEXT_MAX_BITRATE obs_module_text("MaxBitrate")
+#define TEXT_QCOMP obs_module_text("QCompress")
 #define TEXT_CUSTOM_BUF obs_module_text("CustomBufsize")
 #define TEXT_BUF_SIZE obs_module_text("BufferSize")
 #define TEXT_VFR obs_module_text("VFR")
 #define TEXT_CRF obs_module_text("CRF")
+#define TEXT_DEADBAND obs_module_text("Deadband")
 #define TEXT_KEYINT_SEC obs_module_text("KeyframeIntervalSec")
 #define TEXT_PRESET obs_module_text("CPUPreset")
 #define TEXT_PROFILE obs_module_text("Profile")
@@ -315,16 +487,23 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs
 	bool use_bufsize = obs_data_get_bool(settings, "use_bufsize");
 	bool abr = astrcmpi(rc, "CBR") == 0 || astrcmpi(rc, "ABR") == 0;
 	bool rc_crf = astrcmpi(rc, "CRF") == 0;
+	bool abrcustom = astrcmpi(rc, "ABRCustom") == 0;
 
 	p = obs_properties_get(ppts, "crf");
-	obs_property_set_visible(p, !abr);
+	obs_property_set_visible(p, !abr); /* shown for CRF and ABR (Custom) - the quality base point */
 
 	p = obs_properties_get(ppts, "bitrate");
-	obs_property_set_visible(p, !rc_crf);
+	obs_property_set_visible(p, !rc_crf); /* target bitrate; hidden only for plain CRF */
+	p = obs_properties_get(ppts, "max_bitrate");
+	obs_property_set_visible(p, astrcmpi(rc, "ABR") == 0 || abrcustom);
+	p = obs_properties_get(ppts, "qcomp");
+	obs_property_set_visible(p, astrcmpi(rc, "ABR") == 0); /* classic ABR only */
 	p = obs_properties_get(ppts, "use_bufsize");
-	obs_property_set_visible(p, !rc_crf);
+	obs_property_set_visible(p, !rc_crf && !abrcustom); /* VBV is auto-managed by the governor */
 	p = obs_properties_get(ppts, "buffer_size");
-	obs_property_set_visible(p, !rc_crf && use_bufsize);
+	obs_property_set_visible(p, !rc_crf && !abrcustom && use_bufsize);
+	p = obs_properties_get(ppts, "deadband");
+	obs_property_set_visible(p, abrcustom); /* governor tolerance, ABR (Custom) only */
 	return true;
 }
 
@@ -364,6 +543,7 @@ static obs_properties_t *obs_x264_props(void *unused)
 				       OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(list, "CBR", "CBR");
 	obs_property_list_add_string(list, "ABR", "ABR");
+	obs_property_list_add_string(list, "ABR (Custom)", "ABRCustom");
 	obs_property_list_add_string(list, "VBR", "VBR");
 	obs_property_list_add_string(list, "CRF", "CRF");
 
@@ -371,6 +551,30 @@ static obs_properties_t *obs_x264_props(void *unused)
 
 	p = obs_properties_add_int(props, "bitrate", TEXT_BITRATE, 50, 10000000, 50);
 	obs_property_int_set_suffix(p, " Kbps");
+
+	/* Max bitrate (ABR only): VBV peak cap above the target bitrate; shown for ABR by
+	 * rate_control_modified. 0 = keep capping at the target bitrate. */
+	p = obs_properties_add_int(props, "max_bitrate", TEXT_MAX_BITRATE, 0, 10000000, 50);
+	obs_property_int_set_suffix(p, " Kbps");
+	obs_property_set_visible(p, false);
+
+	/* Deadband / bitrate window (ABR Custom only): how far the cumulative average may drift from
+	 * the target before the governor corrects it. Shown for ABR (Custom) by rate_control_modified.
+	 * Stored as a percent; the tick uses it /100. */
+	p = obs_properties_add_float_slider(props, "deadband", TEXT_DEADBAND, 0.1, 10.0, 0.1);
+	obs_property_set_long_description(p,
+			"Governor tolerance: how far (in percent) the stream's cumulative average bitrate may "
+			"drift from the target before the governor pulls the ceiling down (above) or raises it "
+			"(below). Smaller = tighter control and a whole-file average held closer to the target, "
+			"at the cost of more frequent reconfigs; larger = looser, fewer adjustments.");
+	obs_property_set_visible(p, false);
+
+	/* QCompress (ABR only): quantizer curve compression; shown for ABR by rate_control_modified. */
+	p = obs_properties_add_float_slider(props, "qcomp", TEXT_QCOMP, 0.5, 1.0, 0.05);
+	obs_property_set_long_description(p,
+					"The valid range is 0.5 to 1.0. The closer you get to 1.0, the more the encoder favors a constant "
+					"quantization level. This can lead to greater bitrate variations between simple and complex scenes.");
+	obs_property_set_visible(p, false);
 
 	p = obs_properties_add_bool(props, "use_bufsize", TEXT_CUSTOM_BUF);
 	obs_property_set_modified_callback(p, use_bufsize_modified);
@@ -651,6 +855,7 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 	const char *rate_control = obs_data_get_string(settings, "rate_control");
 
 	int bitrate = (int)obs_data_get_int(settings, "bitrate");
+	int max_bitrate = (int)obs_data_get_int(settings, "max_bitrate");
 	int buffer_size = (int)obs_data_get_int(settings, "buffer_size");
 	int keyint_sec = (int)obs_data_get_int(settings, "keyint_sec");
 	obsx264->keyint_sec = keyint_sec;
@@ -688,6 +893,11 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 		bitrate = 0;
 		buffer_size = 0;
 
+	} else if (astrcmpi(rate_control, "ABRCustom") == 0) {
+		/* ABR (Custom): CRF base with a runtime-governed VBV ceiling. crf is the quality point;
+		 * bitrate is the long-term target and max_bitrate the governor ceiling. */
+		rc = RATE_CONTROL_CRF;
+
 	} else { /* CBR */
 		rc = RATE_CONTROL_CBR;
 		crf = 0;
@@ -696,17 +906,38 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 	if (keyint_sec)
 		obsx264->params.i_keyint_max = keyint_sec * voi->fps_num / voi->fps_den;
 
-	if (!use_bufsize)
-		buffer_size = bitrate;
+	/* ABR (Custom): when the governor is active (latched at open by x264_abr_prepare_open), the VBV
+	 * ceiling/buffer are set from the governed rate and re-latched here on mid-stream updates; they must
+	 * not be re-derived from settings. Without it, an explicit max bitrate raises the fixed VBV peak cap
+	 * above the target (classic ABR); 0 keeps capping at the target. Other modes are unaffected. */
+	if (rc == RATE_CONTROL_CRF && astrcmpi(rate_control, "ABRCustom") == 0 && obsx264->abr_active) {
+		x264_abr_re_latch(obsx264, bitrate, max_bitrate);
+		double deadband = obs_data_get_double(settings, "deadband");
+		if (deadband < 0.1)
+			deadband = 0.1; /* avoid a zero band that would reconfig on every tick */
+		else if (deadband > 10.0)
+			deadband = 10.0;
+		obsx264->abr_deadband = deadband / 100.0;
+		obsx264->params.rc.i_vbv_max_bitrate = (int)(obsx264->abr_state.cur_rate / 1000);
+		obsx264->params.rc.i_vbv_buffer_size = (int)(obsx264->abr_state.cur_rate / 1000);
+	} else {
+		int vbv_max = (rc == RATE_CONTROL_ABR && max_bitrate > 0) ? max_bitrate : bitrate;
+
+		if (!use_bufsize)
+			buffer_size = vbv_max;
+
+		obsx264->params.rc.i_vbv_max_bitrate = vbv_max;
+		obsx264->params.rc.i_vbv_buffer_size = buffer_size;
+	}
 
 #ifdef ENABLE_VFR
 	obsx264->params.b_vfr_input = vfr;
 #else
 	obsx264->params.b_vfr_input = false;
 #endif
-	obsx264->params.rc.i_vbv_max_bitrate = bitrate;
-	obsx264->params.rc.i_vbv_buffer_size = buffer_size;
 	obsx264->params.rc.i_bitrate = bitrate;
+	/* QCompress: quantizer curve compression for ABR (ignored by the other rate-control modes). */
+	obsx264->params.rc.f_qcompress = (float)obs_data_get_double(settings, "qcomp");
 	obsx264->params.i_width = width;
 	obsx264->params.i_height = height;
 	obsx264->params.i_fps_num = voi->fps_num;
@@ -810,6 +1041,7 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 		info("settings:\n"
 		     "\trate_control: %s\n"
 		     "\tbitrate:      %d\n"
+		     "\tmax bitrate:  %d\n"
 		     "\tbuffer size:  %d\n"
 		     "\tcrf:          %d\n"
 		     "\tFPS:          %g (%u/%u)\n"
@@ -818,7 +1050,7 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings, const 
 		     "\tkeyint:       %d\n"
 		     "\tcolor format: %d\n"
 		     "\tbit depth:    %u\n",
-		     rate_control, obsx264->params.rc.i_vbv_max_bitrate, obsx264->params.rc.i_vbv_buffer_size,
+		     rate_control, bitrate, obsx264->params.rc.i_vbv_max_bitrate, obsx264->params.rc.i_vbv_buffer_size,
 		     (int)obsx264->params.rc.f_rf_constant, obs_encoder_get_effective_fps(obsx264->encoder),
 		     obs_encoder_get_fps_num(obsx264->encoder), obs_encoder_get_fps_den(obsx264->encoder) * obs_encoder_get_frame_rate_divisor(obsx264->encoder), width, height,
 		     obsx264->params.i_keyint_max, (int)obsx264->color_format, bitdepth);
@@ -1023,6 +1255,11 @@ static void *obs_x264_create(obs_data_t *settings, obs_encoder_t *encoder)
 	obsx264->active_csp = csp;
 	obsx264->active_bitdepth = bitdepth;
 
+	/* ABR (Custom) governor: decide the session budget (fresh vs restored from a previous session of
+	 * this encoder) before the params are built, so the context opens at the correct governed ceiling.
+	 * No-op unless rate_control=ABRCustom with bitrate > 0 and max_bitrate > 0. */
+	x264_abr_prepare_open(obsx264, settings);
+
 	if (update_settings(obsx264, settings, false)) {
 		obsx264->context = x264_encoder_open(&obsx264->params);
 
@@ -1082,11 +1319,12 @@ static void parse_packet(struct obs_x264 *obsx264, struct encoder_packet *packet
 /* De-interleaves a packed BGRA frame (B,G,R,A per pixel) into three planar u8 buffers
  * [G][B][R] so it can be fed to x264 as YUV 4:4:4 with an identity (GBR) matrix. The
  * scratch is cached on the encoder and only reallocated when the resolution changes, so
- * steady-state frames cost one pass and no allocation. */
-static uint8_t *deinterleave_gbra(struct obs_x264 *obsx264, struct encoder_frame *frame, int *stride_out)
+ * steady-state frames cost one pass and no allocation. width/height MUST match the actual
+ * dimensions of the frame being de-interleaved (during the one-tick mix rebind race after a
+ * live resize that is the OLD session size, not the encoder's current target size). */
+static uint8_t *deinterleave_gbra(struct obs_x264 *obsx264, struct encoder_frame *frame, uint32_t width,
+				  uint32_t height, int *stride_out)
 {
-	const uint32_t width = obs_encoder_get_width(obsx264->encoder);
-	const uint32_t height = obs_encoder_get_height(obsx264->encoder);
 	const size_t plane_size = (size_t)width * height;
 
 	if (!obsx264->gbr_deinter || obsx264->gbr_deinter_size < 3 * plane_size) {
@@ -1114,137 +1352,90 @@ static uint8_t *deinterleave_gbra(struct obs_x264 *obsx264, struct encoder_frame
 	return obsx264->gbr_deinter;
 }
 
-/* Nearest-neighbor YUV scaler for the timed-resize transition period. Scales a frame from
- * src_w x src_h to dst_w x dst_h in-place into pre-allocated buffers. Handles NV12 (2 planes),
- * I420/I422 (3 planar planes), and BGRA (packed 4-channel). Only used for the short window
- * between resize detection and the keyframe-boundary re-open, so quality is not a concern. */
-static void scale_frame_to_old_size(struct obs_x264 *obsx264, struct encoder_frame *frame)
+/* Copy one flushed access unit into the re-emit queue. */
+static void obs_x264_flush_enqueue(struct obs_x264 *obsx264, x264_nal_t *nals, int nal_count,
+                                   const x264_picture_t *pic_out)
 {
-	const uint32_t src_w = obs_encoder_get_width(obsx264->encoder);
-	const uint32_t src_h = obs_encoder_get_height(obsx264->encoder);
-	const uint32_t dst_w = obsx264->inited_width;
-	const uint32_t dst_h = obsx264->inited_height;
+	size_t total = 0;
+	for (int i = 0; i < nal_count; i++)
+		total += nals[i].i_payload;
 
-	if (src_w == dst_w && src_h == dst_h)
-		return; /* no scaling needed */
-
-	const int csp = obsx264->active_csp;
-
-	if (obsx264->color_format == VIDEO_FORMAT_BGRA) {
-		/* Packed BGRA: scale pixel-by-pixel, 4 bytes per pixel. */
-		for (uint32_t y = 0; y < dst_h; y++) {
-			const uint32_t sy = (y * src_h) / dst_h;
-			const uint8_t *srow = frame->data[0] + (size_t)sy * frame->linesize[0];
-			uint8_t *drow = obsx264->scale_buf[0] + (size_t)y * obsx264->scale_stride[0];
-			for (uint32_t x = 0; x < dst_w; x++) {
-				const uint32_t sx = (x * src_w) / dst_w;
-				memcpy(drow + x * 4, srow + sx * 4, 4);
-			}
-		}
-		return;
+	struct obs_x264_queued_pkt *pkt = da_push_back_new(obsx264->flush_queue);
+	pkt->data = bmalloc(total);
+	uint8_t *dst = pkt->data;
+	for (int i = 0; i < nal_count; i++) {
+		memcpy(dst, nals[i].p_payload, nals[i].i_payload);
+		dst += nals[i].i_payload;
 	}
-
-	if (csp == X264_CSP_NV12) {
-		/* Plane 0: Y (full res) */
-		for (uint32_t y = 0; y < dst_h; y++) {
-			const uint32_t sy = (y * src_h) / dst_h;
-			const uint8_t *srow = frame->data[0] + (size_t)sy * frame->linesize[0];
-			uint8_t *drow = obsx264->scale_buf[0] + (size_t)y * obsx264->scale_stride[0];
-			for (uint32_t x = 0; x < dst_w; x++)
-				drow[x] = srow[(x * src_w) / dst_w];
-		}
-		/* Plane 1: interleaved UV (half res) */
-		const uint32_t src_uv_w = src_w / 2, src_uv_h = src_h / 2;
-		const uint32_t dst_uv_w = dst_w / 2, dst_uv_h = dst_h / 2;
-		for (uint32_t y = 0; y < dst_uv_h; y++) {
-			const uint32_t sy = (y * src_uv_h) / dst_uv_h;
-			const uint8_t *srow = frame->data[1] + (size_t)sy * frame->linesize[1];
-			uint8_t *drow = obsx264->scale_buf[1] + (size_t)y * obsx264->scale_stride[1];
-			for (uint32_t x = 0; x < dst_uv_w; x++) {
-				const uint32_t sx = (x * src_uv_w) / dst_uv_w;
-				drow[x * 2]     = srow[sx * 2];     /* U */
-				drow[x * 2 + 1] = srow[sx * 2 + 1]; /* V */
-			}
-		}
-		return;
-	}
-
-	if (csp == X264_CSP_I420 || csp == X264_CSP_I422 || csp == X264_CSP_I444) {
-		/* Plane 0: Y (full res) */
-		for (uint32_t y = 0; y < dst_h; y++) {
-			const uint32_t sy = (y * src_h) / dst_h;
-			const uint8_t *srow = frame->data[0] + (size_t)sy * frame->linesize[0];
-			uint8_t *drow = obsx264->scale_buf[0] + (size_t)y * obsx264->scale_stride[0];
-			for (uint32_t x = 0; x < dst_w; x++)
-				drow[x] = srow[(x * src_w) / dst_w];
-		}
-		/* Planes 1,2: U,V */
-		const bool half_w = (csp != X264_CSP_I444);
-		const bool half_h = (csp == X264_CSP_I420);
-		const uint32_t src_uv_w = half_w ? src_w / 2 : src_w;
-		const uint32_t src_uv_h = half_h ? src_h / 2 : src_h;
-		const uint32_t dst_uv_w = half_w ? dst_w / 2 : dst_w;
-		const uint32_t dst_uv_h = half_h ? dst_h / 2 : dst_h;
-		for (int plane = 1; plane <= 2; plane++) {
-			for (uint32_t y = 0; y < dst_uv_h; y++) {
-				const uint32_t sy = (y * src_uv_h) / dst_uv_h;
-				const uint8_t *srow = frame->data[plane] + (size_t)sy * frame->linesize[plane];
-				uint8_t *drow = obsx264->scale_buf[plane] + (size_t)y * obsx264->scale_stride[plane];
-				for (uint32_t x = 0; x < dst_uv_w; x++)
-					drow[x] = srow[(x * src_uv_w) / dst_uv_w];
-			}
-		}
-		return;
-	}
-
-	/* Fallback: unsupported format, do nothing (frame will be encoded as-is if sizes match,
-	 * otherwise the re-open should have already happened). */
+	pkt->size     = total;
+	pkt->pts      = pic_out->i_pts;
+	pkt->dts      = pic_out->i_dts;
+	pkt->keyframe = pic_out->b_keyframe != 0;
 }
 
-/* Allocate scale buffers at the old (current context) resolution for the timed-resize window. */
-static void alloc_scale_buffers(struct obs_x264 *obsx264)
+/* Free any access units still buffered in the re-emit queue (called on destroy). */
+static void obs_x264_flush_queue_free(struct obs_x264 *obsx264)
 {
-	const uint32_t w = obsx264->inited_width;
-	const uint32_t h = obsx264->inited_height;
-	const int csp = obsx264->active_csp;
+	for (size_t i = 0; i < obsx264->flush_queue.num; i++)
+		bfree(obsx264->flush_queue.array[i].data);
+	da_resize(obsx264->flush_queue, 0);
+}
 
-	for (int i = 0; i < 4; i++)
-		bfree(obsx264->scale_buf[i]);
+/* Drain every in-flight frame the current context still holds into the re-emit queue so it can be
+ * re-emitted (with correct timestamps) after the context is re-opened. A plain encoder_close()
+ * discards these frames and mis-stamps the tail, producing a DTS gap and undecodable output at a
+ * live resize; flushing finalizes their decode/display order correctly. */
+static void obs_x264_flush_pending(struct obs_x264 *obsx264)
+{
+	x264_nal_t *nals;
+	int nal_count = 0;
+	x264_picture_t pic_out;
 
-	if (obsx264->color_format == VIDEO_FORMAT_BGRA) {
-		obsx264->scale_stride[0] = w * 4;
-		obsx264->scale_buf[0] = bmalloc((size_t)w * 4 * h);
-		return;
-	}
-
-	if (csp == X264_CSP_NV12) {
-		obsx264->scale_stride[0] = w;
-		obsx264->scale_buf[0] = bmalloc((size_t)w * h);
-		obsx264->scale_stride[1] = w;
-		obsx264->scale_buf[1] = bmalloc((size_t)w * (h / 2));
-		return;
-	}
-
-	if (csp == X264_CSP_I420 || csp == X264_CSP_I422 || csp == X264_CSP_I444) {
-		const bool half_w = (csp != X264_CSP_I444);
-		const bool half_h = (csp == X264_CSP_I420);
-		obsx264->scale_stride[0] = w;
-		obsx264->scale_buf[0] = bmalloc((size_t)w * h);
-		obsx264->scale_stride[1] = half_w ? w / 2 : w;
-		obsx264->scale_buf[1] = bmalloc((size_t)(half_w ? w / 2 : w) * (half_h ? h / 2 : h));
-		obsx264->scale_stride[2] = half_w ? w / 2 : w;
-		obsx264->scale_buf[2] = bmalloc((size_t)(half_w ? w / 2 : w) * (half_h ? h / 2 : h));
-		return;
+	for (int guard = 0; guard < 4096; guard++) {
+		memset(&pic_out, 0, sizeof(pic_out));
+		if (x264_encoder_encode(obsx264->context, &nals, &nal_count, NULL, &pic_out) < 0 || nal_count <= 0)
+			break;
+		obs_x264_flush_enqueue(obsx264, nals, nal_count, &pic_out);
 	}
 }
 
-/* Free scale buffers (called on re-open completion or destroy). */
-static void free_scale_buffers(struct obs_x264 *obsx264)
+/* Re-emit one buffered access unit from the re-emit queue into `packet` and remove it from
+ * the front of the queue. Called from obs_x264_encode after the freshly encoded output has
+ * been deferred to the back of the queue, so the in-flight frames captured by a live re-open
+ * flow out before post-reopen output - keeping DTS order intact across the resize boundary
+ * without dropping any delivered frame. Returns true if a packet was emitted. */
+static bool obs_x264_flush_queue_pop(struct obs_x264 *obsx264, struct encoder_packet *packet)
 {
-	for (int i = 0; i < 4; i++) {
-		bfree(obsx264->scale_buf[i]);
-		obsx264->scale_buf[i] = NULL;
-	}
+	if (obsx264->flush_queue.num == 0)
+		return false;
+
+	uint8_t *data = obsx264->flush_queue.array[0].data;
+	size_t size = obsx264->flush_queue.array[0].size;
+	int64_t pts = obsx264->flush_queue.array[0].pts;
+	int64_t dts = obsx264->flush_queue.array[0].dts;
+	bool keyframe = obsx264->flush_queue.array[0].keyframe;
+
+	/* Hand the bytes out through the persistent packet buffer, exactly like parse_packet:
+	 * receivers of encoder packets never free packet->data (it is only guaranteed to stay valid
+	 * for the synchronous callback dispatch), so the queued copy is released here. */
+	da_resize(obsx264->packet_data, 0);
+	da_push_back_array(obsx264->packet_data, data, size);
+	bfree(data);
+
+	packet->data     = obsx264->packet_data.array;
+	packet->size     = obsx264->packet_data.num;
+	packet->type     = OBS_ENCODER_VIDEO;
+	packet->pts      = pts;
+	packet->dts      = dts;
+	packet->keyframe = keyframe;
+
+	/* Shift the remaining entries one slot toward the front. Every entry besides the one just
+	 * emitted stays live in the queue and must NOT be freed here - its storage is released when
+	 * it is popped or by obs_x264_flush_queue_free on destroy. */
+	for (size_t i = 1; i < obsx264->flush_queue.num; i++)
+		obsx264->flush_queue.array[i - 1] = obsx264->flush_queue.array[i];
+	da_resize(obsx264->flush_queue, obsx264->flush_queue.num - 1);
+	return true;
 }
 
 static inline void init_pic_data(struct obs_x264 *obsx264, x264_picture_t *pic, struct encoder_frame *frame)
@@ -1264,12 +1455,20 @@ static inline void init_pic_data(struct obs_x264 *obsx264, x264_picture_t *pic, 
 
 	if (obsx264->color_format == VIDEO_FORMAT_BGRA) {
 		/* 8-bit RGB: OBS delivers packed BGRA. De-interleave to planar G/R/B and feed as
-		 * YUV 4:4:4 with an identity matrix (see deinterleave_gbra). */
-		const uint32_t width = obs_encoder_get_width(obsx264->encoder);
-		const uint32_t height = obs_encoder_get_height(obsx264->encoder);
+		 * YUV 4:4:4 with an identity matrix (see deinterleave_gbra). During the one-tick mix
+		 * rebind race after a live resize the frame still carries the OLD size; detect it via
+		 * the packed stride so the de-interleave reads the correct dimensions. */
+		uint32_t width, height;
+		if ((uint32_t)frame->linesize[0] == obsx264->inited_width * 4u) {
+			width = obsx264->inited_width;
+			height = obsx264->inited_height;
+		} else {
+			width = obs_encoder_get_width(obsx264->encoder);
+			height = obs_encoder_get_height(obsx264->encoder);
+		}
 		const size_t plane_size = (size_t)width * height;
 		int stride;
-		uint8_t *base = deinterleave_gbra(obsx264, frame, &stride);
+		uint8_t *base = deinterleave_gbra(obsx264, frame, width, height, &stride);
 
 		pic->img.i_plane = 3;
 		pic->img.plane[0] = base;                  /* G */
@@ -1379,6 +1578,8 @@ static void add_roi(struct obs_x264 *obsx264, x264_picture_t *pic)
 static bool obs_x264_reopen_context(struct obs_x264 *obsx264)
 {
 	if (obsx264->context) {
+		/* Re-emit any in-flight frames before the close discards them (see flush_pending). */
+		obs_x264_flush_pending(obsx264);
 		x264_encoder_close(obsx264->context);
 		obsx264->context = NULL;
 	}
@@ -1551,12 +1752,16 @@ static void obs_x264_check_fps(struct obs_x264 *obsx264, struct encoder_frame *f
 /* Live resolution changes (multitrack) - mirrors nvenc_maybe_resize / qsv_   */
 /* maybe_resize. libobs starts delivering frames at the new size on the next  */
 /* tick after obs_encoder_set_scaled_size(), so we detect it here on the      */
-/* encode side. Instead of re-opening immediately (which drops pending        */
-/* B-frames and creates a DTS gap), we defer the re-open until the next       */
-/* shared keyframe boundary. During the wait, incoming new-size frames are    */
-/* scaled to the old resolution so every frame is encoded with continuous     */
-/* DTS. At the boundary, the re-open emits an IDR that lands exactly on-grid  */
-/* - no DTS gap, no second realignment re-open needed.                        */
+/* encode side. The re-open happens IMMEDIATELY on detection: the previous    */
+/* staged approach scaled new-size frames back to the old resolution on the   */
+/* CPU while waiting for a keyframe boundary, but that cost more per frame    */
+/* than the delivery budget allows - the bounded mix cache overflowed and     */
+/* every frame of the wait window was dropped (a visible freeze of up to one  */
+/* GOP). Re-opening instead takes only ~30-80 ms: in-flight frames are        */
+/* flushed and re-emitted by obs_x264_reopen_context, so no frame is lost and */
+/* DTS stays continuous. The fresh context emits an off-grid IDR, so a second */
+/* re-open is staged on the next shared keyframe boundary (align_pending) to  */
+/* re-lock this track onto its siblings' keyframe grid.                       */
 
 static void obs_x264_maybe_resize(struct obs_x264 *obsx264, struct encoder_frame *frame)
 {
@@ -1579,51 +1784,21 @@ static void obs_x264_maybe_resize(struct obs_x264 *obsx264, struct encoder_frame
 	if (!arrived && ++obsx264->resize_stall < 2)
 		return;
 
-	/* If a timed resize is already pending, just keep scaling - the re-open will happen
-	 * at the scheduled keyframe boundary. */
-	if (obsx264->resize_pending)
-		return;
-
-	/* Compute the target PTS for the next shared keyframe boundary. If we have no cadence
-	 * data yet (first GOP), fall back to an immediate re-open. */
-	int64_t target_pts = 0;
-	if (obsx264->last_keyframe_pts >= 0 && obsx264->gop_pts > 0) {
-		target_pts = obsx264->last_keyframe_pts + obsx264->gop_pts;
-		while (target_pts <= frame->pts)
-			target_pts += obsx264->gop_pts;
-	}
-
-	if (target_pts == 0) {
-		/* No keyframe cadence observed yet: fall back to immediate re-open. */
-		info("live resize %ux%u -> %ux%u (immediate, no cadence)", obsx264->inited_width,
-		     obsx264->inited_height, target_w, target_h);
-		obsx264->params.i_width  = (int)target_w;
-		obsx264->params.i_height = (int)target_h;
-		if (!obs_x264_reopen_context(obsx264)) {
-			err("live resize to %ux%u failed - restart required", target_w, target_h);
-			return;
-		}
-		obsx264->inited_width  = target_w;
-		obsx264->inited_height = target_h;
-		obsx264->inited_ls0    = frame->linesize[0];
-		obsx264->resize_stall  = 0;
-		int realign_keyint = obs_x264_compute_realign_keyint(obsx264, frame);
-		if (realign_keyint > 0)
-			obs_x264_commit_realign(obsx264, "resize");
+	info("live resize %ux%u -> %ux%u (immediate re-open)", obsx264->inited_width, obsx264->inited_height,
+	     target_w, target_h);
+	obsx264->params.i_width  = (int)target_w;
+	obsx264->params.i_height = (int)target_h;
+	if (!obs_x264_reopen_context(obsx264)) {
+		err("live resize to %ux%u failed - restart required", target_w, target_h);
 		return;
 	}
-
-	/* Timed resize: defer the re-open to the next keyframe boundary. */
-	info("live resize %ux%u -> %ux%u staged (will apply at pts %lld, current pts %lld)",
-	     obsx264->inited_width, obsx264->inited_height, target_w, target_h,
-	     (long long)target_pts, (long long)frame->pts);
-
-	obsx264->resize_pending     = true;
-	obsx264->pending_width      = target_w;
-	obsx264->pending_height     = target_h;
-	obsx264->resize_target_pts  = target_pts;
-	obsx264->resize_stall       = 0;
-	alloc_scale_buffers(obsx264);
+	obsx264->inited_width  = target_w;
+	obsx264->inited_height = target_h;
+	obsx264->inited_ls0    = frame->linesize[0];
+	obsx264->resize_stall  = 0;
+	int realign_keyint = obs_x264_compute_realign_keyint(obsx264, frame);
+	if (realign_keyint > 0)
+		obs_x264_commit_realign(obsx264, "resize");
 }
 
 static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct encoder_packet *packet,
@@ -1647,35 +1822,10 @@ static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct enco
 	if (!obsx264->context)
 		return false;
 
-	/* Live resolution change (multitrack): detect and stage the timed resize. */
+	/* Live resolution change (multitrack): detect and re-open immediately. */
 	obs_x264_maybe_resize(obsx264, frame);
 	if (!obsx264->context)
 		return false;
-
-	/* Timed resize: at the keyframe boundary, perform the actual re-open with the new size.
-	 * The freshly opened context emits an IDR that lands exactly on-grid. */
-	if (obsx264->resize_pending && frame->pts >= obsx264->resize_target_pts) {
-		info("timed resize: applying %ux%u -> %ux%u at pts %lld (target %lld)",
-		     obsx264->inited_width, obsx264->inited_height,
-		     obsx264->pending_width, obsx264->pending_height,
-		     (long long)frame->pts, (long long)obsx264->resize_target_pts);
-		obsx264->params.i_width  = (int)obsx264->pending_width;
-		obsx264->params.i_height = (int)obsx264->pending_height;
-		if (!obs_x264_reopen_context(obsx264)) {
-			err("timed resize re-open to %ux%u failed - restart required",
-			    obsx264->pending_width, obsx264->pending_height);
-			obsx264->resize_pending = false;
-			free_scale_buffers(obsx264);
-			return false;
-		}
-		obsx264->inited_width  = obsx264->pending_width;
-		obsx264->inited_height = obsx264->pending_height;
-		obsx264->inited_ls0    = frame->linesize[0];
-		obsx264->resize_pending = false;
-		free_scale_buffers(obsx264);
-		/* The IDR at the shared boundary re-anchors the grid; update tracking. */
-		obsx264->last_keyframe_pts = frame->pts;
-	}
 
 	/* Keyframe-grid realignment: re-open the context exactly on the next shared keyframe
 	 * boundary so this track re-locks onto its sibling encoders' keyframe pts grid. A freshly
@@ -1694,21 +1844,7 @@ static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct enco
 		obsx264->last_keyframe_pts = frame->pts;
 	}
 
-	/* If a timed resize is pending and we haven't hit the boundary yet, scale the incoming
-	 * new-size frame down to the old resolution so it can be encoded by the current context. */
-	struct encoder_frame scaled_frame;
-	struct encoder_frame *enc_frame = frame;
-	if (obsx264->resize_pending && obsx264->scale_buf[0]) {
-		scale_frame_to_old_size(obsx264, frame);
-		scaled_frame = *frame;
-		for (int i = 0; i < 4; i++) {
-			scaled_frame.data[i]     = obsx264->scale_buf[i];
-			scaled_frame.linesize[i] = obsx264->scale_stride[i];
-		}
-		enc_frame = &scaled_frame;
-	}
-
-	init_pic_data(obsx264, &pic, enc_frame);
+	init_pic_data(obsx264, &pic, frame);
 
 	if (obs_encoder_has_roi(obsx264->encoder))
 		add_roi(obsx264, &pic);
@@ -1719,12 +1855,30 @@ static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct enco
 		return false;
 	}
 
+	/* Re-emit queue drain (mirrors obs-x265): if a live re-open flushed in-flight frames into
+	 * the queue, emit the oldest queued access unit now and defer this call's fresh output to
+	 * the back of the queue. Every delivered frame is still encoded - none are dropped - and
+	 * emission stays in DTS order across the resize boundary (the pre-reopen tail always flows
+	 * out before post-reopen output, so no gap and no timestamp regression). In steady state
+	 * the queue is empty and this branch is skipped. */
+	if (obsx264->flush_queue.num > 0) {
+		if (nal_count > 0)
+			obs_x264_flush_enqueue(obsx264, nals, nal_count, &pic_out);
+
+		*received_packet = true;
+		return obs_x264_flush_queue_pop(obsx264, packet);
+	}
+
 	*received_packet = (nal_count != 0);
 	parse_packet(obsx264, packet, nals, nal_count, &pic_out);
 
+	/* ABR (Custom) governor: feed the coded size so it can steer the VBV ceiling. */
+	if (*received_packet)
+		x264_abr_tick(obsx264, packet->size);
+
 	/* Track the steady-state on-grid keyframe cadence for future realignment. Only update
 	 * when not mid-realignment so the off-grid resize IDR does not corrupt the grid phase. */
-	if (nal_count > 0 && pic_out.b_keyframe && !obsx264->align_pending && !obsx264->resize_pending) {
+	if (nal_count > 0 && pic_out.b_keyframe && !obsx264->align_pending) {
 		const int64_t kpts = pic_out.i_pts;
 		if (obsx264->last_keyframe_pts >= 0)
 			obsx264->gop_pts = kpts - obsx264->last_keyframe_pts;
