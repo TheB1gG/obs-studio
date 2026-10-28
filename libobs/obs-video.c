@@ -311,7 +311,6 @@ static inline gs_texture_t *render_output_texture(struct obs_core_video_mix *mix
 	profile_start(render_output_texture_name);
 
 	gs_effect_t *effect = get_scale_effect(mix, width, height);
-	gs_technique_t *tech = gs_effect_get_technique(effect, "Draw");
 
 	if (mix->ovi.scale_type == OBS_SCALE_INTEGER_AREA &&
 	    !integer_area_ratio_valid(ovi->base_width, ovi->base_height, width, height)) {
@@ -319,6 +318,12 @@ static inline gs_texture_t *render_output_texture(struct obs_core_video_mix *mix
 		if (obs->video.area_effect)
 			effect = obs->video.area_effect;
 	}
+
+	/* Fetch the technique AFTER the fallback so it belongs to the effect whose uniforms we
+	 * are about to set. Capturing it before would render the integer-area shader (which has no
+	 * kernel for a non-exact ratio and reads unset uniforms) while params go to area_effect,
+	 * producing black frames. */
+	gs_technique_t *tech = gs_effect_get_technique(effect, "Draw");
 
 	gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
 	gs_eparam_t *bres = gs_effect_get_param_by_name(effect, "base_dimension");

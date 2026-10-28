@@ -2763,6 +2763,22 @@ void obs_encoder_set_last_error(obs_encoder_t *encoder, const char *message)
 		encoder->last_error_message = NULL;
 }
 
+int obs_encoder_get_last_stop_code(const obs_encoder_t *encoder)
+{
+	if (!obs_encoder_valid((obs_encoder_t *)encoder, "obs_encoder_get_last_stop_code"))
+		return 0;
+
+	return encoder->last_stop_code;
+}
+
+int64_t obs_encoder_get_last_stop_time(const obs_encoder_t *encoder)
+{
+	if (!obs_encoder_valid((obs_encoder_t *)encoder, "obs_encoder_get_last_stop_time"))
+		return 0;
+
+	return encoder->last_stop_time_ns;
+}
+
 uint64_t obs_encoder_get_pause_offset(const obs_encoder_t *encoder)
 {
 	return encoder ? encoder->pause.ts_offset : 0;
@@ -2896,6 +2912,13 @@ bool obs_encoder_set_group(obs_encoder_t *encoder, obs_encoder_group_t *group)
 	pthread_mutex_unlock(&group->mutex);
 
 	return true;
+}
+
+bool obs_encoder_is_in_group(const obs_encoder_t *encoder)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_is_in_group"))
+		return false;
+	return encoder->encoder_group != NULL;
 }
 
 obs_encoder_group_t *obs_encoder_group_create()

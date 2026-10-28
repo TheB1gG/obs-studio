@@ -1417,6 +1417,16 @@ struct obs_encoder {
 
 	/* reconfigure encoder at next possible opportunity */
 	bool reconfigure_requested;
+
+	/* Stop reason of the most recent time this encoder was stopped by its output, stamped in
+	 * stop_video_encoders() (obs-output.c) before obs_encoder_stop(): the output's stop code at
+	 * that moment (OBS_OUTPUT_SUCCESS = graceful user stop, OBS_OUTPUT_DISCONNECTED = network
+	 * drop, OBS_OUTPUT_KILLED = ungraceful kill, OBS_OUTPUT_ENCODE_ERROR = encoder failure) and
+	 * the wall-clock time of that stop. Both are 0 until the first stop. Plugins query them via
+	 * obs_encoder_get_last_stop_code()/obs_encoder_get_last_stop_time() to decide how to carry
+	 * stream-session state across stop/start cycles (see the ABR governor in plugins/obs-x265). */
+	int last_stop_code;
+	int64_t last_stop_time_ns;
 };
 
 extern struct obs_encoder_info *find_encoder(const char *id);

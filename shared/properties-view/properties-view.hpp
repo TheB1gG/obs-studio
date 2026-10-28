@@ -113,7 +113,7 @@ private:
 	QWidget *AddCheckbox(obs_property_t *prop);
 	QWidget *AddText(obs_property_t *prop, QFormLayout *layout, QLabel *&label);
 	void AddPath(obs_property_t *prop, QFormLayout *layout, QLabel **label);
-	void AddInt(obs_property_t *prop, QFormLayout *layout, QLabel **label);
+	QWidget *AddInt(obs_property_t *prop, QFormLayout *layout, QLabel **label);
 	void AddFloat(obs_property_t *prop, QFormLayout *layout, QLabel **label);
 	QWidget *AddList(obs_property_t *prop, bool &warning);
 	void AddEditableList(obs_property_t *prop, QFormLayout *layout, QLabel *&label);

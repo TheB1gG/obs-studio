@@ -2710,8 +2710,16 @@ static inline void stop_video_encoders(obs_output_t *output, encoded_callback_t 
 {
 	for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++) {
 		obs_encoder_t *video = output->video_encoders[i];
-		if (video)
-			obs_encoder_stop(video, encoded_callback, output);
+		if (!video)
+			continue;
+
+		/* Stamp the stop reason onto the encoder so plugins can decide how to carry
+		 * stream-session state across stop/start cycles (e.g. keeping a bitrate budget
+		 * after a kill or short disconnect, resetting it after a graceful stop). */
+		video->last_stop_code = output->stop_code;
+		video->last_stop_time_ns = os_gettime_ns();
+
+		obs_encoder_stop(video, encoded_callback, output);
 	}
 }
 

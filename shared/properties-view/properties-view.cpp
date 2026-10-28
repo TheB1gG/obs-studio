@@ -424,7 +424,7 @@ void OBSPropertiesView::AddPath(obs_property_t *prop, QFormLayout *layout, QLabe
 	layout->addRow(*label, subLayout);
 }
 
-void OBSPropertiesView::AddInt(obs_property_t *prop, QFormLayout *layout, QLabel **label)
+QWidget *OBSPropertiesView::AddInt(obs_property_t *prop, QFormLayout *layout, QLabel **label)
 {
 	obs_number_type type = obs_property_int_type(prop);
 	QLayout *subLayout = new QHBoxLayout();
@@ -470,6 +470,10 @@ void OBSPropertiesView::AddInt(obs_property_t *prop, QFormLayout *layout, QLabel
 
 	*label = new QLabel(QT_UTF8(obs_property_description(prop)));
 	layout->addRow(*label, subLayout);
+
+	/* Return the spinbox so AddProperty can restore focus to it after a form refresh
+	 * (int rows build their own layout, so the caller has no other widget handle). */
+	return spin;
 }
 
 void OBSPropertiesView::AddFloat(obs_property_t *prop, QFormLayout *layout, QLabel **label)
@@ -1482,7 +1486,7 @@ void OBSPropertiesView::AddProperty(obs_property_t *property, QFormLayout *layou
 		widget = AddCheckbox(property);
 		break;
 	case OBS_PROPERTY_INT:
-		AddInt(property, layout, &label);
+		widget = AddInt(property, layout, &label);
 		break;
 	case OBS_PROPERTY_FLOAT:
 		AddFloat(property, layout, &label);

@@ -2433,6 +2433,23 @@ EXPORT bool obs_encoder_paused(const obs_encoder_t *output);
 EXPORT const char *obs_encoder_get_last_error(obs_encoder_t *encoder);
 EXPORT void obs_encoder_set_last_error(obs_encoder_t *encoder, const char *message);
 
+/**
+ * Returns the stop code with which this encoder was last stopped by its output, or 0 if it has
+ * never been stopped. The value is an OBS_OUTPUT_* code (see obs-defs.h): OBS_OUTPUT_SUCCESS for
+ * a graceful user stop, OBS_OUTPUT_DISCONNECTED for a network drop, OBS_OUTPUT_KILLED for an
+ * ungraceful kill, OBS_OUTPUT_ENCODE_ERROR for an encoder failure. Pairs with
+ * obs_encoder_get_last_stop_time(). Intended for plugins that keep stream-session state across
+ * stop/start cycles and need to know how the previous session ended.
+ */
+EXPORT int obs_encoder_get_last_stop_code(const obs_encoder_t *encoder);
+
+/**
+ * Returns the wall-clock time in nanoseconds (os_gettime_ns) at which this encoder was last
+ * stopped by its output, or 0 if it has never been stopped. Pairs with
+ * obs_encoder_get_last_stop_code().
+ */
+EXPORT int64_t obs_encoder_get_last_stop_time(const obs_encoder_t *encoder);
+
 EXPORT uint64_t obs_encoder_get_pause_offset(const obs_encoder_t *encoder);
 
 /**
@@ -2442,6 +2459,12 @@ EXPORT uint64_t obs_encoder_get_pause_offset(const obs_encoder_t *encoder);
  * destroy the group until it becomes completely inactive.
  */
 EXPORT bool obs_encoder_set_group(obs_encoder_t *encoder, obs_encoder_group_t *group);
+/**
+ * Returns true if the encoder is a member of an encoder group (multitrack). Group members
+ * keep keyframes aligned on a shared GOP grid, so plugins must not force extra IDRs off
+ * that grid (e.g. after a live re-init), or they desync the whole group.
+ */
+EXPORT bool obs_encoder_is_in_group(const obs_encoder_t *encoder);
 EXPORT obs_encoder_group_t *obs_encoder_group_create();
 EXPORT void obs_encoder_group_destroy(obs_encoder_group_t *group);
 
