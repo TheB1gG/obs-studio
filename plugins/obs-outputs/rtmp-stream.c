@@ -122,7 +122,10 @@ static void resend_video_header_if_changed(struct rtmp_stream *stream, struct en
 		return; // unchanged since last send
 
 	update_video_header_snapshot(stream, idx);
-	info("resending video codec header on track %zu (codec data changed mid-stream)", idx);
+	/* Log the triggering keyframe's pts so a delayed header (encoder re-init vs. this
+	 * packet) can be diagnosed from the log alone - see 2026-10-23 x264 live-resize test. */
+	info("resending video codec header on track %zu (codec data changed mid-stream, first keyframe pts %lld)", idx,
+	     (long long)packet->pts);
 
 	if (!send_video_header_ts(stream, idx, packet)) {
 		warn("failed to resend video codec header on track %zu", idx);
@@ -859,10 +862,12 @@ static void *send_thread(void *data)
 	} else if (encode_error) {
 		obs_output_signal_stop(stream->output, OBS_OUTPUT_ENCODE_ERROR);
 	} else if (aborted(stream)) {
-		/* Error code keeps the core from treating this as a recoverable
-		 * disconnect and prevents automatic reconnection */
+		/* OBS_OUTPUT_KILLED keeps the core from treating this as a recoverable disconnect
+		 * and prevents automatic reconnection, while letting plugins distinguish an
+		 * ungraceful kill from a generic error. The last_error marker string is kept for
+		 * consumers that sniff it (see OBSBasic::StreamingStop). */
 		obs_output_set_last_error(stream->output, "Stream killed ungracefully");
-		obs_output_signal_stop(stream->output, OBS_OUTPUT_ERROR);
+		obs_output_signal_stop(stream->output, OBS_OUTPUT_KILLED);
 	} else {
 		obs_output_end_data_capture(stream->output);
 	}
