@@ -51,28 +51,28 @@
         "obsproject.com/obs-studio": {
           "dependencies": {
             "prebuilt": {
-              "version": "2026-10-01",
+              "version": "2026-10-11",
               "baseUrl": "https://github.com/TheB1gG/obs-deps/releases/download",
               "label": "Pre-Built obs-deps",
               "hashes": {
-                "macos-universal": "66bb03dbdff81bf63ae9644a7c9d54e3a9f2f703917743e7130bff45838e1b48",
-                "windows-x64": "7cb6a1738f33e546c4c80cad89f20d74276c18cd747037beff9b5d18098121e9",
-                "windows-x86": "62e85d02f075f37cc41f04b73635acd50e64fc84ba75af147e6cf4d354a977d5",
-                "windows-arm64": "74b4c020d649e6e4e19db32d7158bfbe65c95dce1afdcfc94931b355d58397ef"
+                "macos-universal": "27d7ddba02ff1fa98f85ddefa0d543f2c1dc7f098b702f08127816c35cffb0a7",
+                "windows-x64": "d41ed427a2fbd80d121bc8a66e044acef652333c16af3dfa240ee63e535ad5b2",
+                "windows-x86": "d3a6d95ec43b1bd00d4ea8ebf7eefea57b45de0751dc02dcba9ddb967e8842b5",
+                "windows-arm64": "f6750a36b07d72adf0930d73e0c0d1ef091ab603e82d56707045e6cf422f2677"
               }
             },
             "qt6": {
-              "version": "2026-10-01",
+              "version": "2026-10-11",
               "baseUrl": "https://github.com/TheB1gG/obs-deps/releases/download",
               "label": "Pre-Built Qt6",
               "hashes": {
-                "macos-universal": "2e2440835fc7ce66ed3708bf748204a785a7851dfc030cc63b7518c7af35025e",
-                "windows-x64": "9f27448b49273d6a7502347703e59b7a492a52cfa8d5038ddf19683106a7a556",
-                "windows-arm64": "69650c1e5c3dc8f5218ffcbaf312681e63033af7aa8f3aee7b397a60c5eba4b4"
+                "macos-universal": "685d6c5c5efc48bcd66193cce8e3df8efaf0c487e73fcaf31e7db7f5175ee5c0",
+                "windows-x64": "f312946adf134f2c14dad21a71b5cf7fcd42a31515aa160a3ed1b6031b7198b2",
+                "windows-arm64": "73b0eecceaef0c3705b2601adc91ea73d801bb60fc3f37629150b6dc78f348ad"
               },
               "debugSymbols": {
-                "windows-x64": "45aa711905ae1ab92d6e08a4fe573255f4379169a90a6a8a2f8df603e6ae1cc9",
-                "windows-arm64": "ec2f7af65884b34c8b909522c83b64e7bdc205e7df4e0e7459e3ceb8e90221cc"
+                "windows-x64": "02d574854450d83630ce8c505ecab90c86f0f60fc53a1630b0a152abae7f7823",
+                "windows-arm64": "97b71e491cbe7c223e24e5aca8003e78235e95e77533be70f9404d5e570e2439"
               }
             },
             "cef": {

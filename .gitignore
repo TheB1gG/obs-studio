@@ -49,3 +49,6 @@ build-aux/flatpak-github-action-modified-*
 
 # Exclude CMake build number cache
 /cmake/.CMakeBuildNumber
+
+# Local scratch files (see AGENTS.md section 5)
+/scratch/
