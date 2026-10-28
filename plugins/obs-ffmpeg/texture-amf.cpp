@@ -1,5 +1,6 @@
 #include <util/threading.h>
 #include <opts-parser.h>
+#include <abr-gov.h>
 #include <obs-module.h>
 #include <obs-avc.h>
 
@@ -187,17 +188,19 @@ struct amf_base {
 	bool first_update = true;
 	bool roi_supported = false;
 
-	/* ABR_GOV (PEAK_CONSTRAINED_VBR) + runtime governor. See abr_gov_update(). The governor
+	/* ABR_GOV (PEAK_CONSTRAINED_VBR) + runtime governor. See amf_abr_tick(). The governor
 	 * steers TARGET_BITRATE and PEAK_BITRATE together (kept equal) so the driver's
 	 * min(PEAK, 4*TARGET) cap never bites: complex scenes spend up to the user max, easy
-	 * scenes stay low, and the long-term average tracks the configured target. */
-	bool    abr_active = false;     /* ABR_GOV selected: applies the ABR RC config + runs the governor */
-	int64_t abr_target_bps = 0;     /* target bitrate in bits/sec */
-	int64_t abr_max_bps = 0;        /* user max bitrate in bits/sec (governor ceiling) */
-	double  abr_total_bits = 0.0;   /* cumulative encoded bits */
-	double  abr_total_time = 0.0;   /* cumulative stream seconds */
-	double  abr_acc_time = 0.0;     /* stream seconds since last governor tick */
-	int64_t abr_cur_rate_bps = 0;   /* currently applied rate (bps); written to BOTH target and peak */
+	 * scenes stay low, and the long-term average tracks the configured target. The control law,
+	 * tick cadence and stream-session budget live in the shared abr-gov module; abr_state is the
+	 * per-open latch (cur_rate = applied rate in bps) and survives stop/start via
+	 * abr_gov_session_load/save. */
+	bool        abr_active = false;       /* ABR_GOV selected: applies the ABR RC config + runs the governor */
+	int64_t     abr_target_bps = 0;       /* target bitrate in bits/sec */
+	int64_t     abr_max_bps = 0;          /* user max bitrate in bits/sec (governor ceiling) */
+	double      abr_deadband = 0.005;     /* settings "deadband" as a fraction (0.005 = +/-0.5%) */
+	bool        abr_session_loaded = false; /* session_load has run this session (one-time gate) */
+	abr_gov_state abr_state{};            /* session budget + current governed rate (bps) */
 
 	inline amf_base(bool fallback) : fallback(fallback) {}
 	virtual ~amf_base() = default;
@@ -285,11 +288,14 @@ template<typename T> static bool get_amf_property(amf_base *enc, const wchar_t *
 	return res == AMF_OK;
 }
 
-template<typename T> static void set_amf_property(amf_base *enc, const wchar_t *name, const T &value)
+template<typename T> static bool set_amf_property(amf_base *enc, const wchar_t *name, const T &value)
 {
 	AMF_RESULT res = enc->amf_encoder->SetProperty(name, value);
-	if (res != AMF_OK)
+	if (res != AMF_OK) {
 		error("Failed to set property '%ls': %ls", name, amf_trace->GetResultText(res));
+		return false;
+	}
+	return true;
 }
 
 #define set_avc_property(enc, name, value) set_amf_property(enc, AMF_VIDEO_ENCODER_##name, value)
@@ -323,26 +329,27 @@ template<typename T> static void set_amf_property(amf_base *enc, const wchar_t *
 /* Unlike NVENC this uses AMF's *dynamic* bitrate property (SetProperty, no  */
 /* ReInit), so each tick causes no encoder reset and no forced IDR.          */
 
-static void abr_gov_apply(amf_base *enc, int64_t new_rate_bps)
+static bool amf_abr_apply(amf_base *enc, int64_t new_rate_bps)
 {
 	/* Steer TARGET and PEAK together (kept equal). With PEAK == TARGET the driver's
 	 * min(PEAK, 4*TARGET) cap collapses to just TARGET, so the applied value is a clean
-	 * ceiling with no hidden 4x behaviour. */
+	 * ceiling with no hidden 4x behaviour. Returns false if either property was rejected so
+	 * the caller can revert the governed rate and retry on the next tick. */
+	bool ok = true;
 	if (enc->codec == amf_codec_type::AVC) {
-		set_avc_property(enc, TARGET_BITRATE, new_rate_bps);
-		set_avc_property(enc, PEAK_BITRATE, new_rate_bps);
+		ok = set_avc_property(enc, TARGET_BITRATE, new_rate_bps);
+		ok = set_avc_property(enc, PEAK_BITRATE, new_rate_bps) && ok;
 	} else if (enc->codec == amf_codec_type::HEVC) {
-		set_hevc_property(enc, TARGET_BITRATE, new_rate_bps);
-		set_hevc_property(enc, PEAK_BITRATE, new_rate_bps);
+		ok = set_hevc_property(enc, TARGET_BITRATE, new_rate_bps);
+		ok = set_hevc_property(enc, PEAK_BITRATE, new_rate_bps) && ok;
 	} else {
-		set_av1_property(enc, TARGET_BITRATE, new_rate_bps);
-		set_av1_property(enc, PEAK_BITRATE, new_rate_bps);
+		ok = set_av1_property(enc, TARGET_BITRATE, new_rate_bps);
+		ok = set_av1_property(enc, PEAK_BITRATE, new_rate_bps) && ok;
 	}
-
-	enc->abr_cur_rate_bps = new_rate_bps;
+	return ok;
 }
 
-static void abr_gov_update(amf_base *enc, uint32_t frame_size_bytes)
+static void amf_abr_tick(amf_base *enc, uint32_t frame_size_bytes)
 {
 	if (!enc->abr_active)
 		return;
@@ -357,72 +364,65 @@ static void abr_gov_update(amf_base *enc, uint32_t frame_size_bytes)
 	if (dt <= 0.0)
 		return;
 
-	/* x264-style integral control: track the CUMULATIVE output against the
-	 * target rate so the long-term average (total_bits/total_time) converges
-	 * to the target - exactly what a file's reported bitrate reflects. */
-	enc->abr_total_bits += (double)frame_size_bytes * 8.0;
-	enc->abr_total_time += dt;
-	enc->abr_acc_time += dt;
+	const int64_t ceiling_bps = enc->abr_max_bps > 0 ? enc->abr_max_bps : target_bps;
 
-	if (enc->abr_acc_time < 0.5) /* one governor tick every 0.5 s: react faster to overshoot */
-		return;
-	enc->abr_acc_time = 0.0;
+	/* Shared ABR governor (shared/abr-gov): accumulation, the 0.5 s tick cadence, the 1.0 s history
+	 * gate and the decision law all live in the shared module. AMF only computes dt and applies the
+	 * resulting rate to TARGET/PEAK_BITRATE; on a rejected apply it reverts so the next tick retries. */
+	abr_gov_config cfg = abr_gov_default_config();
+	cfg.deadband_frac = enc->abr_deadband;
 
-	const double cum_avg = enc->abr_total_time > 0.0 ? enc->abr_total_bits / enc->abr_total_time : 0.0;
-
-	if (enc->abr_total_time < 1.0) /* need a little history before deciding */
-		return;
-
-	const int64_t ceiling = enc->abr_max_bps > 0 ? enc->abr_max_bps : target_bps;
-
-	double ratio;
-	int64_t new_rate;
-
-	if (cum_avg > target_bps * 1.03) {
-		/* cumulative average above target: pull the applied rate back toward target.
-		 * Close a large fixed fraction of the remaining gap each tick so a big
-		 * overshoot (e.g. bursting near the ceiling) is corrected in ~2-3 ticks
-		 * instead of tapering slowly; the floor keeps it from ever dropping under
-		 * the target rate. Bump 0.8 toward 1.0 for near-instant convergence. */
-		const double gap = (double)enc->abr_cur_rate_bps - (double)target_bps;
-		new_rate = enc->abr_cur_rate_bps - (int64_t)(gap * 0.8);
-		if (new_rate < target_bps)
-			new_rate = target_bps;
-	} else if (cum_avg > 1.0 && cum_avg < target_bps * 0.97) {
-		/* cumulative average below target: restore headroom up to the ceiling */
-		ratio = (double)target_bps / cum_avg;
-		if (ratio > 2.0)
-			ratio = 2.0;
-		new_rate = (int64_t)(enc->abr_cur_rate_bps * ratio);
-		if (new_rate > ceiling)
-			new_rate = ceiling;
-	} else {
-		return; /* within +/-3% dead band: keep current rate */
+	const int64_t old_rate_bps = enc->abr_state.cur_rate;
+	if (abr_gov_tick(&enc->abr_state, &cfg, target_bps, ceiling_bps, dt, frame_size_bytes, NULL)) {
+		if (!amf_abr_apply(enc, enc->abr_state.cur_rate))
+			enc->abr_state.cur_rate = old_rate_bps; /* driver rejected the change; retry next tick */
 	}
+}
 
-	if (new_rate <= 0 || new_rate == enc->abr_cur_rate_bps)
-		return;
-
-	abr_gov_apply(enc, new_rate);
+/* Read the ABR governor deadband setting as a fraction (the UI stores it in percent). */
+static double amf_deadband_frac(obs_data_t *settings)
+{
+	double db = obs_data_get_double(settings, "deadband");
+	if (db < 0.1)
+		db = 0.1; /* avoid a zero band that would reconfig on every tick */
+	else if (db > 10.0)
+		db = 10.0;
+	return db / 100.0;
 }
 
 /* Central place to latch the ABR settings from the OBS settings object. Called
  * from every codec's init/update before update_data() so the ABR branch and the
- * governor always see consistent target/ceiling values. */
-static void amf_abr_configure(amf_base *enc, const char *rc_str, int64_t bitrate_kbps, int64_t max_bitrate_kbps)
+ * governor always see consistent target/ceiling values. The cumulative session budget is
+ * loaded once per session (abr_gov_session_load) and only re-latched on later updates, so a
+ * mid-stream bitrate change never resets the whole-stream average. */
+static void amf_abr_configure(amf_base *enc, const char *rc_str, int64_t bitrate_kbps, int64_t max_bitrate_kbps,
+                              double deadband_frac)
 {
 	bool abr = (astrcmpi(rc_str, "ABR_GOV") == 0);
 	enc->abr_active = abr;
 	enc->abr_target_bps = abr ? bitrate_kbps * 1000 : 0;
 	enc->abr_max_bps = abr ? max_bitrate_kbps * 1000 : 0;
-	if (abr) {
-		/* restart cumulative tracking on (re)configure */
-		enc->abr_total_bits = 0.0;
-		enc->abr_total_time = 0.0;
-		enc->abr_acc_time = 0.0;
-		/* ABR_GOV starts at the user max so complex content can spend up to the ceiling;
-		 * abr_gov_update() pulls it back toward the target as soon as we overshoot. */
-		enc->abr_cur_rate_bps = enc->abr_max_bps > 0 ? enc->abr_max_bps : enc->abr_target_bps;
+	if (!abr)
+		return;
+
+	enc->abr_deadband = deadband_frac;
+	const int64_t target_bps = enc->abr_target_bps;
+	const int64_t ceiling_bps = enc->abr_max_bps > 0 ? enc->abr_max_bps : target_bps;
+	abr_gov_config cfg = abr_gov_default_config();
+	cfg.deadband_frac = enc->abr_deadband;
+
+	if (!enc->abr_session_loaded) {
+		/* First ABR configure this session: load (fresh at target, or restored after a kill/short
+		 * disconnect). Fresh sessions start at target - headroom is earned, not assumed. */
+		abr_gov_session_load(enc->encoder, true, target_bps, ceiling_bps, &cfg, &enc->abr_state);
+		enc->abr_session_loaded = true;
+	} else {
+		/* Mid-stream (re)configure: re-latch the ceiling, keep the cumulative session budget. */
+		const int64_t floor_bps = (int64_t)((double)target_bps * cfg.overshoot_floor_frac);
+		if (enc->abr_state.cur_rate < floor_bps)
+			enc->abr_state.cur_rate = floor_bps;
+		if (enc->abr_state.cur_rate > ceiling_bps)
+			enc->abr_state.cur_rate = ceiling_bps;
 	}
 }
 
@@ -740,7 +740,7 @@ static void convert_to_encoder_packet(amf_base *enc, AMFDataPtr &data, encoder_p
 		packet->dts -= enc->dts_offset;
 
 	/* ABR_GOV: feed the actual encoded size so the governor can adapt the rate. */
-	abr_gov_update(enc, (uint32_t)packet->size);
+	amf_abr_tick(enc, (uint32_t)packet->size);
 }
 
 #ifndef SEC_TO_NSEC
@@ -1320,6 +1320,9 @@ try {
 static void amf_destroy(void *data)
 {
 	amf_base *enc = (amf_base *)data;
+
+	abr_gov_session_save(enc->encoder, enc->abr_active, &enc->abr_state);
+
 	delete enc;
 }
 
@@ -1365,6 +1368,7 @@ static void amf_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "profile", "high");
 	obs_data_set_default_int(settings, "bf", 3);
 	obs_data_set_default_int(settings, "max_bitrate", 5000);
+	obs_data_set_default_double(settings, "deadband", 0.5); /* +/-0.5% band (percent) */
 }
 
 static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings)
@@ -1379,6 +1383,8 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p, obs
 	p = obs_properties_get(ppts, "cqp");
 	obs_property_set_visible(p, cqp || qvbr);
 	p = obs_properties_get(ppts, "max_bitrate");
+	obs_property_set_visible(p, abr);
+	p = obs_properties_get(ppts, "deadband");
 	obs_property_set_visible(p, abr);
 	return true;
 }
@@ -1406,6 +1412,10 @@ static obs_properties_t *amf_properties_internal(amf_codec_type codec)
 
 	p = obs_properties_add_int(props, "max_bitrate", obs_module_text("MaxBitrate"), 50, 100000, 50);
 	obs_property_int_set_suffix(p, " Kbps");
+
+	/* ABR governor deadband (percent): how far the cumulative average may drift from target before
+	 * the governor corrects. Only shown for ABR. */
+	p = obs_properties_add_float_slider(props, "deadband", obs_module_text("Deadband"), 0.1, 10.0, 0.1);
 
 	obs_properties_add_int(props, "cqp", obs_module_text("NVENC.CQLevel"), 0,
 			       codec == amf_codec_type::AV1 ? 63 : 51, 1);
@@ -1529,7 +1539,7 @@ static void amf_avc_update_data(amf_base *enc, int rc, int64_t bitrate, int64_t 
 
 		/* ABR_GOV: the runtime governor steers TARGET_BITRATE and PEAK_BITRATE
 		 * together (kept equal), so start both at the user max - complex content
-		 * can then spend up to the ceiling while abr_gov_apply() pulls them down
+		 * can then spend up to the ceiling while amf_abr_apply() pulls them down
 		 * toward the target on overshoot. Keeping PEAK == TARGET stops the
 		 * driver's min(PEAK, 4*TARGET) cap from biting. */
 		set_avc_property(enc, TARGET_BITRATE, peak);
@@ -1576,7 +1586,7 @@ try {
 	const char *rc_str = obs_data_get_string(settings, "rate_control");
 	AMF_RESULT res = AMF_OK;
 
-	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"), amf_deadband_frac(settings));
 
 	int rc = get_avc_rate_control(rc_str);
 
@@ -1710,7 +1720,7 @@ static bool amf_avc_init(void *data, obs_data_t *settings)
 		bf = 0;
 	}
 
-	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"), amf_deadband_frac(settings));
 
 	int rc = get_avc_rate_control(rc_str);
 
@@ -1984,7 +1994,7 @@ static void amf_hevc_update_data(amf_base *enc, int rc, int64_t bitrate, int64_t
 	if (enc->abr_active) {
 		int64_t peak = enc->abr_max_bps > 0 ? enc->abr_max_bps : bitrate;
 		/* ABR_GOV: start TARGET and PEAK both at the user max so complex content can spend
-		 * up to the ceiling; abr_gov_apply() pulls them (kept equal) back toward the target
+		 * up to the ceiling; amf_abr_apply() pulls them (kept equal) back toward the target
 		 * on overshoot. PEAK == TARGET stops the driver's min(PEAK, 4*TARGET) cap biting. */
 		set_hevc_property(enc, TARGET_BITRATE, peak);
 		set_hevc_property(enc, PEAK_BITRATE, peak);
@@ -2029,7 +2039,7 @@ try {
 	int rc = get_hevc_rate_control(rc_str);
 	AMF_RESULT res = AMF_OK;
 
-	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"), amf_deadband_frac(settings));
 	amf_hevc_update_data(enc, rc, bitrate * 1000, qp);
 
 	res = enc->amf_encoder->Flush();
@@ -2063,7 +2073,7 @@ static bool amf_hevc_init(void *data, obs_data_t *settings)
 	if (rc != AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CONSTANT_QP)
 		set_hevc_property(enc, ENABLE_VBAQ, true);
 
-	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"), amf_deadband_frac(settings));
 	amf_hevc_update_data(enc, rc, bitrate * 1000, qp);
 
 	set_hevc_property(enc, ENFORCE_HRD, true);
@@ -2369,7 +2379,7 @@ static void amf_av1_update_data(amf_base *enc, int rc, int64_t bitrate, int64_t 
 	if (enc->abr_active) {
 		int64_t peak = enc->abr_max_bps > 0 ? enc->abr_max_bps : bitrate;
 		/* ABR_GOV: start TARGET and PEAK both at the user max so complex content can spend
-		 * up to the ceiling; abr_gov_apply() pulls them (kept equal) back toward the target
+		 * up to the ceiling; amf_abr_apply() pulls them (kept equal) back toward the target
 		 * on overshoot. PEAK == TARGET stops the driver's min(PEAK, 4*TARGET) cap biting. */
 		set_av1_property(enc, TARGET_BITRATE, peak);
 		set_av1_property(enc, PEAK_BITRATE, peak);
@@ -2416,7 +2426,7 @@ try {
 	int rc = get_av1_rate_control(rc_str);
 	AMF_RESULT res = AMF_OK;
 
-	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"), amf_deadband_frac(settings));
 	amf_av1_update_data(enc, rc, bitrate * 1000, cq_level);
 
 	res = enc->amf_encoder->Flush();
@@ -2457,7 +2467,7 @@ static bool amf_av1_init(void *data, obs_data_t *settings)
 	int rc = get_av1_rate_control(rc_str);
 	set_av1_property(enc, RATE_CONTROL_METHOD, rc);
 
-	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"));
+	amf_abr_configure(enc, rc_str, bitrate, obs_data_get_int(settings, "max_bitrate"), amf_deadband_frac(settings));
 	amf_av1_update_data(enc, rc, bitrate * 1000, qp);
 
 	set_av1_property(enc, ENFORCE_HRD, true);

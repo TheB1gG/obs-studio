@@ -9,6 +9,10 @@ endif()
 
 include(cmake/dependencies.cmake)
 
+if(NOT TARGET OBS::abr-gov)
+  add_subdirectory("${CMAKE_SOURCE_DIR}/shared/abr-gov" "${CMAKE_BINARY_DIR}/shared/abr-gov")
+endif()
+
 add_library(obs-ffmpeg MODULE)
 add_library(OBS::ffmpeg ALIAS obs-ffmpeg)
 
@@ -56,6 +60,7 @@ target_link_libraries(
     OBS::libobs
     OBS::media-playback
     OBS::opts-parser
+    OBS::abr-gov
     FFmpeg::avcodec
     FFmpeg::avfilter
     FFmpeg::avformat
