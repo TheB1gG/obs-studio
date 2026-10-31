@@ -1,8 +1,11 @@
 #include "OBSBasicStats.hpp"
 
 #include <widgets/OBSBasic.hpp>
+#include <utility/EncoderStats.hpp>
 
 #include <qt-wrappers.hpp>
+
+#include <cstdint>
 
 #include <QGridLayout>
 #include <QLabel>
@@ -249,16 +252,24 @@ void OBSBasicStats::AddOutputLabels(QString name)
 	outputLabels.push_back(ol);
 }
 
-static uint32_t first_encoded = 0xFFFFFFFF;
-static uint32_t first_skipped = 0xFFFFFFFF;
+/* Delivery-counter baselines of the encoders feeding the active outputs
+ * (see <utility/EncoderStats.hpp>). They are re-armed whenever a value
+ * decreases, which is how an encoder re-init or a delivery-mix rebind
+ * (both reset the counters) is detected. */
+static uint64_t first_delivered = UINT64_MAX;
+static uint64_t first_lag_skipped = UINT64_MAX;
 static uint32_t first_rendered = 0xFFFFFFFF;
 static uint32_t first_lagged = 0xFFFFFFFF;
 
 void OBSBasicStats::InitializeValues()
 {
-	video_t *video = obs_get_video();
-	first_encoded = video_output_get_total_frames(video);
-	first_skipped = video_output_get_skipped_frames(video);
+	/* No absolute baseline here: the encoder-delivery counters restart when an encoder
+	 * attaches to its delivery mix, so any value read before the outputs are up would be
+	 * meaningless. The first Update() tick re-arms the baselines instead. (Frontend
+	 * output getters must not be used here: ResetVideo() runs before the output handler
+	 * exists, and obs_frontend_get_streaming_output() dereferences it.) */
+	first_delivered = UINT64_MAX;
+	first_lag_skipped = UINT64_MAX;
 	first_rendered = obs_get_total_frames();
 	first_lagged = obs_get_lagged_frames();
 }
@@ -355,16 +366,20 @@ void OBSBasicStats::Update()
 
 	/* ------------------ */
 
-	video_t *video = obs_get_video();
-	uint32_t total_encoded = video_output_get_total_frames(video);
-	uint32_t total_skipped = video_output_get_skipped_frames(video);
+	/* Encoding lag belongs to the delivery mix of each encoder, not to the base
+	 * canvas: with the high-fidelity master canvas the base canvas mix has no
+	 * consumers of its own, so obs_get_video() would report 0/0 forever. Sum the
+	 * counters of every encoder feeding the active outputs instead. */
+	OBS::EncoderFrameCounters counters = OBS::outputFrameCounters({strOutput, recOutput});
+	uint64_t total_encoded = counters.delivered;
+	uint64_t total_skipped = counters.lagSkipped;
 
-	if (total_encoded < first_encoded || total_skipped < first_skipped) {
-		first_encoded = total_encoded;
-		first_skipped = total_skipped;
+	if (total_encoded < first_delivered || total_skipped < first_lag_skipped) {
+		first_delivered = total_encoded;
+		first_lag_skipped = total_skipped;
 	}
-	total_encoded -= first_encoded;
-	total_skipped -= first_skipped;
+	total_encoded -= first_delivered;
+	total_skipped -= first_lag_skipped;
 
 	num = total_encoded ? (long double)total_skipped / (long double)total_encoded : 0.0l;
 	num *= 100.0l;
@@ -463,8 +478,8 @@ void OBSBasicStats::Reset()
 {
 	timer.start();
 
-	first_encoded = 0xFFFFFFFF;
-	first_skipped = 0xFFFFFFFF;
+	first_delivered = UINT64_MAX;
+	first_lag_skipped = UINT64_MAX;
 	first_rendered = 0xFFFFFFFF;
 	first_lagged = 0xFFFFFFFF;
 
