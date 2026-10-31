@@ -4,6 +4,7 @@
 #include "ui_AutoConfigTestPage.h"
 
 #include <widgets/OBSBasic.hpp>
+#include <utility/EncoderStats.hpp>
 
 #include <graphics/math-extra.h>
 #include <qt-wrappers.hpp>
@@ -623,6 +624,13 @@ bool AutoConfigTestPage::TestSoftwareEncoding()
 		if (cancel)
 			return false;
 
+		/* The lag counters belong to the delivery mix bound to the test encoder, not
+		 * to the base canvas (which has no consumers of its own in this fork).
+		 * Snapshot around the run: those counters restart when the encoder is rebound
+		 * to a fresh mix (a re-scale) or when the mix gains its first consumer, so a
+		 * value that did not grow means the reading already covers this run only. */
+		OBS::EncoderFrameCounters before = OBS::encoderFrameCounters(vencoder);
+
 		if (!obs_output_start(output)) {
 			QMetaObject::invokeMethod(this, "Failure", Q_ARG(QString, QTStr(TEST_RES_FAIL)));
 			return false;
@@ -633,7 +641,10 @@ bool AutoConfigTestPage::TestSoftwareEncoding()
 		obs_output_stop(output);
 		cv.wait(ul);
 
-		int skipped = (int)video_output_get_skipped_frames(obs_get_video());
+		OBS::EncoderFrameCounters after = OBS::encoderFrameCounters(vencoder);
+		uint64_t skipped =
+			after.lagSkipped > before.lagSkipped ? after.lagSkipped - before.lagSkipped : after.lagSkipped;
+
 		if (force || skipped <= 10)
 			results.emplace_back(cx, cy, fps_num, fps_den);
 
