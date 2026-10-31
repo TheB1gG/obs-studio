@@ -2,6 +2,8 @@
 
 #include "StatusBarWidget.hpp"
 
+#include <utility/EncoderStats.hpp>
+
 #include <obs.hpp>
 
 #include <QPointer>
@@ -36,9 +38,9 @@ private:
 	int delaySecStarting = 0;
 	int delaySecStopping = 0;
 
-	int startSkippedFrameCount = 0;
-	int startTotalFrameCount = 0;
-	int lastSkippedFrameCount = 0;
+	uint64_t startSkippedFrameCount = 0;
+	uint64_t startTotalFrameCount = 0;
+	uint64_t lastSkippedFrameCount = 0;
 
 	int seconds = 0;
 	uint64_t lastBytesSent = 0;
@@ -64,6 +66,8 @@ private:
 	QPointer<QTimer> messageTimer;
 
 	obs_output_t *GetOutput();
+
+	OBS::EncoderFrameCounters activeEncoderFrameCounters();
 
 	void Activate();
 	void Deactivate();
