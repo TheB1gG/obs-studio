@@ -131,8 +131,14 @@ static void *gpu_encode_thread(void *data)
 			skip = encoder->frame_rate_divisor_counter++;
 			if (encoder->frame_rate_divisor_counter == encoder->frame_rate_divisor)
 				encoder->frame_rate_divisor_counter = 0;
-			if (skip)
+			if (skip) {
+				os_atomic_inc_long(&encoder->decimated_frames);
 				continue;
+			}
+
+			// This frame reached the encoder's own texture path. The mix-level pair of these two
+			// counters is video_output_inc_texture_frames()/video_output_inc_texture_skipped_frames().
+			os_atomic_inc_long(&encoder->offered_frames);
 
 			if (!encoder->start_ts)
 				encoder->start_ts = timestamp;

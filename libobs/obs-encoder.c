@@ -1382,6 +1382,39 @@ uint32_t obs_encoder_get_encoded_frames(const obs_encoder_t *encoder)
 	return obs_encoder_valid(encoder, "obs_output_get_encoded_frames") ? encoder->encoded_frames : 0;
 }
 
+void obs_encoder_get_frame_counters(const obs_encoder_t *encoder, struct obs_encoder_frame_counters *out)
+{
+	if (!out)
+		return;
+
+	memset(out, 0, sizeof(*out));
+
+	if (!obs_encoder_valid(encoder, "obs_encoder_get_frame_counters") ||
+	    encoder->info.type != OBS_ENCODER_VIDEO)
+		return;
+
+	/* The frame counters of the delivery path live on the mix the encoder is fed from -
+	 * encoder->media, not on the fps_override frame-rate-divisor wrapper. */
+	const video_t *mix = encoder->media;
+	if (mix) {
+		out->mix_frames = video_output_get_total_frames(mix);
+		out->mix_lag_skipped = video_output_get_skipped_frames(mix);
+	}
+
+	/* Texture encoders are gated per encoder on the mix's GPU encode thread, raw encoders
+	 * per connection in video-io; both keep the pair where their divisor gate is. */
+	if (gpu_encode_available(encoder)) {
+		out->frames_offered = (uint64_t)os_atomic_load_long(&encoder->offered_frames);
+		out->frames_decimated = (uint64_t)os_atomic_load_long(&encoder->decimated_frames);
+	} else {
+		video_output_get_connection_frames(encoder->media, receive_video, (void *)encoder, &out->frames_offered,
+						   &out->frames_decimated);
+	}
+
+	out->frames_encoded = encoder->encoded_frames;
+	out->encoded_bytes = encoder->encoded_bytes;
+}
+
 /**
  * Live-rebind an active encoder to the scaling/conversion mix that matches its
  * current scale type, scaled size and preferred format/colorspace/range.
@@ -2150,9 +2183,11 @@ void send_off_encoder_packet(obs_encoder_t *encoder, bool success, bool received
 
 		pthread_mutex_unlock(&encoder->callbacks_mutex);
 
-		// Count number of video frames successfully encoded
-		if (pkt->type == OBS_ENCODER_VIDEO)
+		// Count number of video frames successfully encoded, and the payload bytes they produced
+		if (pkt->type == OBS_ENCODER_VIDEO) {
 			encoder->encoded_frames++;
+			encoder->encoded_bytes += pkt->size;
+		}
 	}
 }
 

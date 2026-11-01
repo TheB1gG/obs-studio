@@ -1373,6 +1373,16 @@ struct obs_encoder {
 	// Number of frames successfully encoded
 	uint32_t encoded_frames;
 
+	// Payload bytes of the packets this encoder produced (per-rendition bitrate in the stats UI).
+	// Read without a lock, like encoded_frames.
+	uint64_t encoded_bytes;
+
+	// Frame counters of the texture (GPU encode) delivery path. The raw path keeps the same pair on its video-io
+	// connection instead, because that is where the frame-rate-divisor gate lives for it (see
+	// video_output_get_connection_frames()). Written on the mix's GPU encode thread, read lock-free.
+	volatile long offered_frames;
+	volatile long decimated_frames;
+
 	/* Regions of interest to prioritize during encoding */
 	pthread_mutex_t roi_mutex;
 	DARRAY(struct obs_encoder_roi) roi;

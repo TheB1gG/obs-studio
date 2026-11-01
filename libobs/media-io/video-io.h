@@ -503,6 +503,13 @@ EXPORT double video_output_get_frame_rate(const video_t *video);
 EXPORT uint32_t video_output_get_skipped_frames(const video_t *video);
 EXPORT uint32_t video_output_get_total_frames(const video_t *video);
 
+// Frame counters of a single raw connection, identified by callback/param like the divisor setters above: the frames
+// actually handed to that connection and the frames its frame-rate divisor skipped. Delivery-lag skips are not part
+// of this pair - they belong to the mix (video_output_get_skipped_frames), because the video-io thread serves every
+// connection of a mix in one pass, so a frame lost to a full cache was lost by all of its consumers at once.
+EXPORT bool video_output_get_connection_frames(video_t *video, void (*callback)(void *param, struct video_data *frame),
+					       void *param, uint64_t *offered_frames, uint64_t *decimated_frames);
+
 extern void video_output_inc_texture_encoders(video_t *video);
 extern void video_output_dec_texture_encoders(video_t *video);
 extern void video_output_inc_texture_frames(video_t *video);
