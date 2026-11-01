@@ -41,6 +41,13 @@ struct EncoderFrameCounters {
 	uint64_t lagSkipped = 0;
 };
 
+/* Encoder slots of an output (libobs/obs-output.h: MAX_OUTPUT_VIDEO_ENCODERS = 10). That
+ * header is not part of the public API, and obs_output_get_video_encoder2() bounds-checks
+ * the index, so over-reading a slot is harmless. Scanning every slot instead of stopping at
+ * the first empty one keeps the result correct if an output ever fills its encoder slots
+ * non-contiguously. */
+inline constexpr size_t maxVideoEncoderSlots = 16;
+
 /** Frame counters of a single video encoder's own delivery mix. */
 inline EncoderFrameCounters encoderFrameCounters(const obs_encoder_t *encoder)
 {
@@ -65,13 +72,6 @@ inline EncoderFrameCounters encoderFrameCounters(const obs_encoder_t *encoder)
  */
 inline EncoderFrameCounters outputFrameCounters(std::initializer_list<const obs_output_t *> outputs)
 {
-	/* Encoder slots of an output (libobs/obs-output.h: MAX_OUTPUT_VIDEO_ENCODERS = 10).
-	 * The private header is not part of the public API, and obs_output_get_video_encoder2()
-	 * bounds-checks the index, so over-reading a slot is harmless. Scanning every slot
-	 * instead of stopping at the first empty one keeps the sum correct if an output ever
-	 * fills its encoder slots non-contiguously. */
-	static constexpr size_t encoderSlots = 16;
-
 	EncoderFrameCounters counters;
 	std::vector<const obs_encoder_t *> seenEncoders;
 	std::vector<const video_t *> seenMixes;
@@ -80,7 +80,7 @@ inline EncoderFrameCounters outputFrameCounters(std::initializer_list<const obs_
 		if (!output)
 			continue;
 
-		for (size_t idx = 0; idx < encoderSlots; idx++) {
+		for (size_t idx = 0; idx < maxVideoEncoderSlots; idx++) {
 			obs_encoder_t *encoder = obs_output_get_video_encoder2(output, idx);
 			if (!encoder)
 				continue;
@@ -101,6 +101,54 @@ inline EncoderFrameCounters outputFrameCounters(std::initializer_list<const obs_
 		}
 	}
 
+	return counters;
+}
+
+/** A video encoder of an output and the encoder slot it sits in. */
+struct EncoderSlot {
+	obs_encoder_t *encoder = nullptr;
+	size_t slot = 0;
+};
+
+/**
+ * The video encoders attached to an output, in slot order: a multitrack stream carries one
+ * encoder per rendition, a plain recording output usually exactly one. Audio encoders and
+ * empty slots are skipped.
+ */
+inline std::vector<EncoderSlot> outputVideoEncoders(const obs_output_t *output)
+{
+	/* Not named "slots": Qt #defines that word (see QT_NO_KEYWORDS). */
+	std::vector<EncoderSlot> found;
+
+	if (!output)
+		return found;
+
+	for (size_t idx = 0; idx < maxVideoEncoderSlots; idx++) {
+		obs_encoder_t *encoder = obs_output_get_video_encoder2(output, idx);
+		if (!encoder)
+			continue;
+		found.push_back(EncoderSlot{encoder, idx});
+	}
+
+	return found;
+}
+
+/** The delivery mix feeding an encoder, unwrapped (never the fps_override divisor shell). */
+inline const video_t *deliveryMix(const obs_encoder_t *encoder)
+{
+	return encoder ? obs_encoder_parent_video(encoder) : nullptr;
+}
+
+/**
+ * Counters of a single encoder: the delivery-mix pair (mix_frames/mix_lag_skipped, shared
+ * with every other encoder fed from that mix) plus the pair libobs attributes to this
+ * encoder alone (frames_offered/frames_decimated), its encode count and the payload bytes
+ * of its packets (per-rendition bitrate).
+ */
+inline obs_encoder_frame_counters encoderCounters(const obs_encoder_t *encoder)
+{
+	obs_encoder_frame_counters counters = {};
+	obs_encoder_get_frame_counters(encoder, &counters);
 	return counters;
 }
 
