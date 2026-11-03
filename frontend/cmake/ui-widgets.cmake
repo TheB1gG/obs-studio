@@ -49,6 +49,8 @@ target_sources(
     widgets/OBSBasicPreview.hpp
     widgets/OBSBasicStats.cpp
     widgets/OBSBasicStats.hpp
+    widgets/OBSStatsRenditionInspector.cpp
+    widgets/OBSStatsRenditionInspector.hpp
     widgets/OBSBasicStatusBar.cpp
     widgets/OBSBasicStatusBar.hpp
     widgets/OBSMainWindow.hpp

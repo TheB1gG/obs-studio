@@ -1,11 +1,14 @@
 #include "OBSBasicStats.hpp"
 
+#include "OBSStatsRenditionInspector.hpp" /* EXPERIMENT (option G) - remove with that file */
+
 #include <widgets/OBSBasic.hpp>
 #include <utility/EncoderStats.hpp>
 
 #include <qt-wrappers.hpp>
 
 #include <cstdint>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -52,6 +55,15 @@ static QString MakeMissedFramesText(uint32_t total_lagged, uint32_t total_render
 {
 	return QString("%1 / %2 (%3%)")
 		.arg(QString::number(total_lagged), QString::number(total_rendered), QString::number(num, 'f', 1));
+}
+
+/* EXPERIMENT (option G): on while the layout is being evaluated. Turn it off without a
+ * rebuild by writing "RenditionInspector=false" into the [Stats] section of the
+ * configuration; removing the feature entirely is one revert (see OBSBasicStats.hpp). */
+static bool RenditionInspectorEnabled()
+{
+	const char *value = config_get_string(OBSBasic::Get()->Config(), "Stats", "RenditionInspector");
+	return !value || !*value || strcmp(value, "false") != 0;
 }
 
 OBSBasicStats::OBSBasicStats(QWidget *parent, bool closable)
@@ -133,6 +145,14 @@ OBSBasicStats::OBSBasicStats(QWidget *parent, bool closable)
 
 	QVBoxLayout *outputContainerLayout = new QVBoxLayout();
 	outputContainerLayout->addLayout(outputLayout);
+
+	/* EXPERIMENT (option G) begin */
+	if (RenditionInspectorEnabled()) {
+		renditionInspector = new OBSStatsRenditionInspector(this);
+		outputContainerLayout->addWidget(renditionInspector.data());
+	}
+	/* EXPERIMENT (option G) end */
+
 	outputContainerLayout->addStretch();
 
 	QWidget *widget = new QWidget(this);
@@ -571,6 +591,11 @@ void OBSBasicStats::Update()
 	MarkSharedMixes();
 	outputLabels[0].UpdateRenditions();
 	outputLabels[1].UpdateRenditions();
+
+	/* EXPERIMENT (option G) begin */
+	if (renditionInspector)
+		renditionInspector->Update(strOutput, recOutput);
+	/* EXPERIMENT (option G) end */
 
 	if (obs_output_active(recOutput)) {
 		long double kbps = outputLabels[1].kbps;

@@ -14,6 +14,9 @@ class QLabel;
 class QWidget;
 class QGridLayout;
 
+/* EXPERIMENT (option G) - remove together with widgets/OBSStatsRenditionInspector.{hpp,cpp}. */
+class OBSStatsRenditionInspector;
+
 class OBSBasicStats : public QFrame {
 	Q_OBJECT
 
@@ -134,6 +137,12 @@ class OBSBasicStats : public QFrame {
 	/* Flag the rows whose delivery mix feeds more than one encoder (mix reuse). */
 	void MarkSharedMixes();
 	void Update();
+
+	/* EXPERIMENT (option G): the single-rendition drill-down pane below the table. The whole
+	 * feature lives in widgets/OBSStatsRenditionInspector.{hpp,cpp} plus the blocks marked
+	 * "EXPERIMENT (option G)" here - one revert removes it, and [Stats] RenditionInspector=false
+	 * turns it off without a rebuild. */
+	QPointer<OBSStatsRenditionInspector> renditionInspector;
 
 	virtual void closeEvent(QCloseEvent *event) override;
 
