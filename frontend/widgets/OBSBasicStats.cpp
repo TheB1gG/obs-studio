@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <QGridLayout>
+#include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
 #include <QScrollArea>
@@ -221,16 +222,16 @@ OBSBasicStats::~OBSBasicStats()
 	os_cpu_usage_info_destroy(cpu_info);
 }
 
-/* Columns of the output table. An output row and the rendition rows below it share the
- * columns but put different things in them (see RebuildOutputGrid()), which is why every
- * rendition block carries its own (italic) header row. */
+/* Rendition table columns. A section bar spans all of them, so the columns carry rendition
+ * values only and one header row at the top names them for the whole table. */
 enum StatsColumn {
-	StatsColName,      /* output name                / encoder name              */
-	StatsColStatus,    /* output status              / codec                     */
-	StatsColDropped,   /* frames dropped by network  / delivery size, rate, format */
-	StatsColSent,      /* bytes written to the output / frames encoded            */
-	StatsColSkipped,   /* (unused)                    / lag skips and decimation  */
-	StatsColBitrate,   /* output bitrate              / encoder bitstream bitrate */
+	StatsColRendition, /* which rendition this row is                     */
+	StatsColImpl,      /* what encodes it: implementation + codec         */
+	StatsColDelivery,  /* size, rate and pixel format of the feed         */
+	StatsColEncoded,   /* frames it produced                             */
+	StatsColLag,       /* mix-level skips, encoding lag                   */
+	StatsColDecimated, /* its own deliberate frame-rate-divisor skips      */
+	StatsColBitrate,   /* its own bitstream bitrate                       */
 	StatsColCount,
 };
 
@@ -241,11 +242,12 @@ void OBSBasicStats::AddOutputLabels(QString name)
 	outputLabels.push_back(ol);
 }
 
-/* Create every label of the output table from the current model: the header row, one row
- * per output, and below each output one header + one row per video encoder (rendition) of
- * that output. Called only when the structure changes (an output starts or stops, a track
- * is added, ...); Update() writes the text. All counters live in EncoderRow, not in the
- * labels, so rebuilding the table never resets a number. */
+/* Create the whole table from the model: one header row naming the rendition columns, then
+ * one section per running output - a bar spanning the table with that output's status and
+ * totals, followed by one row per video encoder (rendition) of that output. Called only when
+ * the structure changes (an output starts or stops, a track is added, ...); Update() writes
+ * the text. All counters live in EncoderRow, not in the labels, so rebuilding the table
+ * never resets a number. */
 void OBSBasicStats::RebuildOutputGrid()
 {
 	while (QLayoutItem *item = outputLayout->takeAt(0)) {
@@ -256,78 +258,101 @@ void OBSBasicStats::RebuildOutputGrid()
 
 	int row = 0;
 
-	const char *outputHeaders[] = {
-		"Basic.Settings.Output",
-		"Basic.Stats.Status",
-		"Basic.Stats.DroppedFrames",
-		"Basic.Stats.MegabytesSent",
-		nullptr,
-		"Basic.Stats.Bitrate",
+	struct ColHeader {
+		const char *loc;
+		const char *toolTip;
+	};
+	static constexpr ColHeader headers[] = {
+		{"Basic.Stats.Rendition.Title", "Basic.Stats.Rendition.Title.ToolTip"},
+		{"Basic.Stats.Rendition.Encoder", "Basic.Stats.Rendition.Encoder.ToolTip"},
+		{"Basic.Stats.Rendition.Delivery", "Basic.Stats.Rendition.Delivery.ToolTip"},
+		{"Basic.Stats.Rendition.Encoded", "Basic.Stats.Rendition.Encoded.ToolTip"},
+		{"Basic.Stats.Rendition.Lag", "Basic.Stats.Rendition.Lag.ToolTip"},
+		{"Basic.Stats.Rendition.Decimated", "Basic.Stats.Rendition.Decimated.ToolTip"},
+		{"Basic.Stats.Rendition.Bitrate", "Basic.Stats.Rendition.Bitrate.ToolTip"},
 	};
 	for (int col = 0; col < StatsColCount; col++) {
-		if (!outputHeaders[col])
-			continue;
-		QLabel *label = new QLabel(QTStr(outputHeaders[col]), this);
+		QLabel *label = new QLabel(QTStr(headers[col].loc), this);
 		label->setStyleSheet("font-weight: bold");
+		label->setToolTip(QTStr(headers[col].toolTip));
+		bool right = col >= StatsColEncoded && col <= StatsColBitrate;
+		label->setAlignment(right ? (Qt::AlignRight | Qt::AlignVCenter) : (Qt::AlignLeft | Qt::AlignVCenter));
 		outputLayout->addWidget(label, row, col);
 	}
 	row++;
 
 	for (OutputLabels &section : outputLabels) {
-		section.name = new QLabel(section.title, this);
-		section.status = new QLabel(this);
-		section.droppedFrames = new QLabel(this);
-		section.megabytesSent = new QLabel(this);
-		section.bitrate = new QLabel(this);
-
-		outputLayout->addWidget(section.name.data(), row, StatsColName);
-		outputLayout->addWidget(section.status.data(), row, StatsColStatus);
-		outputLayout->addWidget(section.droppedFrames.data(), row, StatsColDropped);
-		outputLayout->addWidget(section.megabytesSent.data(), row, StatsColSent);
-		outputLayout->addWidget(section.bitrate.data(), row, StatsColBitrate);
-		row++;
-
-		if (section.rows.isEmpty())
+		if (!section.active)
 			continue;
 
-		struct SubHeader {
-			const char *loc;
-			const char *toolTip;
-		};
-		const SubHeader subHeaders[] = {
-			{"Basic.Stats.Rendition.Title", nullptr},
-			{"Basic.Stats.Rendition.Encoder", nullptr},
-			{"Basic.Stats.Rendition.Delivery", "Basic.Stats.Rendition.Delivery.ToolTip"},
-			{"Basic.Stats.Rendition.Encoded", "Basic.Stats.Rendition.Encoded.ToolTip"},
-			{"Basic.Stats.Rendition.Skipped", "Basic.Stats.Rendition.Skipped.ToolTip"},
-			{"Basic.Stats.Bitrate", "Basic.Stats.Rendition.Bitrate.ToolTip"},
-		};
-		for (int col = 0; col < StatsColCount; col++) {
-			QLabel *label = new QLabel(QTStr(subHeaders[col].loc), this);
-			label->setStyleSheet("font-style: italic");
-			if (subHeaders[col].toolTip)
-				label->setToolTip(QTStr(subHeaders[col].toolTip));
-			outputLayout->addWidget(label, row, col);
-		}
-		row++;
+		/* The output itself: one bar spanning the table, with the status and the
+		 * output-wide totals. Values stay separate labels so the status and the drop count
+		 * can be coloured through setClasses() and the active theme. */
+		QWidget *bar = new QWidget(this);
+		QHBoxLayout *barLayout = new QHBoxLayout(bar);
+		barLayout->setContentsMargins(0, 0, 0, 0);
 
+		section.bar = bar;
+		section.nameLabel = new QLabel(section.title, bar);
+		section.nameLabel->setStyleSheet("font-weight: bold");
+		section.statusLabel = new QLabel(bar);
+		section.sentLabel = new QLabel(bar);
+		section.sentLabel->setToolTip(QTStr("Basic.Stats.MegabytesSent"));
+		section.bitrateLabel = new QLabel(bar);
+		section.bitrateLabel->setToolTip(QTStr("Basic.Stats.Bitrate.Output.ToolTip"));
+		section.droppedLabel = new QLabel(bar);
+		section.droppedLabel->setToolTip(QTStr("Basic.Stats.DroppedFrames"));
+
+		barLayout->addWidget(section.nameLabel.data());
+		barLayout->addWidget(section.statusLabel.data());
+		barLayout->addWidget(new QLabel(QStringLiteral("·"), bar));
+		barLayout->addWidget(section.sentLabel.data());
+		barLayout->addWidget(new QLabel(QStringLiteral("·"), bar));
+		barLayout->addWidget(section.bitrateLabel.data());
+		barLayout->addWidget(new QLabel(QStringLiteral("·"), bar));
+		barLayout->addWidget(section.droppedLabel.data());
+		barLayout->addStretch();
+
+		outputLayout->addWidget(bar, row++, 0, 1, StatsColCount);
+
+		/* ... and one row per video encoder of that output. */
 		for (EncoderRow &entry : section.rows) {
 			entry.name = new QLabel(this);
-			entry.codec = new QLabel(this);
+			entry.impl = new QLabel(this);
 			entry.delivery = new QLabel(this);
 			entry.encoded = new QLabel(this);
-			entry.skipped = new QLabel(this);
+			entry.lag = new QLabel(this);
+			entry.decimated = new QLabel(this);
 			entry.bitrate = new QLabel(this);
 
-			outputLayout->addWidget(entry.name.data(), row, StatsColName);
-			outputLayout->addWidget(entry.codec.data(), row, StatsColStatus);
-			outputLayout->addWidget(entry.delivery.data(), row, StatsColDropped);
-			outputLayout->addWidget(entry.encoded.data(), row, StatsColSent);
-			outputLayout->addWidget(entry.skipped.data(), row, StatsColSkipped);
+			for (QLabel *label : {entry.encoded.data(), entry.lag.data(), entry.decimated.data(), entry.bitrate.data()})
+				label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+			outputLayout->addWidget(entry.name.data(), row, StatsColRendition);
+			outputLayout->addWidget(entry.impl.data(), row, StatsColImpl);
+			outputLayout->addWidget(entry.delivery.data(), row, StatsColDelivery);
+			outputLayout->addWidget(entry.encoded.data(), row, StatsColEncoded);
+			outputLayout->addWidget(entry.lag.data(), row, StatsColLag);
+			outputLayout->addWidget(entry.decimated.data(), row, StatsColDecimated);
 			outputLayout->addWidget(entry.bitrate.data(), row, StatsColBitrate);
 			row++;
 		}
 	}
+
+	/* Nothing running: say so instead of leaving an empty table (idle Stream/Recording
+	 * rows would otherwise be the only content). */
+	if (row == 1)
+		outputLayout->addWidget(new QLabel(QTStr("Basic.Stats.Output.None"), this), row, 0, 1, StatsColCount);
+
+	/* Hand the slack to the text columns so the numbers never get squeezed out of a narrow
+	 * dock (the dock opens at 700 px by default, OBSBasic.cpp:308). */
+	outputLayout->setColumnStretch(StatsColRendition, 3);
+	outputLayout->setColumnStretch(StatsColImpl, 2);
+	outputLayout->setColumnStretch(StatsColDelivery, 3);
+	outputLayout->setColumnStretch(StatsColEncoded, 1);
+	outputLayout->setColumnStretch(StatsColLag, 2);
+	outputLayout->setColumnStretch(StatsColDecimated, 1);
+	outputLayout->setColumnStretch(StatsColBitrate, 2);
 }
 
 /* Encoder-mix reuse (acquire_encoder_only_mix() in libobs/obs-encoder.c) can feed several
@@ -618,6 +643,10 @@ void OBSBasicStats::Reset()
 
 void OBSBasicStats::OutputLabels::Update(obs_output_t *output, bool rec)
 {
+	/* Section not in the table (output idle) - nothing to write. */
+	if (!statusLabel)
+		return;
+
 	uint64_t totalBytes = output ? obs_output_get_total_bytes(output) : 0;
 	uint64_t curTime = os_gettime_ns();
 	uint64_t bytesSent = totalBytes;
@@ -654,8 +683,8 @@ void OBSBasicStats::OutputLabels::Update(obs_output_t *output, bool rec)
 		}
 	}
 
-	status->setText(str);
-	setClasses(status, styling);
+	statusLabel->setText(str);
+	setClasses(statusLabel, styling);
 
 	long double num = (long double)totalBytes / (1024.0l * 1024.0l);
 	const char *unit = "MiB";
@@ -663,7 +692,8 @@ void OBSBasicStats::OutputLabels::Update(obs_output_t *output, bool rec)
 		num /= 1024;
 		unit = "GiB";
 	}
-	megabytesSent->setText(QString("%1 %2").arg(num, 0, 'f', 1).arg(unit));
+	sentLabel->setText(QTStr("Basic.Stats.Bar.Sent.Text")
+				   .arg(QString("%1 %2").arg(num, 0, 'f', 1).arg(unit)));
 
 	num = kbps;
 	unit = "kb/s";
@@ -671,7 +701,7 @@ void OBSBasicStats::OutputLabels::Update(obs_output_t *output, bool rec)
 		num /= 1000;
 		unit = "Mb/s";
 	}
-	bitrate->setText(QString("%1 %2").arg(num, 0, 'f', 0).arg(unit));
+	bitrateLabel->setText(QString("%1 %2").arg(num, 0, 'f', 0).arg(unit));
 
 	if (!rec) {
 		int total = output ? obs_output_get_total_frames(output) : 0;
@@ -689,14 +719,14 @@ void OBSBasicStats::OutputLabels::Update(obs_output_t *output, bool rec)
 
 		str = QString("%1 / %2 (%3%)")
 			      .arg(QString::number(dropped), QString::number(total), QString::number(num, 'f', 1));
-		droppedFrames->setText(str);
+		droppedLabel->setText(QTStr("Basic.Stats.Bar.Dropped.Text").arg(str));
 
 		if (num > 5.0l)
-			setClasses(droppedFrames, "text-danger");
+			setClasses(droppedLabel, "text-danger");
 		else if (num > 1.0l)
-			setClasses(droppedFrames, "text-warning");
+			setClasses(droppedLabel, "text-warning");
 		else
-			setClasses(droppedFrames, "");
+			setClasses(droppedLabel, "");
 	}
 
 	lastBytesSent = bytesSent;
@@ -722,6 +752,7 @@ void OBSBasicStats::EncoderRow::Rebase(const obs_encoder_frame_counters &counter
 	baseDecimated = counters.frames_decimated;
 	baseEncoded = counters.frames_encoded;
 	baseBytes = counters.encoded_bytes;
+	baseTime = timeNs;
 	lastBytes = counters.encoded_bytes;
 	lastBytesTime = timeNs;
 }
@@ -730,10 +761,12 @@ bool OBSBasicStats::OutputLabels::SyncRenditions(obs_output_t *output)
 {
 	QVector<EncoderRow> next;
 
-	/* Rows exist only while the output is active. The delivery-path counters restart with
-	 * the first consumer on their mix, so numbers gathered from a stopped output cannot be
-	 * related to whatever run follows. */
-	if (output && obs_output_active(output)) {
+	/* The whole section (bar + rows) exists only while the output runs: the delivery-path
+	 * counters restart with the first consumer on their mix, so numbers gathered from a
+	 * stopped output cannot be related to whatever run follows - and an idle section is
+	 * clutter when a single output can be several rows deep. */
+	const bool running = output && obs_output_active(output);
+	if (running) {
 		for (const OBS::EncoderSlot &slot : OBS::outputVideoEncoders(output)) {
 			EncoderRow entry;
 
@@ -760,7 +793,9 @@ bool OBSBasicStats::OutputLabels::SyncRenditions(obs_output_t *output)
 		}
 	}
 
-	bool changed = next.size() != rows.size();
+	bool changed = (running != active) || (next.size() != rows.size());
+	active = running;
+
 	if (!changed) {
 		for (qsizetype i = 0; i < next.size(); i++) {
 			if (next[i].encoder == rows[i].encoder)
@@ -798,9 +833,21 @@ void OBSBasicStats::OutputLabels::UpdateRenditions()
 		const uint64_t lagSkipped = counters.mix_lag_skipped - entry.baseMixLagSkipped;
 		const uint64_t decimated = counters.frames_decimated - entry.baseDecimated;
 		const uint64_t encoded = counters.frames_encoded - entry.baseEncoded;
+		const uint64_t offered = counters.frames_offered - entry.baseOffered;
 
-		entry.name->setText(obs_encoder_get_name(entry.encoder));
-		entry.codec->setText(obs_encoder_get_codec(entry.encoder));
+		/* Frames per second this encoder is really getting, over the current run (re-armed
+		 * on every re-bind). The delivery column carries the nominal rate; the gap between
+		 * the two is what a stalling feed looks like. */
+		const long double runSeconds = (long double)(curTime - entry.baseTime) / 1000000000.0l;
+		const double measuredFps = runSeconds >= 0.01l ? (double) ((long double) offered / runSeconds) : 0.0;
+
+		/* "multitrack video video encoder 0" -> "MT video enc 0". */
+		entry.name->setText(QString::fromStdString(OBS::renditionName(entry.encoder)));
+		/* What really encodes this rendition: implementation + codec ("QSV H264", "x264").
+		 * The encoder type id and the object name stay in the tooltip. */
+		entry.impl->setText(QString::fromStdString(OBS::encoderLabel(entry.encoder)));
+		entry.impl->setToolTip(QString("%1\n%2").arg(obs_encoder_get_id(entry.encoder),
+							     obs_encoder_get_name(entry.encoder)));
 
 		/* What this encoder is actually fed: the mix's size and pixel format plus the
 		 * encoder's own output rate (already divided by its frame-rate divisor). */
@@ -818,20 +865,20 @@ void OBSBasicStats::OutputLabels::UpdateRenditions()
 
 		entry.encoded->setText(QString::number(encoded));
 
-		/* Lag belongs to the mix (shown as a share of the frames that mix pushed),
-		 * decimation to this encoder alone: keep them in separate halves of the cell so an
-		 * intentional rate reduction is never read as a performance problem, or the other
-		 * way round (bug 1 in the review report). */
+		/* Lag is a property of the delivery mix, shown as a share of the frames that mix
+		 * pushed - the same basis as libobs' own log line "skipped frames due to encoding
+		 * lag: X/Y (Z%)". Decimation is this encoder's own deliberate rate reduction and
+		 * gets its own column, so neither can be mistaken for the other (bug 1). */
 		long double pct = mixFrames ? (long double)lagSkipped / (long double)mixFrames * 100.0l : 0.0l;
-		entry.skipped->setText(QString("%1 (%2%) / %3")
-					       .arg(QString::number(lagSkipped), QString::number(pct, 'f', 1),
-						    QString::number(decimated)));
+		entry.lag->setText(QString("%1 (%2%)").arg(QString::number(lagSkipped), QString::number(pct, 'f', 1)));
 		if (pct > 5.0l)
-			setClasses(entry.skipped, "text-danger");
+			setClasses(entry.lag, "text-danger");
 		else if (pct > 1.0l)
-			setClasses(entry.skipped, "text-warning");
+			setClasses(entry.lag, "text-warning");
 		else
-			setClasses(entry.skipped, "");
+			setClasses(entry.lag, "");
+
+		entry.decimated->setText(QString::number(decimated));
 
 		/* This encoder's own bitstream bitrate. The output-level Bitrate column is derived
 		 * from obs_output_get_total_bytes(), which covers the whole output (every
@@ -855,8 +902,8 @@ void OBSBasicStats::OutputLabels::UpdateRenditions()
 
 		/* Everything the columns split up, in one place, for the hover. */
 		entry.name->setToolTip(
-			QString("offered %1, encoded %2, decimated %3, lag-skipped %4, mix frames %5")
-				.arg(QString::number(counters.frames_offered - entry.baseOffered), QString::number(encoded),
+			QString("offered %1 (%2 fps), encoded %3, decimated %4, lag-skipped %5, mix frames %6")
+				.arg(QString::number(offered), QString::number(measuredFps, 'f', 1), QString::number(encoded),
 				     QString::number(decimated), QString::number(lagSkipped), QString::number(mixFrames)));
 	}
 }

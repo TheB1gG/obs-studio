@@ -11,6 +11,7 @@
 #include <QVector>
 
 class QLabel;
+class QWidget;
 class QGridLayout;
 
 class OBSBasicStats : public QFrame {
@@ -57,11 +58,12 @@ class OBSBasicStats : public QFrame {
 		/* Delivery mix the row's numbers were last read from. */
 		const video_t *mix = nullptr;
 
-		QPointer<QLabel> name;
-		QPointer<QLabel> codec;
-		QPointer<QLabel> delivery;
+		QPointer<QLabel> name;      /* rendition label, e.g. "MT video enc 0" */
+		QPointer<QLabel> impl;      /* what encodes it, e.g. "QSV H264"        */
+		QPointer<QLabel> delivery;  /* mix size, encoder rate, pixel format    */
 		QPointer<QLabel> encoded;
-		QPointer<QLabel> skipped;
+		QPointer<QLabel> lag;       /* mix-level skips because of encoding lag */
+		QPointer<QLabel> decimated; /* this encoder's own rate-divisor skips    */
 		QPointer<QLabel> bitrate;
 
 		uint64_t baseMixFrames = 0;
@@ -70,6 +72,7 @@ class OBSBasicStats : public QFrame {
 		uint64_t baseDecimated = 0;
 		uint64_t baseEncoded = 0;
 		uint64_t baseBytes = 0;
+		uint64_t baseTime = 0;
 		uint64_t lastBytes = 0;
 		uint64_t lastBytesTime = 0;
 
@@ -87,11 +90,21 @@ class OBSBasicStats : public QFrame {
 	struct OutputLabels {
 		QString title;
 
-		QPointer<QLabel> name;
-		QPointer<QLabel> status;
-		QPointer<QLabel> droppedFrames;
-		QPointer<QLabel> megabytesSent;
-		QPointer<QLabel> bitrate;
+		/* A section (its bar and its rendition rows) only exists in the table while the
+		 * output is running - an idle Stream/Recording row is noise when renditions can be
+		 * several rows deep. `active` mirrors what RebuildOutputGrid() laid out. */
+		bool active = false;
+
+		/* One bar spanning the table width:
+		 *   "Stream · LIVE · sent 2.1 GiB · 24.8 Mb/s · dropped 0 / 117741 (0.0%)"
+		 * The values stay separate labels because the status and the drop count are
+		 * coloured through setClasses() and the active theme. */
+		QPointer<QWidget> bar;
+		QPointer<QLabel> nameLabel;
+		QPointer<QLabel> statusLabel;
+		QPointer<QLabel> sentLabel;
+		QPointer<QLabel> bitrateLabel;
+		QPointer<QLabel> droppedLabel;
 
 		uint64_t lastBytesSent = 0;
 		uint64_t lastBytesSentTime = 0;

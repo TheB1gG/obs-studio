@@ -5,7 +5,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
+#include <string>
+#include <string_view>
 #include <vector>
 
 /* Frame counters of the video path that feeds a video encoder.
@@ -150,6 +153,128 @@ inline obs_encoder_frame_counters encoderCounters(const obs_encoder_t *encoder)
 	obs_encoder_frame_counters counters = {};
 	obs_encoder_get_frame_counters(encoder, &counters);
 	return counters;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Display names - the object names themselves are left alone, so the log, the
+ * bpm SEI and the encoder hotkey/scene references keep speaking the real name. */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Table label of a rendition. The multitrack encoder names are boilerplate-heavy
+ * ("multitrack video video encoder 0", "multitrack video live audio 1"; see
+ * MultitrackVideoOutput.cpp), which costs a lot of width in a narrow dock.
+ */
+inline std::string renditionName(const obs_encoder_t *encoder)
+{
+	const std::string_view name = (encoder && obs_encoder_get_name(encoder)) ? obs_encoder_get_name(encoder) : "";
+
+	struct PrefixRule {
+		std::string_view prefix;
+		const char *replacement;
+	};
+	static constexpr PrefixRule rules[] = {
+		{"multitrack video video encoder ", "MT video enc "},
+		{"multitrack video live audio ", "MT live audio "},
+		{"multitrack video vod audio ", "MT vod audio "},
+		{"multitrack video ", "MT "},
+	};
+
+	for (const PrefixRule &rule : rules) {
+		if (name.size() <= rule.prefix.size() || name.compare(0, rule.prefix.size(), rule.prefix) != 0)
+			continue;
+		std::string out(rule.replacement);
+		out.append(name.substr(rule.prefix.size()));
+		return out;
+	}
+
+	return std::string(name);
+}
+
+/**
+ * Implementation behind an encoder ("QSV", "NVENC", "x264"), derived from the encoder type id
+ * (obs_encoder_get_id()), which is stable across locales - unlike the plugin display name
+ * ("QuickSync H.264", "NVIDIA NVENC H.264 (new)") that obs_encoder_get_display_name() returns.
+ */
+inline std::string encoderImplementation(const obs_encoder_t *encoder)
+{
+	const char *id = encoder ? obs_encoder_get_id(encoder) : nullptr;
+	if (!id)
+		return {};
+
+	struct IdRule {
+		const char *needle;
+		const char *label;
+	};
+	/* First substring match wins; the ids are the plugin ones (obs-nvenc, obs-qsv11,
+	 * obs-ffmpeg/AMF, obs-x264/x265, SVT-AV1, VideoToolbox). */
+	static constexpr IdRule rules[] = {
+		{"nvenc", "NVENC"},   {"qsv", "QSV"},          {"amf", "AMF"},
+		{"videotoolbox", "VideoToolbox"}, {"obs_x264", "x264"},    {"obs_x265", "x265"},
+		{"svt_av1", "SVT-AV1"},   {"netint", "NetINT"},
+	};
+	for (const IdRule &rule : rules) {
+		if (strstr(id, rule.needle))
+			return rule.label;
+	}
+
+	if (const char *pretty = obs_encoder_get_display_name(id))
+		return pretty;
+	return id;
+}
+
+inline void asciiUpper(std::string &s)
+{
+	for (char &c : s) {
+		if (c >= 'a' && c <= 'z')
+			c = static_cast<char>(c - 'a' + 'A');
+	}
+}
+
+inline void asciiLower(std::string &s)
+{
+	for (char &c : s) {
+		if (c >= 'A' && c <= 'Z')
+			c = static_cast<char>(c - 'A' + 'a');
+	}
+}
+
+/**
+ * "QSV H264", "NVENC HEVC", "x264" ... - implementation plus codec, with the codec dropped
+ * when the implementation label already names it (x264/x265/SVT-AV1 are their own codec
+ * families, so "x264 H264" would just waste the column).
+ */
+inline std::string encoderLabel(const obs_encoder_t *encoder)
+{
+	std::string impl = encoderImplementation(encoder);
+
+	std::string codec = encoder && obs_encoder_get_codec(encoder) ? obs_encoder_get_codec(encoder) : "";
+	asciiUpper(codec);
+
+	struct CodecRule {
+		const char *codec;
+		const char *alsoNamedAs; /* substring that means the impl label says it already */
+	};
+	static constexpr CodecRule rules[] = {
+		{"H264", "264"}, {"H265", "265"}, {"HEVC", "265"}, {"AV1", "AV1"}, {"VP9", "VP9"},
+	};
+	std::string implLower = impl;
+	asciiLower(implLower);
+	for (const CodecRule &rule : rules) {
+		if (strcmp(codec.c_str(), rule.codec) != 0)
+			continue;
+		std::string needleLower = rule.alsoNamedAs;
+		asciiLower(needleLower);
+		if (implLower.find(needleLower) != std::string::npos)
+			codec.clear();
+		break;
+	}
+
+	if (codec.empty())
+		return impl;
+	if (impl.empty())
+		return codec;
+	return impl + " " + codec;
 }
 
 } /* namespace OBS */
