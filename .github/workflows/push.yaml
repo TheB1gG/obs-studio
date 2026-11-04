@@ -8,7 +8,10 @@ on:
       - master
       - 'release/**'
     tags:
-      - '*'
+      # Test tags (test-*) are built by the Test Tag workflow. Excluding them here
+      # stops GitHub from starting a second Push run (all jobs skip immediately) for
+      # every CI gate tag. Release tags (x.y.z / x.y.z-betaN) still trigger this run.
+      - '!test-*'
 permissions:
   contents: write
 jobs:
@@ -21,9 +24,9 @@ jobs:
 
   build-project:
     name: Build 🧱
-    # Test tags (test-*) are handled by the Test Tag workflow only; skip the
-    # full push build for them. create-release needs this job, so it is
-    # skipped as well.
+    # Belt and braces: the push trigger above already ignores test-* tags, but the
+    # full push build must never run for them - the Test Tag workflow is the gate.
+    # create-release needs this job, so it is skipped as well.
     if: ${{ !startsWith(github.ref_name, 'test-') }}
     uses: ./.github/workflows/build-project.yaml
     secrets: inherit
