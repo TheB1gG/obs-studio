@@ -208,12 +208,14 @@ enum encoder_mix_acquire {
 	MIX_ACQUIRE_FAILED,
 };
 
-/* CPU/raw encoders can be handed already-converted YUV through GPU readback when their
+/* CPU/raw encoders can be handed already-converted frames through GPU readback when their
  * requested delivery format has a GPU conversion path (convert_textures allocated in
  * obs_init_gpu_conversion) plus matching raw staging surfaces. This removes the per-frame
- * CPU swscale color-matrix pass: the GPU converts base->YUV and the encoder reads back the
- * smaller YUV buffer instead of full BGRA. Only planar/semi-planar YUV formats with a GPU
- * conversion are eligible; packed-RGB and alpha formats fall back to CPU swscale. */
+ * CPU swscale color-matrix pass: the GPU converts the base canvas -> target and the encoder
+ * reads back the converted buffer instead of re-converting on the CPU. Eligible formats are
+ * exactly those with a conversion shader + convert texture (see the switch below): the
+ * planar/semi-planar YUV family plus packed RGB (BGRA) and planar RGB (GBRP). Formats without
+ * a GPU conversion fall back to CPU swscale. */
 static bool raw_gpu_conversion_supported(enum video_format format)
 {
 	switch (format) {
