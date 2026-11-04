@@ -273,6 +273,9 @@ static inline void calc_gpu_conversion_sizes(struct obs_core_video_mix *video)
 	}
 }
 
+/* Formats a GPU/texture encoder can consume directly as a shared texture (no per-frame
+ * conversion). Distinct from raw_gpu_conversion_supported() in obs-encoder.c, which lists the
+ * target formats CPU/raw encoders can receive via GPU readback. */
 static bool video_format_texture_supported(const enum video_format input_format)
 {
 	switch (input_format) {
@@ -304,17 +307,19 @@ static bool obs_init_gpu_conversion(struct obs_core_video_mix *video)
 		video->encoder_texture_format = info->format;
 
 	if (!video->conversion_needed) {
-		blog(LOG_INFO, "GPU conversion not available for format: %s", get_video_format_name(info->format));
+		blog(LOG_INFO, "Target %s: no GPU color conversion available; this mix falls back to CPU (swscale)",
+		     get_video_format_name(info->format));
 		video->gpu_conversion = false;
 		video->encoder_texture_format = VIDEO_FORMAT_NONE;
-		blog(LOG_INFO, "Encoder texture support not available");
 		return true;
 	}
 
 	if (video->encoder_texture_format != VIDEO_FORMAT_NONE)
-		blog(LOG_INFO, "%s texture support enabled", get_video_format_name(info->format));
+		blog(LOG_INFO, "Target %s: GPU-encoder shared-texture path available",
+		     get_video_format_name(info->format));
 	else
-		blog(LOG_INFO, "%s texture support not available", get_video_format_name(info->format));
+		blog(LOG_INFO, "Target %s: not shareable as a GPU texture; GPU encoders use the RGB conversion path",
+		     get_video_format_name(info->format));
 
 	video->convert_textures[0] = NULL;
 	video->convert_textures[1] = NULL;
@@ -3680,13 +3685,17 @@ bool obs_video_active(void)
 bool obs_nv12_tex_active(void)
 {
 	struct obs_core_video_mix *video = obs->data.main_canvas->mix;
+	if (!video)
+		return false;
 	return video->encoder_texture_format == VIDEO_FORMAT_NV12;
 }
 
 bool obs_p010_tex_active(void)
 {
 	struct obs_core_video_mix *video = obs->data.main_canvas->mix;
-	return video->encoder_texture_format == VIDEO_FORMAT_NV12;
+	if (!video)
+		return false;
+	return video->encoder_texture_format == VIDEO_FORMAT_P010;
 }
 
 /* ------------------------------------------------------------------------- */
