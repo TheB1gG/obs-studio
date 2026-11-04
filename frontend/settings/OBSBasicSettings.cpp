@@ -331,6 +331,15 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 
 	ui->listWidget->setAttribute(Qt::WA_MacShowFocusRect, false);
 
+	/* Multi-destination streaming is dark-launched. The page and its list row always exist in the
+	 * .ui (that keeps the page indices and the themed row icons consistent for every profile), but
+	 * the row stays hidden and the page stays empty unless the profile opts in with
+	 * [General] StreamingDestinationsPage=true. */
+	if (StreamingDestinations::pageEnabled(main->Config()))
+		SetupDestinationsPage();
+	else
+		ui->listWidget->setRowHidden(Pages::DESTINATIONS, true);
+
 	/* clang-format off */
 	HookWidget(ui->language,             COMBO_CHANGED,  GENERAL_CHANGED);
 	HookWidget(ui->updateChannelBox,     COMBO_CHANGED,  GENERAL_CHANGED);
@@ -3772,6 +3781,8 @@ void OBSBasicSettings::SaveSettings()
 		SaveAdvancedSettings();
 	if (appearanceChanged)
 		SaveAppearanceSettings();
+	if (destinationsChanged)
+		SaveDestinationsSettings();
 	if (videoChanged || advancedChanged)
 		main->ResetVideo();
 
@@ -3797,6 +3808,8 @@ void OBSBasicSettings::SaveSettings()
 			AddChangedVal(changed, "a11y");
 		if (appearanceChanged)
 			AddChangedVal(changed, "appearance");
+		if (destinationsChanged)
+			AddChangedVal(changed, "destinations");
 		if (advancedChanged)
 			AddChangedVal(changed, "advanced");
 

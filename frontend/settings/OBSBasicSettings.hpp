@@ -21,6 +21,7 @@
 #include "ui_OBSBasicSettings.h"
 
 #include <utility/FFmpegShared.hpp>
+#include <utility/StreamingDestinations.hpp>
 
 #include <QPointer>
 
@@ -49,7 +50,8 @@ class OBSBasicSettings : public QDialog {
 	Q_PROPERTY(QIcon accessibilityIcon READ GetAccessibilityIcon WRITE SetAccessibilityIcon DESIGNABLE true)
 	Q_PROPERTY(QIcon advancedIcon READ GetAdvancedIcon WRITE SetAdvancedIcon DESIGNABLE true)
 
-	enum Pages { GENERAL, APPEARANCE, STREAM, OUTPUT, AUDIO, VIDEO, HOTKEYS, ACCESSIBILITY, ADVANCED, NUM_PAGES };
+	enum Pages { GENERAL, APPEARANCE, STREAM, DESTINATIONS, OUTPUT, AUDIO, VIDEO, HOTKEYS, ACCESSIBILITY, ADVANCED,
+		   NUM_PAGES };
 
 private:
 	OBSBasic *main;
@@ -67,6 +69,7 @@ private:
 	bool a11yChanged = false;
 	bool appearanceChanged = false;
 	bool advancedChanged = false;
+	bool destinationsChanged = false;
 	int pageIndex = 0;
 	bool loading = true;
 	bool forceAuthReload = false;
@@ -90,6 +93,19 @@ private:
 	OBSPropertiesView *streamProperties = nullptr;
 	OBSPropertiesView *streamEncoderProps = nullptr;
 	OBSPropertiesView *recordEncoderProps = nullptr;
+
+	/* Streaming destinations page (Settings -> "Streaming destinations"). The page exists in the .ui
+	 * either way so that page indices and the themed list icons stay consistent; it is only populated
+	 * when the profile opts in with [General] StreamingDestinationsPage=true. */
+	QPointer<QVBoxLayout> destinationsPageLayout;
+	QPointer<QScrollArea> destinationsScrollArea;
+	QPointer<QWidget> destinationsListBody;
+	QPointer<QVBoxLayout> destinationsListLayout;
+	QPointer<QLabel> destinationsEmptyLabel;
+	QPointer<QPushButton> addDestinationButton;
+	std::vector<QPointer<QWidget>> destinationBlocks;
+	/* The dialog edits a copy: Apply/OK commits it into OBSBasic and to disk, Cancel drops it. */
+	StreamingDestinations destinationEdits;
 
 	QPointer<QLabel> advOutRecWarning;
 	QPointer<QLabel> simpleOutRecWarning;
@@ -144,7 +160,7 @@ private:
 	inline bool Changed() const
 	{
 		return generalChanged || appearanceChanged || outputsChanged || stream1Changed || audioChanged ||
-		       videoChanged || advancedChanged || hotkeysChanged || a11yChanged;
+		       videoChanged || advancedChanged || hotkeysChanged || a11yChanged || destinationsChanged;
 	}
 
 	inline void EnableApplyButton(bool en) { ui->buttonBox->button(QDialogButtonBox::Apply)->setEnabled(en); }
@@ -160,6 +176,7 @@ private:
 		a11yChanged = false;
 		advancedChanged = false;
 		appearanceChanged = false;
+		destinationsChanged = false;
 		EnableApplyButton(false);
 	}
 
@@ -188,6 +205,16 @@ private:
 	void LoadAppearanceSettings(bool reload = false);
 	void LoadAdvancedSettings();
 	void LoadSettings(bool changedOnly);
+
+	/* streaming destinations page */
+	void SetupDestinationsPage();
+	void LoadDestinationsSettings();
+	void SaveDestinationsSettings();
+	void RebuildDestinationBlocks();
+	void MarkDestinationsChanged();
+	void AddDestination();
+	void RenameDestination(const std::string &id);
+	void RemoveDestination(const std::string &id);
 
 	OBSPropertiesView *CreateEncoderPropertyView(const char *encoder, const char *path, bool changed = false);
 
