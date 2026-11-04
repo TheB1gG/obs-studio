@@ -33,6 +33,7 @@ class Auth;
 class OBSBasic;
 class OBSHotkeyWidget;
 class OBSPropertiesView;
+class QListWidget;
 struct FFmpegFormat;
 struct OBSTheme;
 
@@ -50,7 +51,7 @@ class OBSBasicSettings : public QDialog {
 	Q_PROPERTY(QIcon accessibilityIcon READ GetAccessibilityIcon WRITE SetAccessibilityIcon DESIGNABLE true)
 	Q_PROPERTY(QIcon advancedIcon READ GetAdvancedIcon WRITE SetAdvancedIcon DESIGNABLE true)
 
-	enum Pages { GENERAL, APPEARANCE, STREAM, DESTINATIONS, OUTPUT, AUDIO, VIDEO, HOTKEYS, ACCESSIBILITY, ADVANCED,
+	enum Pages { GENERAL, APPEARANCE, STREAM, OUTPUT, DESTINATIONS, AUDIO, VIDEO, HOTKEYS, ACCESSIBILITY, ADVANCED,
 		   NUM_PAGES };
 
 private:
@@ -98,12 +99,10 @@ private:
 	 * either way so that page indices and the themed list icons stay consistent; it is only populated
 	 * when the profile opts in with [General] StreamingDestinationsPage=true. */
 	QPointer<QVBoxLayout> destinationsPageLayout;
-	QPointer<QScrollArea> destinationsScrollArea;
-	QPointer<QWidget> destinationsListBody;
-	QPointer<QVBoxLayout> destinationsListLayout;
+	QPointer<QListWidget> destinationsList;
 	QPointer<QLabel> destinationsEmptyLabel;
+	QPointer<QLabel> destinationsTotalBitrateLabel;
 	QPointer<QPushButton> addDestinationButton;
-	std::vector<QPointer<QWidget>> destinationBlocks;
 	/* The dialog edits a copy: Apply/OK commits it into OBSBasic and to disk, Cancel drops it. */
 	StreamingDestinations destinationEdits;
 
@@ -212,6 +211,9 @@ private:
 	void SaveDestinationsSettings();
 	void RebuildDestinationBlocks();
 	void MarkDestinationsChanged();
+	void ApplyDestinationOrder();
+	void MoveDestination(const std::string &id, int delta);
+	bool AskDestinationNameAndId(QString &name, QString &id, bool idEditable, const QString &title);
 	void AddDestination();
 	void RenameDestination(const std::string &id);
 	void RemoveDestination(const std::string &id);

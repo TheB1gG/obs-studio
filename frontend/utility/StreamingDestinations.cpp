@@ -12,6 +12,7 @@
 namespace {
 
 constexpr const char *legacy_service_file = "service.json";
+constexpr const char *legacy_encoder_file = "streamEncoder.json";
 constexpr const char *legacy_stream_section = "Stream1";
 constexpr const char *schema_version_key = "schema_version";
 constexpr const char *video_tracks_key = "video_tracks";
@@ -78,6 +79,21 @@ bool ieq(std::string_view a, std::string_view b)
 	}
 	return true;
 }
+
+	/* The bitrate of one video track, from the encoder settings block - the same key the output handler
+	 * reads ("bitrate", see AdvancedOutput.cpp). */
+	long long trackBitrate(obs_data_t *track)
+	{
+		if (!track)
+			return 0;
+
+		OBSDataAutoRelease settings = obs_data_get_obj(track, "settings");
+		if (!settings)
+			return 0;
+
+		const long long value = obs_data_get_int(settings, "bitrate");
+		return value > 0 ? value : 0;
+	}
 
 }  // namespace
 
@@ -239,6 +255,106 @@ StreamingDestination *StreamingDestinations::create(std::string_view base, const
 	if (error)
 		error->clear();
 	return find(dest.id);
+}
+
+bool StreamingDestinations::idTaken(std::string_view id) const
+{
+	return find(id) != nullptr;
+}
+
+bool StreamingDestinations::idUsable(std::string_view id) const
+{
+	return validId(id) && !idTaken(id) && !idRetired(id);
+}
+
+StreamingDestination *StreamingDestinations::createWithId(std::string_view requested_id,
+							 const std::string &display_name, QString *error)
+{
+	if (!idUsable(requested_id)) {
+		if (error)
+			*error = QString("The id '%1' cannot be used: 1-32 characters from a-z, 0-9, '_' or '-', "
+					 "starting with a letter or a digit, and never reused after a destination "
+					 "was removed.")
+					 .arg(QString::fromStdString(std::string(requested_id)));
+		return nullptr;
+	}
+
+	StreamingDestination dest;
+	dest.id = std::string(requested_id);
+	dest.name = display_name.empty() ? dest.id : display_name;
+	dest.enabled = true;
+
+	destinations_.push_back(dest);
+
+	if (error)
+		error->clear();
+	return find(dest.id);
+}
+
+bool StreamingDestinations::reorder(const std::vector<std::string> &ids)
+{
+	list_type reordered;
+	reordered.reserve(destinations_.size());
+
+	for (const auto &id : ids) {
+		StreamingDestination *dest = find(id);
+		if (dest)
+			reordered.push_back(*dest);
+	}
+
+	/* Anything the caller did not mention keeps its place at the end, so a partial list can never drop
+	 * a destination. */
+	for (const auto &dest : destinations_) {
+		auto it = std::find_if(reordered.begin(), reordered.end(),
+				       [&](const StreamingDestination &d) { return d.id == dest.id; });
+		if (it == reordered.end())
+			reordered.push_back(dest);
+	}
+
+	if (reordered.size() != destinations_.size())
+		return false;
+
+	destinations_.swap(reordered);
+	return true;
+}
+
+long long StreamingDestinations::totalVideoBitrateKbps() const
+{
+	long long total = 0;
+
+	for (const auto &dest : destinations_) {
+		bool counted = false;
+
+		OBSDataAutoRelease data =
+			obs_data_create_from_json_file_safe(pathOf(dest.tracksFileName()).u8string().c_str(), "bak");
+		if (data) {
+			OBSDataArrayAutoRelease tracks = obs_data_get_array(data, video_tracks_key);
+			if (tracks) {
+				for (size_t i = 0; i < obs_data_array_count(tracks); i++) {
+					OBSDataAutoRelease track = obs_data_array_item(tracks, i);
+					const long long bitrate = trackBitrate(track);
+					if (bitrate > 0) {
+						total += bitrate;
+						counted = true;
+					}
+				}
+			}
+		}
+
+		/* The destination imported from the single-stream layout still gets its video settings from
+		 * the shared advanced-mode encoder file, so its bitrate has to be read there. */
+		if (!counted && dest.inherits_legacy_section) {
+			OBSDataAutoRelease legacy =
+				obs_data_create_from_json_file_safe(pathOf(legacy_encoder_file).u8string().c_str(), "bak");
+			if (legacy) {
+				const long long bitrate = obs_data_get_int(legacy, "bitrate");
+				if (bitrate > 0)
+					total += bitrate;
+			}
+		}
+	}
+
+	return total;
 }
 
 bool StreamingDestinations::setDisplayName(std::string_view id, const std::string &display_name)

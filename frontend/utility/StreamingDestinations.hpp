@@ -68,13 +68,23 @@ public:
 	static bool validId(std::string_view id);
 	/* "twitch" -> "twitch", or "twitch_2" if taken. Also used to normalise a user-typed name. */
 	std::string makeId(std::string_view base) const;
+	/* Ids handed to the user before they are committed: taken ids (including retired ones) are refused,
+	 * so a stale shared_from can never resolve to a newly created destination (Q22). */
+	bool idTaken(std::string_view id) const;
+	bool idRetired(std::string_view id) const;
+	bool idUsable(std::string_view id) const;
 
 	/* Creates an empty destination (no video tracks yet - a new destination is filled by fetching
-	 * the service's own recommendation, not by copying another destination). Nothing is written until
-	 * Save() is called. */
+	 * the service's own recommendation, not by copying another destination). An empty requested_id
+	 * derives one from the display name. Nothing is written until Save() is called. */
 	StreamingDestination *create(std::string_view base, const std::string &display_name, QString *error);
+	StreamingDestination *createWithId(std::string_view requested_id, const std::string &display_name,
+					   QString *error);
 	bool setDisplayName(std::string_view id, const std::string &display_name);
 	bool setEnabled(std::string_view id, bool enabled);
+	/* Order of the list = order shown in the UI, and "first enabled destination" is what the legacy
+	 * API and the websocket status report (Q42), so reordering is a real feature, not cosmetics. */
+	bool reorder(const std::vector<std::string> &ids);
 	/* Refuses while another destination references this one, so a shared encoder never ends up defined
 	 * by a missing destination. The files are only deleted by the next Save(). */
 	bool destroy(std::string_view id, QString *error);
@@ -89,6 +99,11 @@ public:
 	 * (empty when nothing is configured yet) and the number of video tracks in the JSON file. */
 	std::string serviceDescription(std::string_view id) const;
 	size_t trackCount(std::string_view id) const;
+
+	/* Sum of the per-destination video bitrates, for the upload-capacity line on the page. Read from the
+	 * ini ([Stream-<id>] Keyrate, with the [Stream1] fallback) because that is where the number lives
+	 * until the tracks themselves are stored in the per-destination JSON. */
+	long long totalVideoBitrateKbps() const;
 
 	/* Non-video settings access, with the [Stream1] fallback for the imported destination. */
 	const char *configString(std::string_view id, const char *key, const char *fallback = nullptr) const;
@@ -105,7 +120,6 @@ public:
 
 private:
 	std::vector<std::string> ids() const;
-	bool idRetired(std::string_view id) const;
 	/* Does the tracks file of 'from' reference 'target' (shared_from / copied_from)? */
 	bool references(std::string_view from, std::string_view target) const;
 	void writeTracksFile(const StreamingDestination &dest) const;

@@ -89,16 +89,16 @@
        </item>
        <item>
         <property name="text">
-         <string>Basic.Settings.Stream.Destinations</string>
+         <string>Basic.Settings.Output</string>
         </property>
         <property name="icon">
          <iconset resource="obs.qrc">
-          <normaloff>:/settings/images/settings/stream.svg</normaloff>:/settings/images/settings/stream.svg</iconset>
+          <normaloff>:/settings/images/settings/output.svg</normaloff>:/settings/images/settings/output.svg</iconset>
         </property>
        </item>
        <item>
         <property name="text">
-         <string>Basic.Settings.Output</string>
+         <string>Basic.Settings.Stream.Destinations</string>
         </property>
         <property name="icon">
          <iconset resource="obs.qrc">
@@ -2301,9 +2301,6 @@
           </widget>
          </item>
         </layout>
-       </widget>
-       <widget class="QWidget" name="destinationsPage">
-        <layout class="QVBoxLayout" name="destinationsPageLayout"/>
        </widget>
        <widget class="QWidget" name="outputPage">
         <layout class="QVBoxLayout" name="verticalLayout_2">
@@ -6389,6 +6386,9 @@
           </widget>
          </item>
         </layout>
+       </widget>
+       <widget class="QWidget" name="destinationsPage">
+        <layout class="QVBoxLayout" name="destinationsPageLayout"/>
        </widget>
        <widget class="QWidget" name="audioPage">
         <layout class="QVBoxLayout" name="formLayout">

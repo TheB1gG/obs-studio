@@ -3,19 +3,63 @@
 #include <widgets/OBSBasic.hpp>
 
 #include <QCheckBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFormLayout>
 #include <QGridLayout>
+#include <QGraphicsOpacityEffect>
 #include <QGroupBox>
 #include <QHBoxLayout>
-#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
+#include <QListWidgetItem>
 #include <QPushButton>
-#include <QScrollArea>
+#include <QRegularExpression>
+#include <QRegularExpressionValidator>
+#include <QSharedPointer>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 
-/* Build the widgets of the destinations page inside the page that the .ui provides. The blocks
- * themselves are created in code because their number is whatever the profile has. */
+#include <algorithm>
+#include <functional>
+
+namespace {
+
+/* The destinations are shown as one block per destination inside a QListWidget, because that gives
+ * drag-to-reorder (InternalMove) for free: the item carries the destination id in Qt::UserRole, so the
+ * visual order can be written back to the model after a drop. The up/down buttons do the same thing
+ * without a mouse, which QListWidget dragging cannot offer. */
+class DestinationListWidget : public QListWidget {
+public:
+	using QListWidget::QListWidget;
+
+	std::function<void()> reordered;
+
+protected:
+	void dropEvent(QDropEvent *event) override
+	{
+		QListWidget::dropEvent(event);
+		if (reordered)
+			reordered();
+	}
+};
+
+/* A disabled destination stays fully interactive (its buttons must still work), so it is dimmed with an
+ * opacity effect instead of setEnabled(false). */
+void DimBlockIfNeeded(QWidget *block, bool dim)
+{
+	if (!dim && !block->graphicsEffect())
+		return;
+
+	auto effect = new QGraphicsOpacityEffect(block);
+	effect->setOpacity(dim ? 0.55 : 1.0);
+	block->setGraphicsEffect(effect);
+}
+
+}  // namespace
+
 void OBSBasicSettings::SetupDestinationsPage()
 {
 	destinationsPageLayout = ui->destinationsPageLayout;
@@ -24,26 +68,33 @@ void OBSBasicSettings::SetupDestinationsPage()
 	intro->setWordWrap(true);
 	destinationsPageLayout->addWidget(intro);
 
-	destinationsScrollArea = new QScrollArea;
-	destinationsScrollArea->setWidgetResizable(true);
-	destinationsScrollArea->setFrameShape(QFrame::NoFrame);
-
-	destinationsListBody = new QWidget;
-	destinationsListLayout = new QVBoxLayout(destinationsListBody);
-
 	destinationsEmptyLabel = new QLabel(QTStr("Basic.Settings.Stream.Destinations.Empty"));
 	destinationsEmptyLabel->setWordWrap(true);
-	destinationsListLayout->addWidget(destinationsEmptyLabel);
-	destinationsListLayout->addStretch();
+	destinationsEmptyLabel->setAlignment(Qt::AlignCenter);
+	destinationsPageLayout->addWidget(destinationsEmptyLabel);
 
-	destinationsScrollArea->setWidget(destinationsListBody);
-	destinationsPageLayout->addWidget(destinationsScrollArea, 1);
+	auto list = new DestinationListWidget;
+	list->setFrameShape(QFrame::NoFrame);
+	list->setResizeMode(QListWidget::Adjust);
+	list->setSpacing(6);
+	list->setSelectionMode(QAbstractItemView::SingleSelection);
+	list->setDragDropMode(QAbstractItemView::InternalMove);
+	list->setDefaultDropAction(Qt::MoveAction);
+	list->reordered = [this]() {
+		/* Still inside the view's own move handling here: rebuilding destroys the items the view is
+		 * working with, so it has to wait for the next event-loop turn. */
+		QTimer::singleShot(0, this, [this]() { ApplyDestinationOrder(); });
+	};
+	destinationsList = list;
+	destinationsPageLayout->addWidget(list, 1);
 
 	auto bar = new QHBoxLayout;
 	addDestinationButton = new QPushButton(QTStr("Basic.Settings.Stream.Destinations.Add"));
 	connect(addDestinationButton, &QPushButton::clicked, this, &OBSBasicSettings::AddDestination);
 	bar->addWidget(addDestinationButton);
 	bar->addStretch();
+	destinationsTotalBitrateLabel = new QLabel;
+	bar->addWidget(destinationsTotalBitrateLabel);
 	destinationsPageLayout->addLayout(bar);
 
 	LoadDestinationsSettings();
@@ -52,30 +103,38 @@ void OBSBasicSettings::SetupDestinationsPage()
 
 void OBSBasicSettings::RebuildDestinationBlocks()
 {
-	if (!destinationsListLayout)
+	if (!destinationsList)
 		return;
 
-	for (QPointer<QWidget> &block : destinationBlocks) {
-		if (block) {
-			/* hide + remove first, deleteLater second: a rebuild can be triggered from a slot of
-			 * one of these very widgets, so deleting it right there would be a use-after-free. */
-			block->hide();
-			destinationsListLayout->removeWidget(block);
-			block->deleteLater();
-		}
-	}
-	destinationBlocks.clear();
+	destinationsList->clear();
 
 	StreamingDestinations &destinations = destinationEdits;
-	const auto &list = destinations.destinations();
+	const auto list = destinations.destinations();
+	const int count = static_cast<int>(list.size());
 
-	for (const StreamingDestination &dest : list) {
+	for (int index = 0; index < count; index++) {
+		const StreamingDestination &dest = list[index];
 		const std::string id = dest.id;
+
+		auto item = new QListWidgetItem(destinationsList);
+		item->setData(Qt::UserRole, QString::fromStdString(id));
 
 		auto group = new QGroupBox;
 		auto groupLayout = new QVBoxLayout(group);
 
 		auto header = new QHBoxLayout;
+
+		auto moveUp = new QToolButton;
+		moveUp->setArrowType(Qt::UpArrow);
+		moveUp->setToolTip(QTStr("Basic.Settings.Stream.Destinations.MoveUp"));
+		moveUp->setEnabled(index > 0);
+		connect(moveUp, &QToolButton::clicked, this, [this, id]() { MoveDestination(id, -1); });
+
+		auto moveDown = new QToolButton;
+		moveDown->setArrowType(Qt::DownArrow);
+		moveDown->setToolTip(QTStr("Basic.Settings.Stream.Destinations.MoveDown"));
+		moveDown->setEnabled(index + 1 < count);
+		connect(moveDown, &QToolButton::clicked, this, [this, id]() { MoveDestination(id, 1); });
 
 		auto toggle = new QToolButton;
 		toggle->setCheckable(true);
@@ -88,8 +147,8 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		titleFont.setBold(true);
 		title->setFont(titleFont);
 
-		auto idLabel = new QLabel(QTStr("Basic.Settings.Stream.Destinations.Id")
-						   .arg(QString::fromStdString(dest.id)));
+		auto idLabel = new QLabel(
+			QTStr("Basic.Settings.Stream.Destinations.Id").arg(QString::fromStdString(dest.id)));
 
 		auto enable = new QCheckBox(QTStr("Basic.Settings.Stream.Destinations.Enable"));
 		enable->setChecked(dest.enabled);
@@ -104,6 +163,8 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		auto removeButton = new QPushButton(QTStr("Basic.Settings.Stream.Destinations.Remove"));
 		connect(removeButton, &QPushButton::clicked, this, [this, id]() { RemoveDestination(id); });
 
+		header->addWidget(moveUp);
+		header->addWidget(moveDown);
 		header->addWidget(toggle);
 		header->addWidget(title);
 		header->addWidget(idLabel);
@@ -112,6 +173,7 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		header->addWidget(renameButton);
 		header->addWidget(removeButton);
 		groupLayout->addLayout(header);
+
 		auto body = new QWidget;
 		auto bodyLayout = new QGridLayout(body);
 		bodyLayout->setContentsMargins(0, 0, 0, 0);
@@ -138,8 +200,8 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		addInfo(QTStr("Basic.Settings.Stream.Destinations.Recording"),
 			QTStr("Basic.Settings.Stream.Destinations.Recording.Session"));
 
-		/* Offered, not wired yet: the fetch needs the per-destination service object that comes
-		 * with the engine step. Keeping the button here makes the intended flow visible. */
+		/* Offered, not wired yet: the fetch needs the per-destination service object the engine step
+		 * creates. Keeping the button here makes the intended flow visible. */
 		auto fetchButton = new QPushButton(QTStr("Basic.Settings.Stream.Destinations.Fetch"));
 		fetchButton->setEnabled(false);
 		fetchButton->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Fetch.Pending"));
@@ -148,27 +210,80 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		groupLayout->addWidget(body);
 
 		connect(toggle, &QToolButton::toggled, body, &QWidget::setVisible);
-		connect(toggle, &QToolButton::toggled, group, [toggle](bool on) {
-			toggle->setArrowType(on ? Qt::DownArrow : Qt::RightArrow);
-		});
+		connect(toggle, &QToolButton::toggled, group,
+			[toggle](bool on) { toggle->setArrowType(on ? Qt::DownArrow : Qt::RightArrow); });
 
-		/* The layout ends with a stretch item; blocks go in before it so the list stays top-aligned. */
-		destinationsListLayout->insertWidget(destinationsListLayout->count() - 1, group);
-		destinationBlocks.push_back(group);
+		DimBlockIfNeeded(group, !dest.enabled);
+
+		item->setSizeHint(group->sizeHint());
+		destinationsList->setItemWidget(item, group);
 	}
 
 	if (destinationsEmptyLabel)
 		destinationsEmptyLabel->setVisible(list.empty());
+
+	if (destinationsTotalBitrateLabel) {
+		const long long total = destinations.totalVideoBitrateKbps();
+		destinationsTotalBitrateLabel->setText(
+			total > 0 ? QTStr("Basic.Settings.Stream.Destinations.TotalBitrate").arg(total)
+				: QTStr("Basic.Settings.Stream.Destinations.TotalBitrate.None"));
+	}
 }
 
-/* Structural edits only touch the dialog's copy of the list; Apply/OK decides whether they reach the
- * profile (SaveDestinationsSettings, called by SaveSettings) or are dropped, exactly like the other
- * pages. The blocks are rebuilt immediately so the change is visible before applying. */
+/* The order of the list is not cosmetic: the first enabled destination is what the legacy streaming API
+ * reports (Q42), so both the drag and the buttons have to write it back to the model. */
+void OBSBasicSettings::ApplyDestinationOrder()
+{
+	if (!destinationsList)
+		return;
+
+	std::vector<std::string> order;
+	for (int i = 0; i < destinationsList->count(); i++) {
+		auto item = destinationsList->item(i);
+		if (item)
+			order.push_back(item->data(Qt::UserRole).toString().toStdString());
+	}
+
+	if (order.size() != static_cast<size_t>(destinationsList->count()))
+		return;
+
+	if (destinationEdits.reorder(order))
+		MarkDestinationsChanged();
+}
+
+void OBSBasicSettings::MoveDestination(const std::string &id, int delta)
+{
+	std::vector<std::string> order;
+	for (const auto &dest : destinationEdits.destinations())
+		order.push_back(dest.id);
+
+	const auto it = std::find(order.begin(), order.end(), id);
+	if (it == order.end())
+		return;
+
+	const auto from = static_cast<long>(it - order.begin());
+	const auto to = from + delta;
+	if (to < 0 || static_cast<size_t>(to) >= order.size())
+		return;
+
+	const std::string moved = order[static_cast<size_t>(from)];
+	order.erase(order.begin() + from);
+	order.insert(order.begin() + to, moved);
+
+	if (destinationEdits.reorder(order))
+		MarkDestinationsChanged();
+}
+
+/* Structural edits only touch the dialog's copy: Apply/OK commits it through SaveDestinationsSettings,
+ * Cancel drops it - exactly like every other page of this dialog. */
 void OBSBasicSettings::MarkDestinationsChanged()
 {
 	destinationsChanged = true;
 	EnableApplyButton(true);
-	RebuildDestinationBlocks();
+
+	/* The rebuild destroys the widgets that may have triggered this very call (the enable checkbox, a
+	 * move button), so it runs on the next event-loop turn. */
+	QTimer::singleShot(0, this, [this]() { RebuildDestinationBlocks(); });
 }
 
 void OBSBasicSettings::LoadDestinationsSettings()
@@ -189,23 +304,78 @@ void OBSBasicSettings::SaveDestinationsSettings()
 	main->Destinations() = destinationEdits;
 }
 
+/* Name plus id in one dialog. The id is editable when adding (it is what the user will see in file names
+ * and in shared_from references, so it is worth letting them choose it) and read-only when renaming,
+ * because an id that other destinations reference must never change underneath them (Q22). */
+bool OBSBasicSettings::AskDestinationNameAndId(QString &name, QString &id, bool idEditable, const QString &title)
+{
+	QDialog dialog(this);
+	dialog.setWindowTitle(title);
+
+	auto form = new QFormLayout(&dialog);
+	auto nameEdit = new QLineEdit(name, &dialog);
+	auto idEdit = new QLineEdit(id, &dialog);
+
+	idEdit->setMaxLength(32);
+	idEdit->setReadOnly(!idEditable);
+	idEdit->setValidator(new QRegularExpressionValidator(QRegularExpression("[a-z0-9_-]*"), &dialog));
+
+	auto hint = new QLabel(QTStr(idEditable ? "Basic.Settings.Stream.Destinations.Id.Help"
+					       : "Basic.Settings.Stream.Destinations.Id.Fixed"),
+			       &dialog);
+	hint->setWordWrap(true);
+
+	auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, Qt::Horizontal, &dialog);
+	connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+	connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+	form->addRow(QTStr("Basic.Settings.Stream.Destinations.Add.Name"), nameEdit);
+	form->addRow(QTStr("Basic.Settings.Stream.Destinations.Id.Label"), idEdit);
+	form->addRow(hint);
+	form->addRow(buttons);
+
+	/* Suggest an id while the name is typed, and stop suggesting as soon as the user touches the id
+	 * field themselves. */
+	auto idTouched = QSharedPointer<bool>::create(!id.isEmpty());
+	connect(idEdit, &QLineEdit::textEdited, this, [idTouched](const QString &) { *idTouched = true; });
+	connect(nameEdit, &QLineEdit::textEdited, this, [this, nameEdit, idEdit, idTouched](const QString &) {
+		if (*idTouched)
+			return;
+		const std::string suggestion = destinationEdits.makeId(nameEdit->text().trimmed().toStdString());
+		idEdit->setText(QString::fromStdString(suggestion));
+	});
+
+	if (dialog.exec() != QDialog::Accepted)
+		return false;
+
+	name = nameEdit->text().trimmed();
+	id = idEdit->text().trimmed();
+	return true;
+}
+
 void OBSBasicSettings::AddDestination()
 {
-	bool ok = false;
-	const QString text = QInputDialog::getText(this, QTStr("Basic.Settings.Stream.Destinations.Add"),
-						   QTStr("Basic.Settings.Stream.Destinations.Add.Name"),
-						   QLineEdit::Normal, QString(), &ok);
-	if (!ok)
+	QString name = QString();
+	QString id = QString();
+	if (!AskDestinationNameAndId(name, id, true, QTStr("Basic.Settings.Stream.Destinations.Add")))
 		return;
 
-	const QString name = text.trimmed();
+	if (name.isEmpty() && id.isEmpty())
+		return;
 	if (name.isEmpty())
-		return;
+		name = id;
 
-	const std::string typed = name.toStdString();
-	StreamingDestination *dest = destinationEdits.create(typed, typed, nullptr);
-	if (!dest)
+	QString error;
+	StreamingDestination *dest = nullptr;
+	if (id.isEmpty())
+		dest = destinationEdits.create(name.toStdString(), name.toStdString(), &error);
+	else
+		dest = destinationEdits.createWithId(id.toStdString(), name.toStdString(), &error);
+
+	if (!dest) {
+		OBSMessageBox::warning(this, QTStr("Basic.Settings.Stream.Destinations.Add"), error);
 		return;
+	}
 
 	blog(LOG_INFO, "Added streaming destination '%s' (id '%s')", dest->name.c_str(), dest->id.c_str());
 	MarkDestinationsChanged();
@@ -217,18 +387,16 @@ void OBSBasicSettings::RenameDestination(const std::string &id)
 	if (!dest)
 		return;
 
-	bool ok = false;
-	const QString text = QInputDialog::getText(this, QTStr("Basic.Settings.Stream.Destinations.Rename"),
-						   QTStr("Basic.Settings.Stream.Destinations.Add.Name"),
-						   QLineEdit::Normal, QString::fromStdString(dest->name), &ok);
-	if (!ok)
+	QString name = QString::fromStdString(dest->name);
+	QString fixedId = QString::fromStdString(dest->id);
+	if (!AskDestinationNameAndId(name, fixedId, false, QTStr("Basic.Settings.Stream.Destinations.Rename")))
 		return;
 
-	const QString name = text.trimmed();
-	if (name.isEmpty() || name.toStdString() == dest->name)
+	const QString trimmed = name.trimmed();
+	if (trimmed.isEmpty() || trimmed.toStdString() == dest->name)
 		return;
 
-	destinationEdits.setDisplayName(id, name.toStdString());
+	destinationEdits.setDisplayName(id, trimmed.toStdString());
 	MarkDestinationsChanged();
 }
 
@@ -255,3 +423,4 @@ void OBSBasicSettings::RemoveDestination(const std::string &id)
 	blog(LOG_INFO, "Removed streaming destination '%s'", QT_TO_UTF8(name));
 	MarkDestinationsChanged();
 }
+
