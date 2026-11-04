@@ -78,6 +78,11 @@ void OBSBasic::StartStreaming()
 		sysTrayStream->setText("Basic.Main.PreparingStream");
 	}
 
+	if (StreamDestinationRuntime *runtime = CurrentRuntime()) {
+		runtime->state = StreamDestinationRuntime::State::Preparing;
+		runtime->reconnectAttempt = 0;
+	}
+
 	auto finish_stream_setup = [&](bool setupStreamingResult) {
 		if (!setupStreamingResult) {
 			DisplayStreamStartError();
@@ -97,6 +102,9 @@ void OBSBasic::StartStreaming()
 			DisplayStreamStartError();
 			return;
 		}
+
+		if (StreamDestinationRuntime *runtime = CurrentRuntime())
+			runtime->state = StreamDestinationRuntime::State::Connecting;
 
 		if (autoStartBroadcast) {
 			emit BroadcastStreamStarted(autoStopBroadcast);
@@ -244,6 +252,9 @@ void OBSBasic::StreamDelayStarting(int sec)
 {
 	emit StreamingStarted(true);
 
+	if (StreamDestinationRuntime *runtime = CurrentRuntime())
+		runtime->state = StreamDestinationRuntime::State::DelayStarting;
+
 	if (sysTrayStream) {
 		sysTrayStream->setText(QTStr("Basic.Main.StopStreaming"));
 		sysTrayStream->setEnabled(true);
@@ -258,6 +269,9 @@ void OBSBasic::StreamDelayStopping(int sec)
 {
 	emit StreamingStopped(true);
 
+	if (StreamDestinationRuntime *runtime = CurrentRuntime())
+		runtime->state = StreamDestinationRuntime::State::DelayStopping;
+
 	if (sysTrayStream) {
 		sysTrayStream->setText(QTStr("Basic.Main.StartStreaming"));
 		sysTrayStream->setEnabled(true);
@@ -271,6 +285,13 @@ void OBSBasic::StreamDelayStopping(int sec)
 void OBSBasic::StreamingStart()
 {
 	emit StreamingStarted();
+
+	if (StreamDestinationRuntime *runtime = CurrentRuntime()) {
+		runtime->state = StreamDestinationRuntime::State::Live;
+		runtime->output = outputHandler->StreamingOutput();
+		blog(LOG_INFO, "Streaming destination '%s' is live (%zu of %zu enabled destinations up)",
+		     runtime->name.c_str(), LiveDestinationCount(), EnabledDestinationCount());
+	}
 	OBSOutputAutoRelease output = obs_frontend_get_streaming_output();
 	ui->statusbar->StreamStarted(output);
 
@@ -308,6 +329,9 @@ void OBSBasic::StreamingStart()
 void OBSBasic::StreamStopping()
 {
 	emit StreamingStopping();
+
+	if (StreamDestinationRuntime *runtime = CurrentRuntime())
+		runtime->state = StreamDestinationRuntime::State::Stopping;
 
 	if (sysTrayStream)
 		sysTrayStream->setText(QTStr("Basic.Main.StoppingStreaming"));
@@ -388,6 +412,20 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 	if (sysTrayStream) {
 		sysTrayStream->setText(QTStr("Basic.Main.StartStreaming"));
 		sysTrayStream->setEnabled(true);
+	}
+
+	if (StreamDestinationRuntime *runtime = CurrentRuntime()) {
+		const char *previousState = runtime->stateName();
+		runtime->state = StreamDestinationRuntime::State::Stopped;
+		runtime->output = nullptr;
+		runtime->service = nullptr;
+		runtime->encoderGroupId.clear();
+		if (should_reconnect)
+			runtime->reconnectAttempt++;
+		else
+			runtime->reconnectAttempt = 0;
+		blog(LOG_INFO, "Streaming destination '%s' stopped after %s (%zu of %zu enabled destinations up)",
+		     runtime->name.c_str(), previousState, LiveDestinationCount(), EnabledDestinationCount());
 	}
 
 	streamingStopping = false;

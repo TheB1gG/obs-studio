@@ -58,7 +58,7 @@ void DimBlockIfNeeded(QWidget *block, bool dim)
 	block->setGraphicsEffect(effect);
 }
 
-}  // namespace
+} // namespace
 
 void OBSBasicSettings::SetupDestinationsPage()
 {
@@ -147,8 +147,8 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		titleFont.setBold(true);
 		title->setFont(titleFont);
 
-		auto idLabel = new QLabel(
-			QTStr("Basic.Settings.Stream.Destinations.Id").arg(QString::fromStdString(dest.id)));
+		auto idLabel =
+			new QLabel(QTStr("Basic.Settings.Stream.Destinations.Id").arg(QString::fromStdString(dest.id)));
 
 		auto enable = new QCheckBox(QTStr("Basic.Settings.Stream.Destinations.Enable"));
 		enable->setChecked(dest.enabled);
@@ -226,7 +226,7 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		const long long total = destinations.totalVideoBitrateKbps();
 		destinationsTotalBitrateLabel->setText(
 			total > 0 ? QTStr("Basic.Settings.Stream.Destinations.TotalBitrate").arg(total)
-				: QTStr("Basic.Settings.Stream.Destinations.TotalBitrate.None"));
+				  : QTStr("Basic.Settings.Stream.Destinations.TotalBitrate.None"));
 	}
 }
 
@@ -302,6 +302,9 @@ void OBSBasicSettings::SaveDestinationsSettings()
 	 * the rest of the application looking at the previous list. The changed flag itself is cleared by
 	 * ClearChanged() in the caller, like every other page. */
 	main->Destinations() = destinationEdits;
+
+	/* Keep the runtime mirror (slice 2a) in step with the list that was just committed. */
+	main->RefreshStreamRuntimes();
 }
 
 /* Name plus id in one dialog. The id is editable when adding (it is what the user will see in file names
@@ -321,7 +324,7 @@ bool OBSBasicSettings::AskDestinationNameAndId(QString &name, QString &id, bool 
 	idEdit->setValidator(new QRegularExpressionValidator(QRegularExpression("[a-z0-9_-]*"), &dialog));
 
 	auto hint = new QLabel(QTStr(idEditable ? "Basic.Settings.Stream.Destinations.Id.Help"
-					       : "Basic.Settings.Stream.Destinations.Id.Fixed"),
+						: "Basic.Settings.Stream.Destinations.Id.Fixed"),
 			       &dialog);
 	hint->setWordWrap(true);
 
@@ -423,4 +426,3 @@ void OBSBasicSettings::RemoveDestination(const std::string &id)
 	blog(LOG_INFO, "Removed streaming destination '%s'", QT_TO_UTF8(name));
 	MarkDestinationsChanged();
 }
-

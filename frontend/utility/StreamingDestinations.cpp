@@ -38,7 +38,9 @@ std::vector<std::string> splitList(const char *value)
 			comma = text.size();
 
 		std::string item = text.substr(pos, comma - pos);
-		const auto not_space = [](unsigned char c) { return std::isspace(c) == 0; };
+		const auto not_space = [](unsigned char c) {
+			return std::isspace(c) == 0;
+		};
 		item.erase(item.begin(), std::find_if(item.begin(), item.end(), not_space));
 		item.erase(std::find_if(item.rbegin(), item.rend(), not_space).base(), item.end());
 		if (!item.empty())
@@ -80,22 +82,22 @@ bool ieq(std::string_view a, std::string_view b)
 	return true;
 }
 
-	/* The bitrate of one video track, from the encoder settings block - the same key the output handler
+/* The bitrate of one video track, from the encoder settings block - the same key the output handler
 	 * reads ("bitrate", see AdvancedOutput.cpp). */
-	long long trackBitrate(obs_data_t *track)
-	{
-		if (!track)
-			return 0;
+long long trackBitrate(obs_data_t *track)
+{
+	if (!track)
+		return 0;
 
-		OBSDataAutoRelease settings = obs_data_get_obj(track, "settings");
-		if (!settings)
-			return 0;
+	OBSDataAutoRelease settings = obs_data_get_obj(track, "settings");
+	if (!settings)
+		return 0;
 
-		const long long value = obs_data_get_int(settings, "bitrate");
-		return value > 0 ? value : 0;
-	}
+	const long long value = obs_data_get_int(settings, "bitrate");
+	return value > 0 ? value : 0;
+}
 
-}  // namespace
+} // namespace
 
 std::string StreamingDestination::serviceFileName() const
 {
@@ -148,8 +150,8 @@ void StreamingDestinations::Load(config_t *profile_config, const std::filesystem
 		const char *name = config_get_string(config_, section.c_str(), name_key);
 		dest.name = (name && *name) ? name : id;
 		dest.enabled = config_has_user_value(config_, section.c_str(), enabled_key)
-				   ? config_get_bool(config_, section.c_str(), enabled_key)
-				   : true;
+				       ? config_get_bool(config_, section.c_str(), enabled_key)
+				       : true;
 		dest.inherits_legacy_section = config_has_user_value(config_, section.c_str(), inherits_key);
 
 		destinations_.push_back(std::move(dest));
@@ -189,14 +191,14 @@ bool StreamingDestinations::Save()
 StreamingDestination *StreamingDestinations::find(std::string_view id)
 {
 	auto it = std::find_if(destinations_.begin(), destinations_.end(),
-			     [&](const StreamingDestination &d) { return d.id == id; });
+			       [&](const StreamingDestination &d) { return d.id == id; });
 	return it == destinations_.end() ? nullptr : &*it;
 }
 
 const StreamingDestination *StreamingDestinations::find(std::string_view id) const
 {
 	auto it = std::find_if(destinations_.begin(), destinations_.end(),
-			     [&](const StreamingDestination &d) { return d.id == id; });
+			       [&](const StreamingDestination &d) { return d.id == id; });
 	return it == destinations_.end() ? nullptr : &*it;
 }
 
@@ -243,7 +245,7 @@ std::string StreamingDestinations::makeId(std::string_view base) const
 }
 
 StreamingDestination *StreamingDestinations::create(std::string_view base, const std::string &display_name,
-						   QString *error)
+						    QString *error)
 {
 	StreamingDestination dest;
 	dest.id = makeId(base);
@@ -268,7 +270,7 @@ bool StreamingDestinations::idUsable(std::string_view id) const
 }
 
 StreamingDestination *StreamingDestinations::createWithId(std::string_view requested_id,
-							 const std::string &display_name, QString *error)
+							  const std::string &display_name, QString *error)
 {
 	if (!idUsable(requested_id)) {
 		if (error)
@@ -344,8 +346,8 @@ long long StreamingDestinations::totalVideoBitrateKbps() const
 		/* The destination imported from the single-stream layout still gets its video settings from
 		 * the shared advanced-mode encoder file, so its bitrate has to be read there. */
 		if (!counted && dest.inherits_legacy_section) {
-			OBSDataAutoRelease legacy =
-				obs_data_create_from_json_file_safe(pathOf(legacy_encoder_file).u8string().c_str(), "bak");
+			OBSDataAutoRelease legacy = obs_data_create_from_json_file_safe(
+				pathOf(legacy_encoder_file).u8string().c_str(), "bak");
 			if (legacy) {
 				const long long bitrate = obs_data_get_int(legacy, "bitrate");
 				if (bitrate > 0)
@@ -387,10 +389,11 @@ bool StreamingDestinations::destroy(std::string_view id, QString *error)
 			continue;
 		if (references(other.id, dest->id)) {
 			if (error)
-				*error = QString("Destination '%1' still sends a track shared from '%2'. Give it its own "
-						 "track before removing '%2'.")
-						 .arg(QString::fromStdString(other.name))
-						 .arg(QString::fromStdString(dest->name));
+				*error =
+					QString("Destination '%1' still sends a track shared from '%2'. Give it its own "
+						"track before removing '%2'.")
+						.arg(QString::fromStdString(other.name))
+						.arg(QString::fromStdString(dest->name));
 			return false;
 		}
 	}
@@ -401,7 +404,7 @@ bool StreamingDestinations::destroy(std::string_view id, QString *error)
 	retired_.push_back(dest->id);
 	pending_removals_.push_back(dest->id);
 	destinations_.erase(std::find_if(destinations_.begin(), destinations_.end(),
-					[&](const StreamingDestination &d) { return d.id == dest->id; }));
+					 [&](const StreamingDestination &d) { return d.id == dest->id; }));
 	return true;
 }
 
@@ -413,7 +416,7 @@ bool StreamingDestinations::sameServiceAndKey(const char *service_type, obs_data
 
 	const std::string key = getString(settings, "key");
 	if (key.empty())
-		return false;  /* nothing configured yet, so nothing can collide */
+		return false; /* nothing configured yet, so nothing can collide */
 
 	const std::string provider = getString(settings, "service");
 	const std::string server = getString(settings, "server");
@@ -484,7 +487,7 @@ std::string StreamingDestinations::serviceDescription(std::string_view id) const
 		out += " / " + server;
 
 	if (!getString(settings, "key").empty())
-		out += " (*)";  /* (*) = a stream key is set */
+		out += " (*)"; /* (*) = a stream key is set */
 
 	return out;
 }
@@ -673,7 +676,8 @@ void StreamingDestinations::writeTracksFile(const StreamingDestination &dest) co
 	obs_data_set_array(data, video_tracks_key, tracks);
 
 	if (!obs_data_save_json_safe(data, path.u8string().c_str(), "tmp", "bak"))
-		blog(LOG_WARNING, "Failed to create the video-track file of streaming destination '%s'", dest.id.c_str());
+		blog(LOG_WARNING, "Failed to create the video-track file of streaming destination '%s'",
+		     dest.id.c_str());
 }
 
 void StreamingDestinations::removeDestinationFiles(const StreamingDestination &dest) const

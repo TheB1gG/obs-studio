@@ -25,6 +25,7 @@
 #include <utility/BasicOutputHandler.hpp>
 #include <utility/OBSCanvas.hpp>
 #include <utility/StreamingDestinations.hpp>
+#include <utility/StreamDestinationRuntime.hpp>
 #include <utility/VCamConfig.hpp>
 #include <utility/platform.hpp>
 #include <utility/undo_stack.hpp>
@@ -283,6 +284,10 @@ private:
 	/* The streaming destinations of the active profile (service + video tracks per destination).
 	 * Reloaded whenever a profile is activated; see LoadStreamingDestinations(). */
 	StreamingDestinations streamingDestinations;
+
+	/* Runtime mirror of that list - one entry per destination, or one unnamed entry while the profile
+	 * still uses the single-stream layout. See frontend/utility/StreamDestinationRuntime.hpp. */
+	std::vector<StreamDestinationRuntime> streamRuntimes;
 
 	QScopedPointer<QThread> patronJsonThread;
 	std::string patronJson;
@@ -908,6 +913,10 @@ public:
 	const OBSProfile &GetCurrentProfile() const;
 	void LoadStreamingDestinations();
 	StreamingDestinations &Destinations() { return streamingDestinations; }
+	void RefreshStreamRuntimes();
+	StreamDestinationRuntime *CurrentRuntime();
+	size_t LiveDestinationCount() const;
+	size_t EnabledDestinationCount() const;
 
 	std::optional<OBSProfile> GetProfileByName(const std::string &profileName) const;
 	std::optional<OBSProfile> GetProfileByDirectoryName(const std::string &directoryName) const;
