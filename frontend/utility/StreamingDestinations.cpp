@@ -575,6 +575,43 @@ void StreamingDestinations::setConfigInt(std::string_view id, const char *key, l
 	const std::string section = dest->iniSection();
 	config_set_int(config_, section.c_str(), key, value);
 }
+
+StreamingDestinations::ReconnectPolicy StreamingDestinations::reconnectPolicy(std::string_view id) const
+{
+	ReconnectPolicy policy = profileReconnectPolicy();
+
+	policy.overridden = configBool(id, reconnect_override_key, false);
+	if (policy.overridden) {
+		policy.enabled = configBool(id, reconnect_key, policy.enabled);
+		policy.retryDelaySec = configInt(id, retry_delay_key, policy.retryDelaySec);
+		policy.maxRetries = configInt(id, max_retries_key, policy.maxRetries);
+	}
+	return policy;
+}
+
+StreamingDestinations::ReconnectPolicy StreamingDestinations::profileReconnectPolicy() const
+{
+	ReconnectPolicy policy;
+	if (!config_)
+		return policy;
+
+	policy.enabled = config_get_bool(config_, profile_section, reconnect_key);
+	policy.retryDelaySec = config_get_int(config_, profile_section, retry_delay_key);
+	policy.maxRetries = config_get_int(config_, profile_section, max_retries_key);
+	return policy;
+}
+
+void StreamingDestinations::setReconnectPolicy(std::string_view id, const ReconnectPolicy &policy)
+{
+	setConfigBool(id, reconnect_override_key, policy.overridden);
+	if (!policy.overridden)
+		return;
+
+	setConfigBool(id, reconnect_key, policy.enabled);
+	setConfigInt(id, retry_delay_key, policy.retryDelaySec);
+	setConfigInt(id, max_retries_key, policy.maxRetries);
+}
+
 bool StreamingDestinations::importLegacyLayout()
 {
 	if (!config_ || dir_.empty() || !destinations_.empty())

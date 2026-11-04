@@ -1391,6 +1391,7 @@ public slots:
 	void StopStreaming();
 	void ForceStopStreaming();
 	void KillStreamingUngracefully();
+	void ApplyDestinationReconnect(bool &enabled, int &retryDelaySec, int &maxRetries);
 
 	void StreamDelayStarting(int sec);
 	void StreamDelayStopping(int sec);

@@ -46,6 +46,28 @@ void OBSBasic::DisplayStreamStartError()
 	QMessageBox::critical(this, QTStr("Output.StartStreamFailed"), message);
 }
 
+/* Q14: a destination may use its own reconnect values instead of the profile-wide ones. The session runs a
+ * single stream today, and that stream belongs to the first enabled destination (Q42), so this is the entry
+ * consulted here; the multi-destination loop will call the same resolver once per destination. Without an
+ * override the values are left exactly as they were read from [Output], which is what keeps the behaviour of
+ * a profile with the flag off identical. */
+void OBSBasic::ApplyDestinationReconnect(bool &enabled, int &retryDelaySec, int &maxRetries)
+{
+	StreamDestinationRuntime *runtime = CurrentRuntime();
+	if (!runtime || runtime->id.empty())
+		return;
+
+	const StreamingDestinations::ReconnectPolicy policy = streamingDestinations.reconnectPolicy(runtime->id);
+	if (!policy.overridden)
+		return;
+
+	enabled = policy.enabled;
+	retryDelaySec = static_cast<int>(policy.retryDelaySec);
+	maxRetries = static_cast<int>(policy.maxRetries);
+	blog(LOG_INFO, "streaming destination '%s' overrides reconnect: %s, retry every %d s, %d attempts",
+	     runtime->name.c_str(), enabled ? "enabled" : "disabled", retryDelaySec, maxRetries);
+}
+
 void OBSBasic::StartStreaming()
 {
 	if (outputHandler->StreamingActive())
