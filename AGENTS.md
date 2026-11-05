@@ -61,39 +61,37 @@ Rules:
   has permanent value), no commented-out code, no unrelated formatting changes.
 - Revert cosmetic-only edits to files that are not part of the fix.
 
-## 3. CI gate via test tags (bulk, not per commit)
+## 3. CI gate via test tags (start it early, never idle on it)
 
-Per-commit test-tag gates are too slow for the current feature work - the Ubuntu
-runner alone often needs 30+ minutes. The agreed workflow is:
+Program-code changes must pass a test-tag build before they go to the branch, but the runners are slow
+(Windows x64 ~20 min, arm64 longer, Ubuntu 30-45 min). Waiting for a runner while doing nothing is wasted
+time - that is explicitly forbidden. The workflow:
 
-1. Commit locally, verify with the local build plus the local harnesses
-   (`scratch/tmp/*.ps1`), then push the branch freely. No test tag per commit.
-2. Record every pushed commit that has not been through CI in
-   `scratch/plan/CI-PENDING.md` - one line each: short sha + subject + which
-   platforms (if any) were verified.
-3. When a batch of commits has piled up, or before anything is released, run a
-   single test tag over the **newest** commit of the batch:
-   - Tag schema: `test-<problem-or-feature>` - the name of the problem being
-     fixed or the feature being added, **no whitespace** (use hyphens), e.g.
-     `test-qsv-hevc-444-colors`.
+1. Commit locally and verify with the local build plus the local harnesses (`scratch/tmp/*.ps1`).
+2. Push the test tag for that commit immediately - the tag run is what gates the code:
+   - Tag schema: `test-<problem-or-feature>` - the name of the problem being fixed or the feature being
+     added, **no whitespace** (use hyphens), e.g. `test-qsv-hevc-444-colors`.
    - `git tag test-... <commit> && git push origin test-...`
-   - The tag builds the commit it points at, which contains all earlier pushed
-     commits, so one run gates the whole batch.
-4. Read the individual jobs of the "Test Tag" workflow
-   (`.github/workflows/test-tag.yaml`), not the run conclusion: Windows x64 and
-   arm64 must be green. macOS runners are offline (cancelled jobs are the
-   expected state - do not edit the workflow). Ubuntu is slow; skipping it needs
-   the user's go-ahead, and the CI-PENDING entry must then say so. A red Ubuntu
-   job whose **Build** step passed but whose **Package** step died on a network
-   error is an infrastructure flake, not a code failure (see scratch/plan/CI-NOTES.md).
-5. After the batch is green, push (if anything is still unpushed) and delete the
-   test tag again (mandatory - test tags are a temporary CI gate, not part of
-   the release history):
-   `git tag -d test-... && git push origin --delete test-...`
-   Then remove the covered commits from `scratch/plan/CI-PENDING.md`.
+3. Keep working on the next increment right away. Do not wait for the run.
+4. The gated commit stays **local** until its gate is green. Poll the run between other steps
+   (`scratch/tmp/gate-check.ps1`, `scratch/tmp/gate-wait.ps1`; token comes from the credential manager,
+   see `scratch/plan/CI-NOTES.md`).
+5. When the gate is green: push the branch, delete the tag (mandatory - test tags are a temporary CI gate,
+   not part of the release history), and remove the covered commits from `scratch/plan/CI-PENDING.md`:
+   `git push origin <branch> && git tag -d test-... && git push origin --delete test-...`
+6. Batching: when several commits are queued locally, tag the **newest** one - that build contains all
+   earlier commits, so a single run gates the whole batch, which is then pushed together.
+7. Read the individual jobs of the "Test Tag" workflow (`.github/workflows/test-tag.yaml`), not the run
+   conclusion: Windows x64 and arm64 must be green. macOS runners are offline (cancelled jobs are the
+   expected state - do not edit the workflow). Ubuntu is slow; skipping it needs the user's go-ahead and the
+   CI-PENDING entry must say so. A red Ubuntu job whose **Build** step passed but whose **Package** step died
+   on a network error is an infrastructure flake, not a code failure (see scratch/plan/CI-NOTES.md).
 
-Exception: changes that only touch `.github/workflows` (CI configuration) do not
-change program code and do **not** require the test-tag build gate.
+`scratch/plan/CI-PENDING.md` lists the commits that are committed but not on the branch yet because their
+gate is still running (or went red). Never leave a commit out of it.
+
+Exception: changes that only touch `.github/workflows` (CI configuration) or documentation (`AGENTS.md`) do
+not change program code and do **not** require the test-tag build gate.
 
 ## 4. Launching the local rundir build (Windows, mandatory)
 
