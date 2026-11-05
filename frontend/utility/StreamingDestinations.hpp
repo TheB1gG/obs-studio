@@ -130,6 +130,10 @@ public:
 	 * for a service that uses one. */
 	long long streamingAudioKbps(std::string_view id) const;
 	std::string serviceType(std::string_view id) const;
+	/* The service object of a destination, built from its own service_<id>.json. Every destination needs
+	 * one to start, and the settings page needs one before the engine exists. Null when the file is
+	 * missing or its service type is not registered. */
+	OBSService createService(std::string_view id) const;
 
 	/* Resolved reconnect policy of one destination: the profile-wide [Output] values, replaced by the
 	 * destination's own while ReconnectOverride is set. The defaults are registered by OBSBasic on every

@@ -810,6 +810,7 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	if (obs_output_start(streamOutput)) {
 		if (multitrackVideo && multitrackVideoActive)
 			multitrackVideo->StartedStreaming();
+		StartExtraDestinations();
 		return true;
 	}
 
@@ -827,6 +828,157 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	blog(LOG_WARNING, "Stream output type '%s' failed to start!%s%s", type, hasLastError ? "  Last Error: " : "",
 	     hasLastError ? error : "");
 	return false;
+}
+
+/* Signal handlers of the extra destination outputs. They only report the destination they belong to: a
+ * failed connection takes nothing else with it (Q13), and the primary destination's own signals still drive
+ * the session UI exactly as before. */
+static void ExtraStreamStarted(void *data, calldata_t *)
+{
+	auto *stream = static_cast<AdvancedOutput::ExtraDestinationStream *>(data);
+	stream->live = true;
+	stream->owner->NoteDestinationStarted(stream->id);
+}
+
+static void ExtraStreamStopped(void *data, calldata_t *params)
+{
+	auto *stream = static_cast<AdvancedOutput::ExtraDestinationStream *>(data);
+	long long code = 0;
+	calldata_get_int(params, "code", &code);
+	stream->live = false;
+	stream->owner->NoteDestinationStopped(stream->id, code);
+}
+
+/* Slice 2b, first step of the fan-out: start the destinations after the first one.
+ *
+ * The first enabled destination is served by the existing streamOutput path (Q42), so it is skipped here.
+ * Every remaining one gets its own output object on top of the same encoders: the media is encoded once and
+ * uploaded once per connection, which is what the feature is for.
+ *
+ * A destination that cannot be started is logged and left out; it never undoes the session, and the session's
+ * own UI state still follows the first destination until that state becomes a live-destination count in the
+ * next step of this slice. */
+void AdvancedOutput::StartExtraDestinations()
+{
+	/* Nothing of the previous session may linger: stop and disconnect before the entries are dropped,
+	 * because their signal handlers point at the entries themselves. */
+	for (auto &previous : extraStreams) {
+		if (previous->output && obs_output_active(previous->output))
+			obs_output_force_stop(previous->output);
+		previous->startSignal.Disconnect();
+		previous->stopSignal.Disconnect();
+		previous->output = nullptr;
+	}
+	extraStreams.clear();
+
+	const StreamingDestinations &destinations = main->Destinations();
+	bool firstEnabled = true;
+
+	for (const auto &dest : destinations.destinations()) {
+		if (!dest.enabled)
+			continue;
+		if (firstEnabled) {
+			firstEnabled = false;
+			continue;
+		}
+
+		OBSService service = destinations.createService(dest.id);
+		if (!service)
+			continue;
+
+		const char *type = GetStreamOutputType(service);
+		if (!type) {
+			blog(LOG_WARNING, "streaming destination '%s': no streaming output supports this service",
+			     dest.id.c_str());
+			continue;
+		}
+
+		auto stream = std::make_unique<ExtraDestinationStream>();
+		stream->id = dest.id;
+		stream->name = dest.name;
+		stream->owner = main;
+		stream->service = service;
+		stream->output = obs_output_create(type, dest.id.c_str(), nullptr, nullptr);
+		if (!stream->output) {
+			blog(LOG_WARNING, "streaming destination '%s': could not create an output of type '%s'",
+			     dest.id.c_str(), type);
+			continue;
+		}
+
+		/* Same encoder attachment as the primary output, so all destinations send identical media. */
+		obs_output_set_video_encoder(stream->output, videoStreaming);
+		if (!allowsMultiTrack()) {
+			obs_output_set_audio_encoder(stream->output, streamAudioEnc, 0);
+		} else {
+			int multiTrackAudioMixes =
+				config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes");
+			int idx = 0;
+			for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
+				if ((multiTrackAudioMixes & (1 << i)) != 0)
+					obs_output_set_audio_encoder(stream->output, streamTrack[i], idx++);
+			}
+		}
+
+		obs_output_set_service(stream->output, stream->service);
+
+		OBSDataAutoRelease settings = obs_data_create();
+		obs_data_set_string(settings, "bind_ip", config_get_string(main->Config(), "Output", "BindIP"));
+		obs_data_set_string(settings, "ip_family", config_get_string(main->Config(), "Output", "IPFamily"));
+#ifdef _WIN32
+		obs_data_set_bool(settings, "new_socket_loop_enabled",
+				  config_get_bool(main->Config(), "Output", "NewSocketLoopEnable"));
+		obs_data_set_bool(settings, "low_latency_mode_enabled",
+				  config_get_bool(main->Config(), "Output", "LowLatencyEnable"));
+#endif
+		obs_data_set_bool(settings, "dyn_bitrate", config_get_bool(main->Config(), "Output", "DynamicBitrate"));
+		obs_output_update(stream->output, settings);
+
+		/* Q14: its own reconnect values. The attempt counter, the backoff and the retry thread are per
+		 * output inside libobs already, so one destination can never spend another's attempts. */
+		const auto policy = destinations.reconnectPolicy(dest.id);
+		obs_output_set_reconnect_settings(stream->output,
+						  policy.enabled ? static_cast<int>(policy.maxRetries) : 0,
+						  static_cast<int>(policy.retryDelaySec));
+
+		stream->startSignal.Connect(obs_output_get_signal_handler(stream->output), "start", ExtraStreamStarted,
+					    stream.get());
+		stream->stopSignal.Connect(obs_output_get_signal_handler(stream->output), "stop", ExtraStreamStopped,
+					   stream.get());
+
+		if (!obs_output_start(stream->output)) {
+			const char *error = obs_output_get_last_error(stream->output);
+			blog(LOG_WARNING, "streaming destination '%s' failed to start%s%s", dest.name.c_str(),
+			     (error && *error) ? ": " : "", (error && *error) ? error : "");
+			stream->startSignal.Disconnect();
+			stream->stopSignal.Disconnect();
+			continue;
+		}
+
+		if (StreamDestinationRuntime *runtime = main->RuntimeForId(dest.id)) {
+			runtime->output = stream->output;
+			runtime->service = stream->service;
+			/* The output starts asynchronously, like the primary one: the connection attempt is what
+			 * decides between "live" and another "stopped". */
+			runtime->state = StreamDestinationRuntime::State::Connecting;
+		}
+
+		extraStreams.push_back(std::move(stream));
+	}
+
+	if (!extraStreams.empty())
+		blog(LOG_INFO, "streaming session: %zu additional destination output(s) started", extraStreams.size());
+}
+
+void AdvancedOutput::StopExtraDestinations(bool force)
+{
+	for (auto &stream : extraStreams) {
+		if (!stream->output)
+			continue;
+		if (force)
+			obs_output_force_stop(stream->output);
+		else
+			obs_output_stop(stream->output);
+	}
 }
 
 bool AdvancedOutput::StartRecording()
@@ -972,6 +1124,10 @@ bool AdvancedOutput::StartReplayBuffer()
 
 void AdvancedOutput::StopStreaming(bool force)
 {
+	/* The extras go down with the session: while the session state is still the primary destination's,
+	 * a session stop means every connection stops (Q42). */
+	StopExtraDestinations(force);
+
 	auto output = StreamingOutput();
 	if (force && output)
 		obs_output_force_stop(output);

@@ -2,6 +2,10 @@
 
 #include "BasicOutputHandler.hpp"
 
+#include <memory>
+#include <string>
+#include <vector>
+
 struct AdvancedOutput : BasicOutputHandler {
 	OBSEncoder streamAudioEnc;
 	OBSEncoder streamArchiveEnc;
@@ -44,4 +48,24 @@ struct AdvancedOutput : BasicOutputHandler {
 	virtual bool RecordingActive() const override;
 	virtual bool ReplayBufferActive() const override;
 	bool allowsMultiTrack();
+
+	/* Slice 2b: the destinations after the first one. The first enabled destination keeps using the
+	 * existing streamOutput, which leaves the recording, delay and multitrack-video code untouched while
+	 * the loop is built; every other destination gets its own output object on top of the same encoders.
+	 * Sharing an encoder costs upload, not encoding, so this is about the connection, not the media. */
+	struct ExtraDestinationStream {
+		std::string id;
+		std::string name;
+		OBSBasic *owner = nullptr;
+		OBSService service;
+		OBSOutput output; /* released when the entry goes away */
+		OBSSignal stopSignal;
+		OBSSignal startSignal;
+		bool live = false;
+	};
+
+	std::vector<std::unique_ptr<ExtraDestinationStream>> extraStreams;
+
+	void StartExtraDestinations();
+	void StopExtraDestinations(bool force);
 };

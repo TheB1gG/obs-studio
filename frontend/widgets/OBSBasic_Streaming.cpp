@@ -68,6 +68,35 @@ void OBSBasic::ApplyDestinationReconnect(bool &enabled, int &retryDelaySec, int 
 	     runtime->name.c_str(), enabled ? "enabled" : "disabled", retryDelaySec, maxRetries);
 }
 
+/* Slice 2b: the outputs of the extra destinations report through these. The runtime model and the log know
+ * how many connections are up; the session UI still follows the first destination until its state becomes a
+ * live-destination count, which is the step that also brings the per-destination status display and the
+ * failure toasts of Q13. */
+void OBSBasic::NoteDestinationStarted(const std::string &id)
+{
+	StreamDestinationRuntime *runtime = RuntimeForId(id);
+	if (!runtime)
+		return;
+
+	runtime->state = StreamDestinationRuntime::State::Live;
+	blog(LOG_INFO, "streaming destination '%s' is live (%zu of %zu enabled destinations up)", runtime->name.c_str(),
+	     LiveDestinationCount(), EnabledDestinationCount());
+}
+
+void OBSBasic::NoteDestinationStopped(const std::string &id, long long code)
+{
+	StreamDestinationRuntime *runtime = RuntimeForId(id);
+	if (!runtime)
+		return;
+
+	const char *previousState = runtime->stateName();
+	runtime->state = StreamDestinationRuntime::State::Stopped;
+	runtime->output = nullptr;
+	runtime->service = nullptr;
+	blog(LOG_INFO, "streaming destination '%s' stopped after %s, code %lld (%zu of %zu enabled destinations up)",
+	     runtime->name.c_str(), previousState, code, LiveDestinationCount(), EnabledDestinationCount());
+}
+
 void OBSBasic::StartStreaming()
 {
 	if (outputHandler->StreamingActive())

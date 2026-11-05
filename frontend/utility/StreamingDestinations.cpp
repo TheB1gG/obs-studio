@@ -341,11 +341,11 @@ StreamingDestinations::BitrateBreakdown StreamingDestinations::bitrateFor(std::s
 		}
 	}
 
-	/* No video tracks of its own: the destination imported from the single-stream layout still takes its
-	 * video settings from the shared advanced-mode encoder file, and a profile in simple mode keeps the
-	 * bitrate in [SimpleOutput]. Both are marked, so the page does not present them as per-destination
-	 * values. */
-	if (info.videoKbps == 0 && dest->inherits_legacy_section) {
+	/* No video tracks of its own: the destination is fed by the shared stream encoder, so its video
+	 * bitrate is the one in the advanced-mode encoder file - whether it came from the single-stream
+	 * import or was added later. A profile still in simple mode keeps the bitrate in [SimpleOutput].
+	 * Both are marked, so the page does not present them as per-destination values. */
+	if (info.videoKbps == 0) {
 		OBSDataAutoRelease legacy =
 			obs_data_create_from_json_file_safe(pathOf(legacy_encoder_file).u8string().c_str(), "bak");
 		if (legacy) {
@@ -425,7 +425,39 @@ std::string StreamingDestinations::serviceType(std::string_view id) const
 
 	OBSDataAutoRelease data =
 		obs_data_create_from_json_file_safe(pathOf(dest->serviceFileName()).u8string().c_str(), "bak");
-	return data ? obs_data_get_string(data, "service") : std::string();
+	if (!data)
+		return std::string();
+
+	/* Same key and default as OBSBasic::LoadService() uses for the profile's own service file. */
+	obs_data_set_default_string(data, "type", "rtmp_common");
+	return obs_data_get_string(data, "type");
+}
+
+OBSService StreamingDestinations::createService(std::string_view id) const
+{
+	const StreamingDestination *dest = find(id);
+	if (!dest)
+		return OBSService();
+
+	OBSDataAutoRelease data =
+		obs_data_create_from_json_file_safe(pathOf(dest->serviceFileName()).u8string().c_str(), "bak");
+	if (!data) {
+		blog(LOG_WARNING, "streaming destination '%.*s' has no readable service file",
+		     static_cast<int>(id.size()), id.data());
+		return OBSService();
+	}
+
+	obs_data_set_default_string(data, "type", "rtmp_common");
+	const char *type = obs_data_get_string(data, "type");
+
+	OBSDataAutoRelease settings = obs_data_get_obj(data, "settings");
+	OBSDataAutoRelease hotkeys = obs_data_get_obj(data, "hotkeys");
+
+	OBSService service(obs_service_create(type, "stream_destination", settings, hotkeys));
+	if (!service)
+		blog(LOG_WARNING, "streaming destination '%.*s': service type '%s' is not available",
+		     static_cast<int>(id.size()), id.data(), type ? type : "");
+	return service;
 }
 
 bool StreamingDestinations::advancedMode() const

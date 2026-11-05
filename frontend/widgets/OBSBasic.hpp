@@ -915,6 +915,10 @@ public:
 	StreamingDestinations &Destinations() { return streamingDestinations; }
 	void RefreshStreamRuntimes();
 	StreamDestinationRuntime *CurrentRuntime();
+	/* The runtime entry of one destination id, used by the per-destination outputs. */
+	StreamDestinationRuntime *RuntimeForId(std::string_view id);
+	void NoteDestinationStarted(const std::string &id);
+	void NoteDestinationStopped(const std::string &id, long long code);
 	size_t LiveDestinationCount() const;
 	size_t EnabledDestinationCount() const;
 

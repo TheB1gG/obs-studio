@@ -843,6 +843,15 @@ StreamDestinationRuntime *OBSBasic::CurrentRuntime()
 	return streamRuntimes.empty() ? nullptr : &streamRuntimes.front();
 }
 
+StreamDestinationRuntime *OBSBasic::RuntimeForId(std::string_view id)
+{
+	for (auto &runtime : streamRuntimes) {
+		if (runtime.id == id)
+			return &runtime;
+	}
+	return nullptr;
+}
+
 size_t OBSBasic::LiveDestinationCount() const
 {
 	size_t count = 0;
