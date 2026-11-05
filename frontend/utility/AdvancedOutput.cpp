@@ -885,7 +885,22 @@ void AdvancedOutput::StartExtraDestinations()
 	}
 	extraStreams.clear();
 
+	/* A multitrack-video session is not a plain RTMP output: it owns its own output object, its own ingest
+	 * and its own key exchange. Attaching a plain RTMP connection beside it would send the same media to a
+	 * second place that never agreed to receive it, so such a session stays with its first destination and
+	 * says why. Each destination getting its own multitrack-video session is the Go-Live step of slice 2d. */
+	if (multitrackVideo && multitrackVideoActive) {
+		const size_t skipped = main->EnabledDestinationCount() - 1;
+		if (skipped > 0)
+			blog(LOG_INFO,
+			     "streaming session is a multitrack-video session: %zu other destination(s) not "
+			     "started - one multitrack-video session per destination comes with a later step",
+			     skipped);
+		return;
+	}
+
 	const StreamingDestinations &destinations = main->Destinations();
+	size_t started = 0;
 	bool firstEnabled = true;
 
 	for (const auto &dest : destinations.destinations()) {
@@ -896,107 +911,210 @@ void AdvancedOutput::StartExtraDestinations()
 			continue;
 		}
 
-		/* A destination that never gets an output running must not stay counted as one of the session's
-		 * connections: OBSBasic asks how many runtime entries are still running to decide whether the
-		 * session goes on, so a failed one has to be put back to "stopped" here. */
-		auto markNotStarted = [&dest, this](const char *why) {
-			blog(LOG_WARNING, "streaming destination '%s' not started: %s", dest.name.c_str(), why);
-			if (StreamDestinationRuntime *runtime = main->RuntimeForId(dest.id)) {
-				runtime->state = StreamDestinationRuntime::State::Stopped;
-				runtime->output = nullptr;
-				runtime->service = nullptr;
-				runtime->encoderGroupId.clear();
-			}
-		};
-
-		OBSService service = destinations.createService(dest.id);
-		if (!service) {
-			markNotStarted("its service could not be created");
-			continue;
-		}
-
-		const char *type = GetStreamOutputType(service);
-		if (!type) {
-			markNotStarted("no streaming output supports this service");
-			continue;
-		}
-
-		auto stream = std::make_unique<ExtraDestinationStream>();
-		stream->id = dest.id;
-		stream->name = dest.name;
-		stream->owner = main;
-		stream->service = service;
-		stream->output = obs_output_create(type, dest.id.c_str(), nullptr, nullptr);
-		if (!stream->output) {
-			markNotStarted("no output object could be created");
-			continue;
-		}
-
-		/* Same encoder attachment as the primary output, so all destinations send identical media. */
-		obs_output_set_video_encoder(stream->output, videoStreaming);
-		if (!allowsMultiTrack()) {
-			obs_output_set_audio_encoder(stream->output, streamAudioEnc, 0);
-		} else {
-			int multiTrackAudioMixes =
-				config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes");
-			int idx = 0;
-			for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
-				if ((multiTrackAudioMixes & (1 << i)) != 0)
-					obs_output_set_audio_encoder(stream->output, streamTrack[i], idx++);
-			}
-		}
-
-		obs_output_set_service(stream->output, stream->service);
-
-		OBSDataAutoRelease settings = obs_data_create();
-		obs_data_set_string(settings, "bind_ip", config_get_string(main->Config(), "Output", "BindIP"));
-		obs_data_set_string(settings, "ip_family", config_get_string(main->Config(), "Output", "IPFamily"));
-#ifdef _WIN32
-		obs_data_set_bool(settings, "new_socket_loop_enabled",
-				  config_get_bool(main->Config(), "Output", "NewSocketLoopEnable"));
-		obs_data_set_bool(settings, "low_latency_mode_enabled",
-				  config_get_bool(main->Config(), "Output", "LowLatencyEnable"));
-#endif
-		obs_data_set_bool(settings, "dyn_bitrate", config_get_bool(main->Config(), "Output", "DynamicBitrate"));
-		obs_output_update(stream->output, settings);
-
-		/* Q14: its own reconnect values. The attempt counter, the backoff and the retry thread are per
-		 * output inside libobs already, so one destination can never spend another's attempts. */
-		const auto policy = destinations.reconnectPolicy(dest.id);
-		obs_output_set_reconnect_settings(stream->output,
-						  policy.enabled ? static_cast<int>(policy.maxRetries) : 0,
-						  static_cast<int>(policy.retryDelaySec));
-
-		stream->startSignal.Connect(obs_output_get_signal_handler(stream->output), "start", ExtraStreamStarted,
-					    stream.get());
-		stream->stopSignal.Connect(obs_output_get_signal_handler(stream->output), "stop", ExtraStreamStopped,
-					   stream.get());
-
-		if (!obs_output_start(stream->output)) {
-			const char *error = obs_output_get_last_error(stream->output);
-			const string reason = string("the output refused to start") +
-					      ((error && *error) ? (": " + string(error)) : string());
-			stream->startSignal.Disconnect();
-			stream->stopSignal.Disconnect();
-			markNotStarted(reason.c_str());
-			continue;
-		}
-
-		stream->stopPending = true;
-
-		if (StreamDestinationRuntime *runtime = main->RuntimeForId(dest.id)) {
-			runtime->output = stream->output;
-			runtime->service = stream->service;
-			/* The output starts asynchronously, like the primary one: the connection attempt is what
-			 * decides between "live" and another "stopped". */
-			runtime->state = StreamDestinationRuntime::State::Connecting;
-		}
-
-		extraStreams.push_back(std::move(stream));
+		if (StartDestinationOutput(dest))
+			started++;
 	}
 
-	if (!extraStreams.empty())
-		blog(LOG_INFO, "streaming session: %zu additional destination output(s) started", extraStreams.size());
+	if (started)
+		blog(LOG_INFO, "streaming session: %zu additional destination output(s) started", started);
+}
+
+/* Everything one destination needs to become a connection of this session: its service object, an output on
+ * the shared encoders, the profile's socket settings, its own reconnect values and its signal handlers. Used
+ * by the fan-out and by restarting a single destination (the restart action of Q13), because both need the
+ * same thing - one connection for one destination. */
+bool AdvancedOutput::StartDestinationOutput(const StreamingDestination &dest)
+{
+	const StreamingDestinations &destinations = main->Destinations();
+
+	/* A destination that never gets an output running must not stay counted as one of the session's
+	 * connections: OBSBasic asks how many runtime entries are still running to decide whether the
+	 * session goes on, so a failed one has to be put back to "stopped" here. */
+	auto markNotStarted = [&dest, this](const char *why) {
+		blog(LOG_WARNING, "streaming destination '%s' not started: %s", dest.name.c_str(), why);
+		if (StreamDestinationRuntime *runtime = main->RuntimeForId(dest.id)) {
+			runtime->state = StreamDestinationRuntime::State::Stopped;
+			runtime->output = nullptr;
+			runtime->service = nullptr;
+			runtime->encoderGroupId.clear();
+		}
+	};
+
+	OBSService service = destinations.createService(dest.id);
+	if (!service) {
+		markNotStarted("its service could not be created");
+		return false;
+	}
+
+	const char *type = GetStreamOutputType(service);
+	if (!type) {
+		markNotStarted("no streaming output supports this service");
+		return false;
+	}
+
+	auto stream = std::make_unique<ExtraDestinationStream>();
+	stream->id = dest.id;
+	stream->name = dest.name;
+	stream->owner = main;
+	stream->service = service;
+	stream->output = obs_output_create(type, dest.id.c_str(), nullptr, nullptr);
+	if (!stream->output) {
+		markNotStarted("no output object could be created");
+		return false;
+	}
+
+	/* Same encoder attachment as the primary output, so all destinations send identical media. */
+	obs_output_set_video_encoder(stream->output, videoStreaming);
+	if (!allowsMultiTrack()) {
+		obs_output_set_audio_encoder(stream->output, streamAudioEnc, 0);
+	} else {
+		int multiTrackAudioMixes = config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes");
+		int idx = 0;
+		for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
+			if ((multiTrackAudioMixes & (1 << i)) != 0)
+				obs_output_set_audio_encoder(stream->output, streamTrack[i], idx++);
+		}
+	}
+
+	obs_output_set_service(stream->output, stream->service);
+
+	OBSDataAutoRelease settings = obs_data_create();
+	obs_data_set_string(settings, "bind_ip", config_get_string(main->Config(), "Output", "BindIP"));
+	obs_data_set_string(settings, "ip_family", config_get_string(main->Config(), "Output", "IPFamily"));
+#ifdef _WIN32
+	obs_data_set_bool(settings, "new_socket_loop_enabled",
+			  config_get_bool(main->Config(), "Output", "NewSocketLoopEnable"));
+	obs_data_set_bool(settings, "low_latency_mode_enabled",
+			  config_get_bool(main->Config(), "Output", "LowLatencyEnable"));
+#endif
+	obs_data_set_bool(settings, "dyn_bitrate", config_get_bool(main->Config(), "Output", "DynamicBitrate"));
+
+	/* Q12/Q15: every connection carries its own delay state - libobs keeps delay_active and
+	 * delay_restart_refs per output - so the profile's delay settings apply to each of them individually
+	 * and one destination counting down never drags the others with it. Per-destination delay *values*
+	 * are the next step; the separation of the state is already here. */
+	const bool useDelay = config_get_bool(main->Config(), "Output", "DelayEnable");
+	const int delaySec = static_cast<int>(config_get_int(main->Config(), "Output", "DelaySec"));
+	const bool preserveDelay = config_get_bool(main->Config(), "Output", "DelayPreserve");
+	obs_output_set_delay(stream->output, useDelay ? delaySec : 0, preserveDelay ? OBS_OUTPUT_DELAY_PRESERVE : 0);
+
+	obs_output_update(stream->output, settings);
+
+	/* Q14: its own reconnect values. The attempt counter, the backoff and the retry thread are per
+		 * output inside libobs already, so one destination can never spend another's attempts. */
+	const auto policy = destinations.reconnectPolicy(dest.id);
+	obs_output_set_reconnect_settings(stream->output, policy.enabled ? static_cast<int>(policy.maxRetries) : 0,
+					  static_cast<int>(policy.retryDelaySec));
+
+	stream->startSignal.Connect(obs_output_get_signal_handler(stream->output), "start", ExtraStreamStarted,
+				    stream.get());
+	stream->stopSignal.Connect(obs_output_get_signal_handler(stream->output), "stop", ExtraStreamStopped,
+				   stream.get());
+
+	if (!obs_output_start(stream->output)) {
+		const char *error = obs_output_get_last_error(stream->output);
+		const string reason =
+			string("the output refused to start") + ((error && *error) ? (": " + string(error)) : string());
+		stream->startSignal.Disconnect();
+		stream->stopSignal.Disconnect();
+		markNotStarted(reason.c_str());
+		return false;
+	}
+
+	stream->stopPending = true;
+
+	if (StreamDestinationRuntime *runtime = main->RuntimeForId(dest.id)) {
+		runtime->output = stream->output;
+		runtime->service = stream->service;
+		/* The output starts asynchronously, like the primary one: the connection attempt is what
+		 * decides between "live" and another "stopped". */
+		runtime->state = StreamDestinationRuntime::State::Connecting;
+	}
+
+	extraStreams.push_back(std::move(stream));
+	return true;
+}
+
+/* Restart one destination of a session that is still running (the restart action of Q13). */
+bool AdvancedOutput::StartDestination(std::string_view id)
+{
+	/* The first enabled destination is served by this handler's own output (Q42), so restarting it means
+	 * starting that output again: its service, encoders and settings are still what the session was built
+	 * with, and the output object survives because the session did not end (ResetStreaming() only runs
+	 * when it does). */
+	const StreamDestinationRuntime *primary = main->PrimaryRuntime();
+	if (primary && primary->id == id) {
+		OBSOutputAutoRelease output = StreamingOutput();
+		if (!output) {
+			blog(LOG_WARNING,
+			     "streaming destination '%s' cannot be restarted: its output went away "
+			     "with the session",
+			     primary->name.c_str());
+			return false;
+		}
+		if (obs_output_active(output)) {
+			blog(LOG_INFO, "streaming destination '%s' is already connecting or uploading",
+			     primary->name.c_str());
+			return true;
+		}
+		if (StreamDestinationRuntime *runtime = main->RuntimeForId(id))
+			runtime->state = StreamDestinationRuntime::State::Connecting;
+		return obs_output_start(output);
+	}
+
+	for (const auto &stream : extraStreams) {
+		if (stream->id == id && stream->stopPending) {
+			blog(LOG_INFO, "streaming destination '%s' is already connecting or uploading",
+			     stream->name.c_str());
+			return true;
+		}
+	}
+
+	const StreamingDestination *dest = main->Destinations().find(id);
+	if (!dest) {
+		blog(LOG_WARNING, "cannot restart streaming destination: this profile does not list '%.*s'",
+		     (int)id.size(), id.data());
+		return false;
+	}
+	if (!dest->enabled) {
+		blog(LOG_INFO, "streaming destination '%s' is not enabled, so it does not get a connection back",
+		     dest->name.c_str());
+		return false;
+	}
+
+	blog(LOG_INFO, "restarting the connection of streaming destination '%s'", dest->name.c_str());
+	return StartDestinationOutput(*dest);
+}
+
+void AdvancedOutput::StopDestination(std::string_view id, bool force)
+{
+	/* One connection of the session, leaving the others uploading (Q13). */
+	for (auto &stream : extraStreams) {
+		if (stream->id != id)
+			continue;
+		if (!stream->output || !stream->stopPending)
+			return;
+		if (force)
+			obs_output_force_stop(stream->output);
+		else
+			obs_output_stop(stream->output);
+		return;
+	}
+
+	const StreamDestinationRuntime *primary = main->PrimaryRuntime();
+	if (primary && primary->id == id) {
+		OBSOutputAutoRelease output = StreamingOutput();
+		if (!output)
+			return;
+		if (force)
+			obs_output_force_stop(output);
+		else
+			obs_output_stop(output);
+		return;
+	}
+
+	blog(LOG_WARNING, "streaming destination '%.*s' has no connection of this session to stop", (int)id.size(),
+	     id.data());
 }
 
 size_t AdvancedOutput::ActiveExtraDestinations() const

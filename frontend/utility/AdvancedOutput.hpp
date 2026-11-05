@@ -2,8 +2,11 @@
 
 #include "BasicOutputHandler.hpp"
 
+#include <utility/StreamingDestinations.hpp>
+
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct AdvancedOutput : BasicOutputHandler {
@@ -73,4 +76,13 @@ struct AdvancedOutput : BasicOutputHandler {
 	void StartExtraDestinations();
 	void StopExtraDestinations(bool force) override;
 	size_t ActiveExtraDestinations() const override;
+	/* One connection of the session by destination id: stop it alone, or bring it back while the rest of
+	 * the session keeps running. */
+	void StopDestination(std::string_view id, bool force) override;
+	bool StartDestination(std::string_view id) override;
+
+private:
+	/* Build one destination's output on the shared encoders and start it: the fan-out and the restart of a
+	 * single destination need exactly the same thing. */
+	bool StartDestinationOutput(const StreamingDestination &dest);
 };

@@ -175,8 +175,14 @@ void OBSBasic::StartStreaming()
 			return;
 		}
 
-		if (StreamDestinationRuntime *runtime = CurrentRuntime())
+		if (StreamDestinationRuntime *runtime = CurrentRuntime()) {
 			runtime->state = StreamDestinationRuntime::State::Connecting;
+			/* The first destination is served by the handler's own output (Q42); its runtime entry keeps
+			 * a reference to it so that the per-destination widgets - and the per-destination stop,
+			 * restart and kill - can reach the connection instead of only the extra ones. */
+			runtime->output = outputHandler->StreamingOutput();
+			runtime->service = service;
+		}
 
 		if (autoStartBroadcast) {
 			emit BroadcastStreamStarted(autoStopBroadcast);
@@ -336,6 +342,72 @@ void OBSBasic::KillDestinationUngracefully(std::string id)
 		     runtime->name.c_str());
 		obs_output_force_stop(output);
 	}
+}
+
+/* Per-destination actions for the widgets that show the session (the stats window rows, and later the
+ * hotkeys): one connection stopped on its own, one brought back, and the snapshot both of them render. */
+void OBSBasic::StopDestination(std::string id, bool force)
+{
+	if (!outputHandler)
+		return;
+
+	StreamDestinationRuntime *runtime = id.empty() ? PrimaryRuntime() : RuntimeForId(id);
+	if (!runtime) {
+		blog(LOG_WARNING, "StopDestination: no runtime entry for destination '%s'", id.c_str());
+		return;
+	}
+
+	blog(LOG_INFO, "stopping the connection of streaming destination '%s'%s", runtime->name.c_str(),
+	     force ? " (forced)" : "");
+
+	/* Counting as still running until its own stop signal arrives is what keeps the session alive while the
+	 * other connections are up (Q13) - the transition is reported by the signal, not here. */
+	runtime->state = StreamDestinationRuntime::State::Stopping;
+	outputHandler->StopDestination(runtime->id, force);
+}
+
+bool OBSBasic::RestartDestination(const std::string &id)
+{
+	StreamDestinationRuntime *runtime = id.empty() ? PrimaryRuntime() : RuntimeForId(id);
+	if (!runtime) {
+		blog(LOG_WARNING, "RestartDestination: no runtime entry for destination '%s'", id.c_str());
+		return false;
+	}
+	if (!runtime->enabled) {
+		blog(LOG_INFO, "streaming destination '%s' is disabled, so it does not get a connection back",
+		     runtime->name.c_str());
+		return false;
+	}
+	if (!outputHandler || !outputHandler->StreamingActive()) {
+		/* Nothing of the session is left to attach to: starting again means starting a session, which is
+		 * the normal StartStreaming path with all of its encoder setup. */
+		blog(LOG_INFO, "streaming destination '%s' cannot be restarted on its own: the session has ended",
+		     runtime->name.c_str());
+		return false;
+	}
+
+	return outputHandler->StartDestination(runtime->id);
+}
+
+std::vector<OBSBasic::StreamSessionEntry> OBSBasic::StreamSessionSnapshot() const
+{
+	std::vector<StreamSessionEntry> entries;
+
+	for (const auto &runtime : streamRuntimes) {
+		if (!runtime.enabled || !runtime.isRunning())
+			continue;
+
+		StreamSessionEntry entry;
+		entry.id = runtime.id;
+		entry.name = runtime.name;
+		entry.output = runtime.output;
+		entry.state = runtime.state;
+		entry.reconnectAttempt = runtime.reconnectAttempt;
+		entry.reconnecting = runtime.output ? obs_output_reconnecting(runtime.output) : false;
+		entries.push_back(std::move(entry));
+	}
+
+	return entries;
 }
 
 void OBSBasic::KillStreamingUngracefully()

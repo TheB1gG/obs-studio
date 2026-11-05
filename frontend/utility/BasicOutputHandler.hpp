@@ -6,6 +6,7 @@
 #include <util/dstr.hpp>
 
 #include <future>
+#include <string_view>
 
 #define RTMP_PROTOCOL "rtmp"
 #define SRT_PROTOCOL "srt"
@@ -79,11 +80,16 @@ struct BasicOutputHandler {
 	virtual void StopVirtualCam();
 	virtual bool StreamingActive() const = 0;
 	virtual bool RecordingActive() const = 0;
-	/* Slice 2b: the extra destination outputs of an advanced session. A session is still defined by its
-	 * first destination (Q42), so when that one goes down on its own the rest have to go down with it -
-	 * otherwise the UI says "stopped" while connections are still uploading. */
+	/* Slice 2b: the extra destination outputs of an advanced session. Since Q13 the session is the set of
+	 * its connections, not its first one: a connection that goes down on its own leaves the others
+	 * uploading, and the session ends when the last one does. */
 	virtual void StopExtraDestinations(bool force) { (void)force; }
 	virtual size_t ActiveExtraDestinations() const { return 0; }
+	/* One connection of the session addressed by destination id: stopped on its own, or brought back while
+	 * the rest of the session keeps running (the per-destination stop and restart actions). The defaults
+	 * cover output modes that only ever have the one stream connection. */
+	virtual void StopDestination(std::string_view id, bool force) { (void)id; (void)force; }
+	virtual bool StartDestination(std::string_view id) { (void)id; return false; }
 	virtual bool ReplayBufferActive() const { return false; }
 	virtual bool VirtualCamActive() const;
 

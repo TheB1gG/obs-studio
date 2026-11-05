@@ -933,6 +933,22 @@ public:
 	 * any end-of-stream data, so the ingest sees a hard drop. An empty id means the first destination. The
 	 * session itself comes down through the normal stop path once nothing is left (Q13). */
 	void KillDestinationUngracefully(std::string id = {});
+	/* Stop one connection of the session by destination id, leaving the others uploading (Q13), and bring
+	 * one back while the rest of the session runs (the restart action of a failure notice). */
+	void StopDestination(std::string id, bool force = false);
+	bool RestartDestination(const std::string &id);
+	/* What the widgets that show the session need: one entry per destination that is live or still
+	 * attempting, with its output, its state and its reconnect counter. Copies on purpose - a widget ticks
+	 * on its own and must not hold on to the runtime vector. */
+	struct StreamSessionEntry {
+		std::string id;
+		std::string name;
+		OBSOutput output;
+		StreamDestinationRuntime::State state = StreamDestinationRuntime::State::Stopped;
+		int reconnectAttempt = 0;
+		bool reconnecting = false;
+	};
+	std::vector<StreamSessionEntry> StreamSessionSnapshot() const;
 
 	std::optional<OBSProfile> GetProfileByName(const std::string &profileName) const;
 	std::optional<OBSProfile> GetProfileByDirectoryName(const std::string &directoryName) const;
