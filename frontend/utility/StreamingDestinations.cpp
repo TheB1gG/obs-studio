@@ -320,43 +320,134 @@ bool StreamingDestinations::reorder(const std::vector<std::string> &ids)
 	return true;
 }
 
-long long StreamingDestinations::totalVideoBitrateKbps() const
+StreamingDestinations::BitrateBreakdown StreamingDestinations::bitrateFor(std::string_view id) const
 {
-	long long total = 0;
+	BitrateBreakdown info;
+	const StreamingDestination *dest = find(id);
+	if (!dest)
+		return info;
 
-	for (const auto &dest : destinations_) {
-		bool counted = false;
-
-		OBSDataAutoRelease data =
-			obs_data_create_from_json_file_safe(pathOf(dest.tracksFileName()).u8string().c_str(), "bak");
-		if (data) {
-			OBSDataArrayAutoRelease tracks = obs_data_get_array(data, video_tracks_key);
-			if (tracks) {
-				for (size_t i = 0; i < obs_data_array_count(tracks); i++) {
-					OBSDataAutoRelease track = obs_data_array_item(tracks, i);
-					const long long bitrate = trackBitrate(track);
-					if (bitrate > 0) {
-						total += bitrate;
-						counted = true;
-					}
-				}
-			}
-		}
-
-		/* The destination imported from the single-stream layout still gets its video settings from
-		 * the shared advanced-mode encoder file, so its bitrate has to be read there. */
-		if (!counted && dest.inherits_legacy_section) {
-			OBSDataAutoRelease legacy = obs_data_create_from_json_file_safe(
-				pathOf(legacy_encoder_file).u8string().c_str(), "bak");
-			if (legacy) {
-				const long long bitrate = obs_data_get_int(legacy, "bitrate");
+	OBSDataAutoRelease data =
+		obs_data_create_from_json_file_safe(pathOf(dest->tracksFileName()).u8string().c_str(), "bak");
+	if (data) {
+		OBSDataArrayAutoRelease tracks = obs_data_get_array(data, video_tracks_key);
+		if (tracks) {
+			for (size_t i = 0; i < obs_data_array_count(tracks); i++) {
+				OBSDataAutoRelease track = obs_data_array_item(tracks, i);
+				const long long bitrate = trackBitrate(track);
 				if (bitrate > 0)
-					total += bitrate;
+					info.videoKbps += bitrate;
 			}
 		}
 	}
 
+	/* No video tracks of its own: the destination imported from the single-stream layout still takes its
+	 * video settings from the shared advanced-mode encoder file, and a profile in simple mode keeps the
+	 * bitrate in [SimpleOutput]. Both are marked, so the page does not present them as per-destination
+	 * values. */
+	if (info.videoKbps == 0 && dest->inherits_legacy_section) {
+		OBSDataAutoRelease legacy =
+			obs_data_create_from_json_file_safe(pathOf(legacy_encoder_file).u8string().c_str(), "bak");
+		if (legacy) {
+			const long long bitrate = obs_data_get_int(legacy, "bitrate");
+			if (bitrate > 0) {
+				info.videoKbps = bitrate;
+				info.shared_video = true;
+			}
+		}
+	}
+	if (info.videoKbps == 0 && !advancedMode()) {
+		info.videoKbps = config_get_int(config_, "SimpleOutput", "VBitrate");
+		info.shared_video = info.videoKbps > 0;
+	}
+
+	info.audioKbps = streamingAudioKbps(id);
+	return info;
+}
+
+long long StreamingDestinations::streamingAudioKbps(std::string_view id) const
+{
+	if (!config_)
+		return 0;
+
+	auto mixBitrate = [this](int mix) -> long long {
+		static const char *names[] = {"Track1Bitrate", "Track2Bitrate", "Track3Bitrate",
+					      "Track4Bitrate", "Track5Bitrate", "Track6Bitrate"};
+		if (mix < 1 || mix > 6)
+			return 0;
+		return config_get_int(config_, "AdvOut", names[mix - 1]);
+	};
+
+	/* Mirrors how the streaming output is wired up in AdvancedOutput::SetupStreaming()
+	 * (AdvancedOutput.cpp:334,347-356,733-743): simple mode streams one stereo mix, advanced mode the
+	 * mixes marked in the [AdvOut] StreamMultiTrackAudioMixes bitmask. A service that cannot take
+	 * multitrack audio gets a single mix instead, which is why this number is what a multitrack-capable
+	 * destination uploads - said out loud in the page's tooltip. */
+	if (!advancedMode())
+		return config_get_int(config_, "SimpleOutput", "ABitrate");
+
+	const unsigned mixes = static_cast<unsigned>(config_get_int(config_, "AdvOut", "StreamMultiTrackAudioMixes"));
+	long long total = 0;
+	if (mixes != 0) {
+		for (int mix = 1; mix <= 6; mix++) {
+			if ((mixes & (1u << (mix - 1))) != 0)
+				total += mixBitrate(mix);
+		}
+	} else {
+		total = mixBitrate(static_cast<int>(config_get_int(config_, "AdvOut", "TrackIndex")));
+	}
+
+	/* A VOD track is a second copy of one mix on the same connection, and only the services that support
+	 * it get one. */
+	if (usesVodTrack(id))
+		total += mixBitrate(static_cast<int>(config_get_int(config_, "AdvOut", "VodTrackIndex")));
+
 	return total;
+}
+
+long long StreamingDestinations::totalUploadKbps() const
+{
+	long long total = 0;
+	for (const auto &dest : destinations_) {
+		if (!dest.enabled)
+			continue;
+		const BitrateBreakdown info = bitrateFor(dest.id);
+		total += info.videoKbps + info.audioKbps;
+	}
+	return total;
+}
+
+std::string StreamingDestinations::serviceType(std::string_view id) const
+{
+	const StreamingDestination *dest = find(id);
+	if (!dest)
+		return std::string();
+
+	OBSDataAutoRelease data =
+		obs_data_create_from_json_file_safe(pathOf(dest->serviceFileName()).u8string().c_str(), "bak");
+	return data ? obs_data_get_string(data, "service") : std::string();
+}
+
+bool StreamingDestinations::advancedMode() const
+{
+	const char *mode = config_ ? config_get_string(config_, profile_section, "Mode") : nullptr;
+	return mode && strcmp(mode, "Advanced") == 0;
+}
+
+bool StreamingDestinations::usesVodTrack(std::string_view id) const
+{
+	if (!config_ || !config_get_bool(config_, "AdvOut", "VodTrackEnabled"))
+		return false;
+
+	/* The same service list the output handler checks (ServiceSupportsVodTrack, BasicOutputHandler.hpp);
+	 * duplicated on purpose, because the storage layer must not depend on the output handler. */
+	static const char *vodTrackServices[] = {"Twitch"};
+	const std::string type = serviceType(id);
+	for (const char *service : vodTrackServices) {
+		if (ieq(service, type))
+			return true;
+	}
+	return false;
 }
 
 bool StreamingDestinations::setDisplayName(std::string_view id, const std::string &display_name)

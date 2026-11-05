@@ -197,6 +197,22 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 			tracks == 0 ? QTStr("Basic.Settings.Stream.Destinations.Tracks.None")
 				    : QTStr("Basic.Settings.Stream.Destinations.Tracks.Count").arg(int(tracks)));
 
+		/* What this destination will upload on its own. There is no capacity comparison here on
+		 * purpose: the number is information, not a warning. */
+		const auto bandwidth = destinations.bitrateFor(dest.id);
+		QString bandwidthText;
+		if (bandwidth.videoKbps == 0 && bandwidth.audioKbps == 0) {
+			bandwidthText = QTStr("Basic.Settings.Stream.Destinations.Bitrate.None");
+		} else {
+			bandwidthText = QTStr("Basic.Settings.Stream.Destinations.Bitrate.Value")
+						.arg(bandwidth.videoKbps)
+						.arg(bandwidth.audioKbps)
+						.arg(bandwidth.videoKbps + bandwidth.audioKbps);
+			if (bandwidth.shared_video)
+				bandwidthText += QTStr("Basic.Settings.Stream.Destinations.Bitrate.SharedVideo");
+		}
+		addInfo(QTStr("Basic.Settings.Stream.Destinations.Bitrate"), bandwidthText);
+
 		addInfo(QTStr("Basic.Settings.Stream.Destinations.Recording"),
 			QTStr("Basic.Settings.Stream.Destinations.Recording.Session"));
 
@@ -302,10 +318,12 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		destinationsEmptyLabel->setVisible(list.empty());
 
 	if (destinationsTotalBitrateLabel) {
-		const long long total = destinations.totalVideoBitrateKbps();
+		const long long total = destinations.totalUploadKbps();
 		destinationsTotalBitrateLabel->setText(
-			total > 0 ? QTStr("Basic.Settings.Stream.Destinations.TotalBitrate").arg(total)
-				  : QTStr("Basic.Settings.Stream.Destinations.TotalBitrate.None"));
+			total > 0 ? QTStr("Basic.Settings.Stream.Destinations.TotalUpload").arg(total)
+				  : QTStr("Basic.Settings.Stream.Destinations.TotalUpload.None"));
+		destinationsTotalBitrateLabel->setToolTip(
+			QTStr("Basic.Settings.Stream.Destinations.TotalUpload.ToolTip"));
 	}
 }
 

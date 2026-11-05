@@ -111,10 +111,25 @@ public:
 	std::string serviceDescription(std::string_view id) const;
 	size_t trackCount(std::string_view id) const;
 
-	/* Sum of the per-destination video bitrates, for the upload-capacity line on the page. Read from the
-	 * ini ([Stream-<id>] Keyrate, with the [Stream1] fallback) because that is where the number lives
-	 * until the tracks themselves are stored in the per-destination JSON. */
-	long long totalVideoBitrateKbps() const;
+	/* What one destination puts on the wire, in kbps, so the page can show it. Video comes from the
+	 * destination's own video tracks; the destination imported from the single-stream layout has none of
+	 * its own and gets the number from the shared advanced-mode encoder file, and a profile still in
+	 * simple mode keeps it in [SimpleOutput] - both are reported with shared_video so the value is not
+	 * mistaken for a per-destination setting. Audio is the profile's streaming audio, because
+	 * per-destination audio tracks are not stored yet. Each destination uploads its own copy: sharing an
+	 * encoder saves encoding time, not bandwidth. */
+	struct BitrateBreakdown {
+		long long videoKbps = 0;
+		long long audioKbps = 0;
+		bool shared_video = false;
+	};
+	BitrateBreakdown bitrateFor(std::string_view id) const;
+	/* Sum over the enabled destinations - a disabled destination uploads nothing. */
+	long long totalUploadKbps() const;
+	/* The audio a destination's stream carries: the profile's selected mixes, plus the VOD track copy
+	 * for a service that uses one. */
+	long long streamingAudioKbps(std::string_view id) const;
+	std::string serviceType(std::string_view id) const;
 
 	/* Resolved reconnect policy of one destination: the profile-wide [Output] values, replaced by the
 	 * destination's own while ReconnectOverride is set. The defaults are registered by OBSBasic on every
@@ -145,6 +160,10 @@ public:
 
 private:
 	std::vector<std::string> ids() const;
+	/* Is this profile using advanced output? Decides where the audio bitrates live. */
+	bool advancedMode() const;
+	/* Does this destination's service take the extra VOD audio track? */
+	bool usesVodTrack(std::string_view id) const;
 	/* Does the tracks file of 'from' reference 'target' (shared_from / copied_from)? */
 	bool references(std::string_view from, std::string_view target) const;
 	void writeTracksFile(const StreamingDestination &dest) const;

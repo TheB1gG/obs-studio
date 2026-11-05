@@ -149,6 +149,18 @@ void OBSBasic::StartStreaming()
 #endif
 	};
 
+	/* The first number to look at when a stream is congested. Logged per destination because where the
+	 * value comes from depends on the profile mode and on whether the destination has its own video
+	 * tracks, and that is not visible from the number alone. */
+	for (const auto &destination : streamingDestinations.destinations()) {
+		if (!destination.enabled)
+			continue;
+		const auto bandwidth = streamingDestinations.bitrateFor(destination.id);
+		blog(LOG_INFO, "streaming destination '%s' will upload %lld kbps (video %lld, audio %lld)",
+		     destination.name.c_str(), bandwidth.videoKbps + bandwidth.audioKbps, bandwidth.videoKbps,
+		     bandwidth.audioKbps);
+	}
+
 	setupStreamingGuard = outputHandler->SetupStreaming(service, finish_stream_setup);
 }
 
