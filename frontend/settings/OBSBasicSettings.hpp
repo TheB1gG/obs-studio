@@ -25,6 +25,9 @@
 
 #include <QPointer>
 
+#include <map>
+#include <string>
+
 #define VOLUME_METER_DECAY_FAST 23.53
 #define VOLUME_METER_DECAY_MEDIUM 11.76
 #define VOLUME_METER_DECAY_SLOW 8.57
@@ -33,7 +36,9 @@ class Auth;
 class OBSBasic;
 class OBSHotkeyWidget;
 class OBSPropertiesView;
+class QLabel;
 class QListWidget;
+class QTimer;
 struct FFmpegFormat;
 struct OBSTheme;
 
@@ -103,6 +108,11 @@ private:
 	QPointer<QLabel> destinationsEmptyLabel;
 	QPointer<QLabel> destinationsTotalBitrateLabel;
 	QPointer<QPushButton> addDestinationButton;
+	/* The live state of every destination while a session is running. The blocks are only rebuilt when the
+	 * list changes, so their state labels are remembered here and refreshed on a timer; the state itself stays
+	 * in OBSBasic's runtime entries, this page only reads it. */
+	std::map<std::string, QPointer<QLabel>> destinationStateLabels;
+	QPointer<QTimer> destinationsStateTimer;
 	/* The dialog edits a copy: Apply/OK commits it into OBSBasic and to disk, Cancel drops it. */
 	StreamingDestinations destinationEdits;
 
@@ -210,6 +220,7 @@ private:
 	void LoadDestinationsSettings();
 	void SaveDestinationsSettings();
 	void RebuildDestinationBlocks();
+	void RefreshDestinationStates();
 	void MarkDestinationsChanged();
 	void ApplyDestinationOrder();
 	void MoveDestination(const std::string &id, int delta);

@@ -97,8 +97,16 @@ void OBSBasicSettings::SetupDestinationsPage()
 	bar->addWidget(destinationsTotalBitrateLabel);
 	destinationsPageLayout->addLayout(bar);
 
+	/* While a session is running the page also says what each destination is doing: the state lives in
+	 * OBSBasic's runtime entries and this page only borrows it, so nothing here can change a session. When no
+	 * session is running the state labels stay empty and the page looks exactly like it always did. */
+	destinationsStateTimer = new QTimer(this);
+	connect(destinationsStateTimer, &QTimer::timeout, this, &OBSBasicSettings::RefreshDestinationStates);
+	destinationsStateTimer->start(1000);
+
 	LoadDestinationsSettings();
 	RebuildDestinationBlocks();
+	RefreshDestinationStates();
 }
 
 void OBSBasicSettings::RebuildDestinationBlocks()
@@ -107,6 +115,9 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		return;
 
 	destinationsList->clear();
+	/* The labels of the previous blocks are being deleted with them; only the ids that are still listed get
+	 * remembered again below. */
+	destinationStateLabels.clear();
 
 	StreamingDestinations &destinations = destinationEdits;
 	const auto list = destinations.destinations();
@@ -150,6 +161,11 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		auto idLabel =
 			new QLabel(QTStr("Basic.Settings.Stream.Destinations.Id").arg(QString::fromStdString(dest.id)));
 
+		/* Filled in by RefreshDestinationStates() while a session runs; stays blank otherwise. */
+		auto state = new QLabel;
+		state->setWordWrap(false);
+		destinationStateLabels[id] = state;
+
 		auto enable = new QCheckBox(QTStr("Basic.Settings.Stream.Destinations.Enable"));
 		enable->setChecked(dest.enabled);
 		connect(enable, &QCheckBox::toggled, this, [this, id](bool on) {
@@ -168,6 +184,7 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		header->addWidget(toggle);
 		header->addWidget(title);
 		header->addWidget(idLabel);
+		header->addWidget(state);
 		header->addStretch();
 		header->addWidget(enable);
 		header->addWidget(renameButton);
@@ -522,4 +539,84 @@ void OBSBasicSettings::RemoveDestination(const std::string &id)
 
 	blog(LOG_INFO, "Removed streaming destination '%s'", QT_TO_UTF8(name));
 	MarkDestinationsChanged();
+}
+
+/* What each destination is doing in the running session. The state is read from the runtime entries OBSBasic
+ * keeps for the session, so the page cannot drift out of step with what is actually connected, and it changes
+ * nothing here: editing settings and driving the session stay separate things. With no session running every
+ * label goes blank, which keeps the page looking the way it always did. */
+void OBSBasicSettings::RefreshDestinationStates()
+{
+	if (destinationStateLabels.empty())
+		return;
+
+	OBSBasic *main = OBSBasic::Get();
+	const bool streaming = main && obs_frontend_streaming_active();
+
+	std::vector<OBSBasic::StreamSessionEntry> snapshot;
+	if (streaming)
+		snapshot = main->StreamSessionSnapshot(true);
+
+	for (auto &entry : destinationStateLabels) {
+		QLabel *label = entry.second;
+		if (!label)
+			continue;
+
+		if (!streaming) {
+			label->setText(QString());
+			setClasses(label, "");
+			continue;
+		}
+
+		const auto it =
+			std::find_if(snapshot.begin(), snapshot.end(),
+				     [&](const OBSBasic::StreamSessionEntry &e) { return e.id == entry.first; });
+		if (it == snapshot.end()) {
+			/* Not a connection of the session that is running: the destination is switched off, or it
+			 * never got one. */
+			label->setText(QTStr("Basic.Settings.Stream.Destinations.State.NotInSession"));
+			setClasses(label, "text-warning");
+			continue;
+		}
+
+		QString text;
+		QString styling;
+		switch (it->state) {
+		case StreamDestinationRuntime::State::Live:
+			text = QTStr("Basic.Settings.Stream.Destinations.State.Live");
+			styling = "text-success";
+			break;
+		case StreamDestinationRuntime::State::DelayStarting:
+			text = QTStr("Basic.Settings.Stream.Destinations.State.DelayStarting");
+			styling = "text-warning";
+			break;
+		case StreamDestinationRuntime::State::Preparing:
+		case StreamDestinationRuntime::State::Connecting:
+			text = QTStr("Basic.Settings.Stream.Destinations.State.Connecting");
+			styling = "text-warning";
+			break;
+		case StreamDestinationRuntime::State::Reconnecting:
+			text = QTStr("Basic.Settings.Stream.Destinations.State.Reconnecting");
+			styling = "text-danger";
+			break;
+		case StreamDestinationRuntime::State::Stopping:
+		case StreamDestinationRuntime::State::DelayStopping:
+			text = QTStr("Basic.Settings.Stream.Destinations.State.Stopping");
+			break;
+		case StreamDestinationRuntime::State::Stopped:
+		default:
+			/* Part of a session that is still running, but this connection is down: it stays that way
+			 * until the user restarts it from the stats window. */
+			text = QTStr("Basic.Settings.Stream.Destinations.State.Down");
+			styling = "text-warning";
+			break;
+		}
+
+		if (it->reconnectAttempt > 0)
+			text += QTStr("Basic.Settings.Stream.Destinations.State.Attempt")
+					.arg(QString::number(it->reconnectAttempt));
+
+		label->setText(text);
+		setClasses(label, styling);
+	}
 }
