@@ -280,7 +280,7 @@ void OBSBasicStats::AddOutputLabels(QString name, bool recording)
  * new connection. */
 bool OBSBasicStats::SyncSections(const std::vector<SectionInfo> &session, obs_output_t *recOutput)
 {
-	bool changed = outputLabels.size() != session.size() + 1;
+	bool changed = outputLabels.size() != static_cast<qsizetype>(session.size()) + 1;
 
 	QList<OutputLabels> next;
 	next.reserve(int(session.size()) + 1);
