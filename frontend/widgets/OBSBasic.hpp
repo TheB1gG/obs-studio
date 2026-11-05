@@ -922,7 +922,7 @@ public:
 	/* The runtime entry of one destination id, used by the per-destination outputs. */
 	StreamDestinationRuntime *RuntimeForId(std::string_view id);
 	void NoteDestinationStarted(const std::string &id);
-	void NoteDestinationStopped(const std::string &id, long long code);
+	void NoteDestinationStopped(const std::string &id, long long code, const QString &error = {});
 	/* The reconnect of an extra destination reaches the status bar through here: the output handler owns
 	 * that connection and its signal handlers, so the widget never points at an entry that can disappear. */
 	void NoteDestinationReconnect(const std::string &id, long long seconds);
@@ -930,6 +930,15 @@ public:
 	/* Hand the current set of session connections to the status bar (which of them are up, which one is
 	 * between attempts). Called on every session transition. */
 	void PushStreamConnections();
+	/* Q13 (ii): the visible feedback of one destination failing while the rest of the session keeps
+	 * streaming. Deliberately not a dialog: a modal in the middle of a running session blocks the work the
+	 * other destinations are still doing. */
+	void ReportDestinationFailure(const StreamDestinationRuntime &runtime, long long code, bool killed,
+				      const QString &error, bool shared_encoder_failure = false);
+	/* Correlated drops: when several connections fail within a few seconds the shared cause is the uplink, so
+	 * the messages collapse into one line instead of a stack per destination. */
+	qint64 lastDestinationFailureMs = 0;
+	int destinationFailureRun = 0;
 	size_t LiveDestinationCount() const;
 	size_t EnabledDestinationCount() const;
 	/* Destinations that belong to the running session: live, or still working their way through setup and

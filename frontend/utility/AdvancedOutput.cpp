@@ -856,10 +856,17 @@ static void ExtraStreamStopped(void *data, calldata_t *params)
 	calldata_get_int(params, "code", &code);
 	stream->stopPending = false;
 
+	/* The reason the ingest or the socket gave, read while the output object still carries it: a destination
+	 * whose failure leaves the session running is reported with it, so the user sees what dropped without a
+	 * dialog in the middle of the session. */
+	const char *last = stream->output ? obs_output_get_last_error(stream->output) : nullptr;
+	std::string error = (last && *last) ? last : "";
+
 	OBSBasic *owner = stream->owner;
 	std::string id = stream->id;
 	QMetaObject::invokeMethod(
-		owner, [owner, id, code] { owner->NoteDestinationStopped(id, code); }, Qt::QueuedConnection);
+		owner, [owner, id, code, error] { owner->NoteDestinationStopped(id, code, QT_UTF8(error.c_str())); },
+		Qt::QueuedConnection);
 }
 
 /* The reconnect signals of an extra destination's output: same arrangement - the handler runs on the output's

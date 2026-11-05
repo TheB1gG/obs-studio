@@ -29,8 +29,14 @@
 
 #include <qt-wrappers.hpp>
 
+#include <QDateTime>
+
 #define STREAMING_START "==== Streaming Start ==============================================="
 #define STREAMING_STOP "==== Streaming Stop ================================================"
+
+/* Q13 (ii): two or more connections dropping inside this window are reported as one correlated failure - the
+ * likely cause is then the uplink rather than the destinations, and one line per destination would hide it. */
+static constexpr qint64 failure_collapse_window_ms = 5000;
 
 void OBSBasic::DisplayStreamStartError()
 {
@@ -85,7 +91,7 @@ void OBSBasic::NoteDestinationStarted(const std::string &id)
 	PushStreamConnections();
 }
 
-void OBSBasic::NoteDestinationStopped(const std::string &id, long long code)
+void OBSBasic::NoteDestinationStopped(const std::string &id, long long code, const QString &error)
 {
 	StreamDestinationRuntime *runtime = RuntimeForId(id);
 	if (!runtime)
@@ -115,6 +121,7 @@ void OBSBasic::NoteDestinationStopped(const std::string &id, long long code)
 		blog(LOG_INFO,
 		     "streaming session continues after destination '%s' went down: %zu of %zu enabled destinations still attempting or uploading",
 		     runtime->name.c_str(), RunningDestinationCount(), EnabledDestinationCount());
+		ReportDestinationFailure(*runtime, code, killed, error);
 		return;
 	}
 
@@ -161,10 +168,64 @@ void OBSBasic::NoteDestinationReconnected(const std::string &id)
 		ui->statusbar->NoteStreamReconnectSuccess(id);
 }
 
+/* Q13 (ii): a destination that fails while the rest of the session keeps uploading has to be visible without a
+ * dialog. A modal in the middle of a running session would block the work the other connections are still doing,
+ * and what the user needs here is to see which destination is gone - not to confirm anything. The restart action
+ * itself lives in the stats window's section for that destination. */
+void OBSBasic::ReportDestinationFailure(const StreamDestinationRuntime &runtime, long long code, bool killed,
+					const QString &error, bool shared_encoder_failure)
+{
+	/* Nothing to report for a connection the user stopped or killed themselves, nor while the session as a
+	 * whole is coming down - that cascade ends every connection and is reported by the session's own stop
+	 * path, which is the case a dialog is right for. */
+	if (killed || streamingStopping || code == OBS_OUTPUT_SUCCESS)
+		return;
+
+	const qint64 now = QDateTime::currentMSecsSinceEpoch();
+	if (lastDestinationFailureMs != 0 && now - lastDestinationFailureMs <= failure_collapse_window_ms)
+		++destinationFailureRun;
+	else
+		destinationFailureRun = 1;
+	lastDestinationFailureMs = now;
+
+	QString text;
+	const QString name = QT_UTF8(runtime.name.c_str());
+
+	if (shared_encoder_failure) {
+		/* An encoder or HDR problem is not this destination's: the connections of a session share the
+		 * encoder group, so saying which destination reported it would blame the wrong one. */
+		text = QTStr("Basic.Streaming.EncoderFailureShared");
+		if (!error.isEmpty())
+			text += QStringLiteral(" (") + error + QStringLiteral(")");
+	} else if (destinationFailureRun >= 2) {
+		/* Several connections failing within a few seconds have one likely cause between them - the
+		 * uplink - and a stack of per-destination lines would hide that. One line, counting them. */
+		text = QTStr("Basic.Streaming.DestinationsDropped").arg(QString::number(destinationFailureRun));
+	} else if (!error.isEmpty()) {
+		text = QTStr("Basic.Streaming.DestinationDroppedWithReason").arg(name, error);
+	} else {
+		text = QTStr("Basic.Streaming.DestinationDropped").arg(name);
+	}
+
+	blog(LOG_WARNING, "streaming session: %s", QT_TO_UTF8(text));
+
+	if (ui && ui->statusbar)
+		ui->statusbar->showMessage(text, 8000);
+
+	/* The window may be in the tray while a session runs; the status bar line would go unseen. */
+	if (!isVisible())
+		SysTrayNotify(text, QSystemTrayIcon::Warning);
+}
+
 void OBSBasic::StartStreaming()
 {
 	if (outputHandler->StreamingActive())
 		return;
+
+	/* A new session reports its failures on their own: correlated drops of the previous one must not collapse
+	 * into this session's first message. */
+	destinationFailureRun = 0;
+	lastDestinationFailureMs = 0;
 	if (disableOutputsRef)
 		return;
 
@@ -667,9 +728,12 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 		dstr_copy(errorMessage, errorDescription);
 
 	/* The destination this signal belongs to. An entry that is already stopped is skipped, which is what
-	 * keeps the last extra destination - routed through this same function - from re-logging the first one. */
-	if (StreamDestinationRuntime *runtime = CurrentRuntime();
-	    runtime && runtime->state != StreamDestinationRuntime::State::Stopped) {
+	 * keeps the last extra destination - routed through this same function - from re-logging the first one.
+	 * Declared outside the if, because the failure report further down has to know which connection this
+	 * particular signal was about. */
+	StreamDestinationRuntime *runtime = CurrentRuntime();
+	const bool stopped_here = runtime && runtime->state != StreamDestinationRuntime::State::Stopped;
+	if (stopped_here) {
 		const char *previousState = runtime->stateName();
 		runtime->state = StreamDestinationRuntime::State::Stopped;
 		runtime->output = nullptr;
@@ -698,6 +762,12 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 		blog(LOG_INFO,
 		     "streaming session continues after a destination went down: %zu of %zu enabled destinations still attempting or uploading",
 		     stillRunning, EnabledDestinationCount());
+		/* Q13 (ii): the session goes on, so this is reported as a message rather than a dialog - and a
+		 * drop that leaves the session running has to be reported, or the user only notices it when a
+		 * connection they expected to be live never shows up. */
+		if (stopped_here)
+			ReportDestinationFailure(*runtime, code, ungracefulKill, QT_UTF8(errorMessage),
+						 encode_error || code == OBS_OUTPUT_HDR_DISABLED);
 		return;
 	}
 
