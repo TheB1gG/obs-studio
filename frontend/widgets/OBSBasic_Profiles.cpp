@@ -843,6 +843,16 @@ StreamDestinationRuntime *OBSBasic::CurrentRuntime()
 	return streamRuntimes.empty() ? nullptr : &streamRuntimes.front();
 }
 
+StreamDestinationRuntime *OBSBasic::PrimaryRuntime()
+{
+	for (auto &runtime : streamRuntimes) {
+		if (runtime.enabled)
+			return &runtime;
+	}
+
+	return streamRuntimes.empty() ? nullptr : &streamRuntimes.front();
+}
+
 StreamDestinationRuntime *OBSBasic::RuntimeForId(std::string_view id)
 {
 	for (auto &runtime : streamRuntimes) {

@@ -40,6 +40,11 @@ public:
 	State state = State::Stopped;
 	int reconnectAttempt = 0;
 
+	/* Set when the skull button was pressed for this destination and cleared when its stop signal arrives.
+	 * Per destination on purpose: the fork's kill path rewrites the stop code to success so that no failure
+	 * dialog appears, and a kill of one destination must not silence the failure report of another. */
+	bool killRequested = false;
+
 	/* Filled in when the destination is actually started (slice 2b). */
 	OBSService service;
 	OBSOutput output;

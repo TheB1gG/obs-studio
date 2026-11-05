@@ -915,6 +915,10 @@ public:
 	StreamingDestinations &Destinations() { return streamingDestinations; }
 	void RefreshStreamRuntimes();
 	StreamDestinationRuntime *CurrentRuntime();
+	/* The destination served by the output handler's own stream output: the first enabled one of the profile
+	 * (Q42). Its session-level side effects - broadcast state, the "preparing" messages - are the ones the
+	 * single-stream code paths were written for. */
+	StreamDestinationRuntime *PrimaryRuntime();
 	/* The runtime entry of one destination id, used by the per-destination outputs. */
 	StreamDestinationRuntime *RuntimeForId(std::string_view id);
 	void NoteDestinationStarted(const std::string &id);
@@ -925,6 +929,10 @@ public:
 	 * the handshake. Q13: the session exists as long as this count is above zero, which is what keeps one
 	 * failed connection from ending a session whose other connections are still going. */
 	size_t RunningDestinationCount() const;
+	/* End one connection of the session the way the skull button does it: a reset of the RTMP socket without
+	 * any end-of-stream data, so the ingest sees a hard drop. An empty id means the first destination. The
+	 * session itself comes down through the normal stop path once nothing is left (Q13). */
+	void KillDestinationUngracefully(std::string id = {});
 
 	std::optional<OBSProfile> GetProfileByName(const std::string &profileName) const;
 	std::optional<OBSProfile> GetProfileByDirectoryName(const std::string &directoryName) const;
@@ -1390,8 +1398,9 @@ private:
 	std::shared_future<void> setupStreamingGuard;
 	bool streamingStopping = false;
 	bool streamingStarting = false;
-	// Set while an ungraceful kill (skull button) is in progress: the resulting "stop" signal must be treated like a normal stop (no error dialog).
-	bool streamingKillActive = false;
+	// The ungraceful-kill request is kept per destination (StreamDestinationRuntime::killRequested) rather
+	// than as one flag for the whole session: killing one connection must not silence the failure report of
+	// another connection that dies at the same moment.
 
 public slots:
 	void DisplayStreamStartError();
