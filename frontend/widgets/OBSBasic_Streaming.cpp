@@ -278,6 +278,13 @@ void OBSBasic::KillStreamingUngracefully()
 
 	blog(LOG_INFO, "Force-killing active stream ungracefully (simulated crash)");
 
+	/* The kill button is still global, so it ends the whole session - every connection, not only the
+	 * first one. Per-destination kill buttons (Q13) will abort a single connection instead. */
+	if (const size_t others = outputHandler->ActiveExtraDestinations(); others > 0) {
+		blog(LOG_INFO, "killing the session ungracefully: %zu other connection(s) as well", others);
+		outputHandler->StopExtraDestinations(true);
+	}
+
 	// Make sure automatic restart does not bring the stream back up
 	if (outputHandler->multitrackVideo)
 		outputHandler->multitrackVideo->SetRestartOnError(false);
@@ -405,6 +412,16 @@ void OBSBasic::StreamStopping()
 
 void OBSBasic::StreamingStop(int code, QString last_error)
 {
+	/* Interim session semantics until Q13 lands: the session is the first destination, so when that
+	 * connection goes down by itself every other connection of the session goes down with it. The user
+	 * pressed stop (or the first destination died); either way the extras must not keep uploading while
+	 * the UI says the stream is over. */
+	if (const size_t others = outputHandler->ActiveExtraDestinations(); others > 0) {
+		blog(LOG_INFO, "streaming session ended with its first destination: stopping %zu other connection(s)",
+		     others);
+		outputHandler->StopExtraDestinations(false);
+	}
+
 	const char *errorDescription = "";
 	DStr errorMessage;
 	bool use_last_error = false;
@@ -489,6 +506,16 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 			runtime->reconnectAttempt = 0;
 		blog(LOG_INFO, "Streaming destination '%s' stopped after %s (%zu of %zu enabled destinations up)",
 		     runtime->name.c_str(), previousState, LiveDestinationCount(), EnabledDestinationCount());
+	}
+
+	/* An output that never got as far as starting emits no stop signal, so its runtime entry would be
+	 * left saying "connecting" after the session is over. Everything that is not live and not already
+	 * going down is simply stopped with the session - done after the block above, which reports the
+	 * first destination's own transition before it is cleared. */
+	for (auto &runtime : streamRuntimes) {
+		if (runtime.state == StreamDestinationRuntime::State::Preparing ||
+		    runtime.state == StreamDestinationRuntime::State::Connecting)
+			runtime.state = StreamDestinationRuntime::State::Stopped;
 	}
 
 	streamingStopping = false;

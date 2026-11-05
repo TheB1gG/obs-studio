@@ -836,7 +836,6 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 static void ExtraStreamStarted(void *data, calldata_t *)
 {
 	auto *stream = static_cast<AdvancedOutput::ExtraDestinationStream *>(data);
-	stream->live = true;
 	stream->owner->NoteDestinationStarted(stream->id);
 }
 
@@ -845,7 +844,7 @@ static void ExtraStreamStopped(void *data, calldata_t *params)
 	auto *stream = static_cast<AdvancedOutput::ExtraDestinationStream *>(data);
 	long long code = 0;
 	calldata_get_int(params, "code", &code);
-	stream->live = false;
+	stream->stopPending = false;
 	stream->owner->NoteDestinationStopped(stream->id, code);
 }
 
@@ -954,6 +953,8 @@ void AdvancedOutput::StartExtraDestinations()
 			continue;
 		}
 
+		stream->stopPending = true;
+
 		if (StreamDestinationRuntime *runtime = main->RuntimeForId(dest.id)) {
 			runtime->output = stream->output;
 			runtime->service = stream->service;
@@ -969,10 +970,20 @@ void AdvancedOutput::StartExtraDestinations()
 		blog(LOG_INFO, "streaming session: %zu additional destination output(s) started", extraStreams.size());
 }
 
+size_t AdvancedOutput::ActiveExtraDestinations() const
+{
+	size_t count = 0;
+	for (const auto &stream : extraStreams) {
+		if (stream->stopPending)
+			count++;
+	}
+	return count;
+}
+
 void AdvancedOutput::StopExtraDestinations(bool force)
 {
 	for (auto &stream : extraStreams) {
-		if (!stream->output)
+		if (!stream->output || !stream->stopPending)
 			continue;
 		if (force)
 			obs_output_force_stop(stream->output);

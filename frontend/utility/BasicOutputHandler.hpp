@@ -79,6 +79,11 @@ struct BasicOutputHandler {
 	virtual void StopVirtualCam();
 	virtual bool StreamingActive() const = 0;
 	virtual bool RecordingActive() const = 0;
+	/* Slice 2b: the extra destination outputs of an advanced session. A session is still defined by its
+	 * first destination (Q42), so when that one goes down on its own the rest have to go down with it -
+	 * otherwise the UI says "stopped" while connections are still uploading. */
+	virtual void StopExtraDestinations(bool force) { (void)force; }
+	virtual size_t ActiveExtraDestinations() const { return 0; }
 	virtual bool ReplayBufferActive() const { return false; }
 	virtual bool VirtualCamActive() const;
 

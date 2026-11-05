@@ -61,11 +61,14 @@ struct AdvancedOutput : BasicOutputHandler {
 		OBSOutput output; /* released when the entry goes away */
 		OBSSignal stopSignal;
 		OBSSignal startSignal;
-		bool live = false;
+		/* Set once the output has been started and cleared by its stop signal: an output that is still
+		 * connecting has to be stopped just as much as one that is already uploading. */
+		bool stopPending = false;
 	};
 
 	std::vector<std::unique_ptr<ExtraDestinationStream>> extraStreams;
 
 	void StartExtraDestinations();
-	void StopExtraDestinations(bool force);
+	void StopExtraDestinations(bool force) override;
+	size_t ActiveExtraDestinations() const override;
 };
