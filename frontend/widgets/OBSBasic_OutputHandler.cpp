@@ -27,14 +27,11 @@ void OBSBasic::ResetOutputs()
 {
 	ProfileScope("OBSBasic::ResetOutputs");
 
-	const char *mode = config_get_string(activeConfiguration, "Output", "Mode");
-	bool advOut = astrcmpi(mode, "Advanced") == 0;
-
 	if ((!outputHandler || !outputHandler->Active()) &&
 	    (!setupStreamingGuard.valid() ||
 	     setupStreamingGuard.wait_for(std::chrono::seconds{0}) == std::future_status::ready)) {
 		outputHandler.reset();
-		outputHandler.reset(advOut ? CreateAdvancedOutputHandler(this) : CreateSimpleOutputHandler(this));
+		outputHandler.reset(CreateAdvancedOutputHandler(this));
 
 		emit ReplayBufEnabled(outputHandler->replayBuffer);
 
@@ -92,22 +89,12 @@ void OBSBasic::ResizeOutputSizeOfSource()
 
 const char *OBSBasic::GetCurrentOutputPath()
 {
-	const char *path = nullptr;
-	const char *mode = config_get_string(Config(), "Output", "Mode");
+	const char *rec_type = config_get_string(Config(), "AdvOut", "RecType");
 
-	if (strcmp(mode, "Advanced") == 0) {
-		const char *advanced_mode = config_get_string(Config(), "AdvOut", "RecType");
+	if (strcmp(rec_type, "Standard") == 0)
+		return config_get_string(Config(), "AdvOut", "RecFilePath");
 
-		if (strcmp(advanced_mode, "FFmpeg") == 0) {
-			path = config_get_string(Config(), "AdvOut", "FFFilePath");
-		} else {
-			path = config_get_string(Config(), "AdvOut", "RecFilePath");
-		}
-	} else {
-		path = config_get_string(Config(), "SimpleOutput", "FilePath");
-	}
-
-	return path;
+	return config_get_string(Config(), "AdvOut", "FFFilePath");
 }
 
 void OBSBasic::OutputPathInvalidMessage()
@@ -119,14 +106,11 @@ void OBSBasic::OutputPathInvalidMessage()
 
 bool OBSBasic::IsFFmpegOutputToURL() const
 {
-	const char *mode = config_get_string(Config(), "Output", "Mode");
-	if (strcmp(mode, "Advanced") == 0) {
-		const char *advanced_mode = config_get_string(Config(), "AdvOut", "RecType");
-		if (strcmp(advanced_mode, "FFmpeg") == 0) {
-			bool is_local = config_get_bool(Config(), "AdvOut", "FFOutputToFile");
-			if (!is_local)
-				return true;
-		}
+	const char *rec_type = config_get_string(Config(), "AdvOut", "RecType");
+	if (strcmp(rec_type, "FFmpeg") == 0) {
+		bool is_local = config_get_bool(Config(), "AdvOut", "FFOutputToFile");
+		if (!is_local)
+			return true;
 	}
 
 	return false;

@@ -349,10 +349,10 @@ StreamingDestinations::BitrateBreakdown StreamingDestinations::bitrateFor(std::s
 		}
 	}
 
-	/* No video tracks of its own: the destination is fed by the shared stream encoder, so its video
-	 * bitrate is the one in the advanced-mode encoder file - whether it came from the single-stream
-	 * import or was added later. A profile still in simple mode keeps the bitrate in [SimpleOutput].
-	 * Both are marked, so the page does not present them as per-destination values. */
+	/* No video tracks of its own: the destination is fed by the shared stream encoder, so its video bitrate
+	 * is the one in the encoder file the advanced settings write - whether it came from the single-stream
+	 * import or was added later. It is marked as shared so the page does not present it as a per-destination
+	 * value. */
 	if (info.videoKbps == 0) {
 		OBSDataAutoRelease legacy =
 			obs_data_create_from_json_file_safe(pathOf(legacy_encoder_file).u8string().c_str(), "bak");
@@ -363,10 +363,6 @@ StreamingDestinations::BitrateBreakdown StreamingDestinations::bitrateFor(std::s
 				info.shared_video = true;
 			}
 		}
-	}
-	if (info.videoKbps == 0 && !advancedMode()) {
-		info.videoKbps = config_get_int(config_, "SimpleOutput", "VBitrate");
-		info.shared_video = info.videoKbps > 0;
 	}
 
 	info.audioKbps = streamingAudioKbps(id);
@@ -387,13 +383,9 @@ long long StreamingDestinations::streamingAudioKbps(std::string_view id) const
 	};
 
 	/* Mirrors how the streaming output is wired up in AdvancedOutput::SetupStreaming()
-	 * (AdvancedOutput.cpp:334,347-356,733-743): simple mode streams one stereo mix, advanced mode the
-	 * mixes marked in the [AdvOut] StreamMultiTrackAudioMixes bitmask. A service that cannot take
-	 * multitrack audio gets a single mix instead, which is why this number is what a multitrack-capable
-	 * destination uploads - said out loud in the page's tooltip. */
-	if (!advancedMode())
-		return config_get_int(config_, "SimpleOutput", "ABitrate");
-
+	 * (AdvancedOutput.cpp:334,347-356,733-743): the mixes marked in the [AdvOut] StreamMultiTrackAudioMixes
+	 * bitmask. A service that cannot take multitrack audio gets a single mix instead, which is why this number
+	 * is what a multitrack-capable destination uploads - said out loud in the page's tooltip. */
 	const unsigned mixes = static_cast<unsigned>(config_get_int(config_, "AdvOut", "StreamMultiTrackAudioMixes"));
 	long long total = 0;
 	if (mixes != 0) {
@@ -466,12 +458,6 @@ OBSService StreamingDestinations::createService(std::string_view id) const
 		blog(LOG_WARNING, "streaming destination '%.*s': service type '%s' is not available",
 		     static_cast<int>(id.size()), id.data(), type ? type : "");
 	return service;
-}
-
-bool StreamingDestinations::advancedMode() const
-{
-	const char *mode = config_ ? config_get_string(config_, profile_section, "Mode") : nullptr;
-	return mode && strcmp(mode, "Advanced") == 0;
 }
 
 bool StreamingDestinations::usesVodTrack(std::string_view id) const

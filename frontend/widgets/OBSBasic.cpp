@@ -701,7 +701,73 @@ bool OBSBasic::InitBasicConfigDefaults()
 	};
 
 	MigrateFormat("AdvOut");
-	MigrateFormat("SimpleOutput");
+
+	/* The simple output mode is gone. A profile that still carries its settings has them dropped rather than
+	 * translated: its quality presets have no counterpart in [AdvOut] (advanced mode configures the encoder
+	 * directly), so inventing values for keys the user never chose would be worse than saying plainly that the
+	 * settings are back to their defaults. Removing the keys also keeps the profile clean for the next launch,
+	 * and the [Stream1]/[AdvOut] defaults above are what the outputs read from now on. */
+	bool droppedSimpleSettings = false;
+
+	if (config_has_user_value(activeConfiguration, "Output", "Mode") &&
+	    astrcmpi(config_get_string(activeConfiguration, "Output", "Mode"), "Advanced") != 0)
+		droppedSimpleSettings = true;
+	config_remove_value(activeConfiguration, "Output", "Mode");
+
+	static const char *const simple_keys[] = {"ABitrate",
+						  "ABitrateMode",
+						  "AMDAV1Preset",
+						  "AMDPreset",
+						  "AQualityTarget",
+						  "EnforceBitrate",
+						  "FileNameWithoutSpace",
+						  "FilePath",
+						  "MuxerCustom",
+						  "NVENCPreset2",
+						  "Preset",
+						  "QSVPreset",
+						  "RecAudioEncoder",
+						  "RecEncoder",
+						  "RecFormat2",
+						  "RecQuality",
+						  "RecRB",
+						  "RecRBPrefix",
+						  "RecRBSuffix",
+						  "RecRBSize",
+						  "RecRBTime",
+						  "RecTracks",
+						  "StreamAudioEncoder",
+						  "StreamEncoder",
+						  "UseAdvanced",
+						  "VBitrate",
+						  "VodTrackEnabled",
+						  "x264Settings"};
+
+	for (const char *key : simple_keys) {
+		if (config_has_user_value(activeConfiguration, "SimpleOutput", key))
+			droppedSimpleSettings = true;
+		config_remove_value(activeConfiguration, "SimpleOutput", key);
+	}
+
+	if (droppedSimpleSettings) {
+		/* Said once per profile: the settings page still writes the old keys until its own rebuild, and the
+		 * notice must not come back on every load because of that. */
+		if (!config_get_string(activeConfiguration, "General", "SimpleOutputRemoved")) {
+			blog(LOG_WARNING,
+			     "output settings: the removed simple output mode left values in this profile, they were "
+			     "dropped and the output is back to its defaults");
+			const QString text = QTStr("Output.SimpleModeRemoved.Text");
+			/* Non-modal on purpose: a dialog here would sit in front of the profile load and stop the
+			 * start-up actions (and any automated run) until somebody clicks it away. The tray bubble plus the
+			 * status bar say it without blocking, and the line above keeps it in the log. */
+			QTimer::singleShot(2500, this, [this, text] {
+				SysTrayNotify(text, QSystemTrayIcon::Warning);
+				ShowStatusBarMessage(text);
+			});
+			config_set_string(activeConfiguration, "General", "SimpleOutputRemoved", "1");
+		}
+		changed = true;
+	}
 
 	/* ----------------------------------------------------- */
 	/* Migrate output scale setting to GPU scaling options.  */
@@ -724,31 +790,11 @@ bool OBSBasic::InitBasicConfigDefaults()
 
 	/* ----------------------------------------------------- */
 
-	config_set_default_string(activeConfiguration, "Output", "Mode", "Simple");
-
 	config_set_default_bool(activeConfiguration, "Stream1", "IgnoreRecommended", false);
 	config_set_default_bool(activeConfiguration, "Stream1", "EnableMultitrackVideo", false);
 	config_set_default_bool(activeConfiguration, "Stream1", "MultitrackVideoRequestMaxTracks", false);
 	config_set_default_bool(activeConfiguration, "Stream1", "MultitrackVideoMaximumAggregateBitrateAuto", true);
 	config_set_default_bool(activeConfiguration, "Stream1", "MultitrackVideoMaximumVideoTracksAuto", true);
-
-	config_set_default_string(activeConfiguration, "SimpleOutput", "FilePath", GetDefaultVideoSavePath().c_str());
-	config_set_default_string(activeConfiguration, "SimpleOutput", "RecFormat2", DEFAULT_CONTAINER);
-	config_set_default_uint(activeConfiguration, "SimpleOutput", "VBitrate", 2500);
-	config_set_default_uint(activeConfiguration, "SimpleOutput", "ABitrate", 160);
-	config_set_default_string(activeConfiguration, "SimpleOutput", "ABitrateMode", "CBR");
-	config_set_default_int(activeConfiguration, "SimpleOutput", "AQualityTarget", 127);
-	config_set_default_bool(activeConfiguration, "SimpleOutput", "UseAdvanced", false);
-	config_set_default_string(activeConfiguration, "SimpleOutput", "Preset", "veryfast");
-	config_set_default_string(activeConfiguration, "SimpleOutput", "NVENCPreset2", "p5");
-	config_set_default_string(activeConfiguration, "SimpleOutput", "RecQuality", "Stream");
-	config_set_default_bool(activeConfiguration, "SimpleOutput", "RecRB", false);
-	config_set_default_int(activeConfiguration, "SimpleOutput", "RecRBTime", 20);
-	config_set_default_int(activeConfiguration, "SimpleOutput", "RecRBSize", 512);
-	config_set_default_string(activeConfiguration, "SimpleOutput", "RecRBPrefix", "Replay");
-	config_set_default_string(activeConfiguration, "SimpleOutput", "StreamAudioEncoder", "aac");
-	config_set_default_string(activeConfiguration, "SimpleOutput", "RecAudioEncoder", "aac");
-	config_set_default_uint(activeConfiguration, "SimpleOutput", "RecTracks", (1 << 0));
 
 	config_set_default_bool(activeConfiguration, "AdvOut", "ApplyServiceSettings", true);
 	config_set_default_bool(activeConfiguration, "AdvOut", "UseRescale", false);
@@ -879,14 +925,6 @@ bool OBSBasic::InitBasicConfigDefaults()
 
 void OBSBasic::InitBasicConfigDefaults2()
 {
-	bool oldEncDefaults = config_get_bool(App()->GetUserConfig(), "General", "Pre23Defaults");
-	bool useNV = EncoderAvailable("ffmpeg_nvenc") && !oldEncDefaults;
-
-	config_set_default_string(activeConfiguration, "SimpleOutput", "StreamEncoder",
-				  useNV ? SIMPLE_ENCODER_NVENC : SIMPLE_ENCODER_X264);
-	config_set_default_string(activeConfiguration, "SimpleOutput", "RecEncoder",
-				  useNV ? SIMPLE_ENCODER_NVENC : SIMPLE_ENCODER_X264);
-
 	const char *aac_default = "ffmpeg_aac";
 	if (EncoderAvailable("CoreAudio_AAC"))
 		aac_default = "CoreAudio_AAC";

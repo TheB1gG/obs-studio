@@ -156,14 +156,11 @@ void ScreenshotObj::Save()
 	OBSBasic *main = OBSBasic::Get();
 	config_t *config = main->Config();
 
-	const char *mode = config_get_string(config, "Output", "Mode");
 	const char *type = config_get_string(config, "AdvOut", "RecType");
-	const char *adv_path = strcmp(type, "Standard") ? config_get_string(config, "AdvOut", "FFFilePath")
+	const char *rec_path = strcmp(type, "Standard") ? config_get_string(config, "AdvOut", "FFFilePath")
 							: config_get_string(config, "AdvOut", "RecFilePath");
-	const char *rec_path = strcmp(mode, "Advanced") ? config_get_string(config, "SimpleOutput", "FilePath")
-							: adv_path;
 
-	bool noSpace = config_get_bool(config, "SimpleOutput", "FileNameWithoutSpace");
+	bool noSpace = config_get_bool(config, "AdvOut", "RecFileNameWithoutSpace");
 	const char *filenameFormat = config_get_string(config, "Output", "FilenameFormatting");
 	bool overwriteIfExists = config_get_bool(config, "Output", "OverwriteIfExists");
 

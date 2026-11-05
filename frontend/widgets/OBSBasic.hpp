@@ -905,7 +905,6 @@ private:
 	void UpdateProfileEncoders();
 	std::vector<std::string> GetRestartRequirements(const ConfigFile &config) const;
 	void ResetProfileData();
-	void CheckForSimpleModeX264Fallback();
 
 public:
 	inline const OBSProfileCache &GetProfileCache() const noexcept { return profiles; };

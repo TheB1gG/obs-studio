@@ -76,11 +76,7 @@ bool OBSBasic::LoadService()
 
 	/* Enforce Opus on WHIP if needed */
 	if (strcmp(obs_service_get_protocol(service), "WHIP") == 0) {
-		const char *option = config_get_string(activeConfiguration, "SimpleOutput", "StreamAudioEncoder");
-		if (strcmp(option, "opus") != 0)
-			config_set_string(activeConfiguration, "SimpleOutput", "StreamAudioEncoder", "opus");
-
-		option = config_get_string(activeConfiguration, "AdvOut", "AudioEncoder");
+		const char *option = config_get_string(activeConfiguration, "AdvOut", "AudioEncoder");
 
 		const char *encoder_codec = obs_get_encoder_codec(option);
 		if (!encoder_codec || strcmp(encoder_codec, "opus") != 0)

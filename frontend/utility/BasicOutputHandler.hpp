@@ -117,7 +117,6 @@ protected:
 	OBSDataAutoRelease GenerateMultitrackVideoStreamDumpConfig();
 };
 
-BasicOutputHandler *CreateSimpleOutputHandler(OBSBasic *main);
 BasicOutputHandler *CreateAdvancedOutputHandler(OBSBasic *main);
 
 void OBSStreamStarting(void *data, calldata_t *params);
