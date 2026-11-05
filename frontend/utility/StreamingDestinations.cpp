@@ -118,7 +118,15 @@ bool StreamingDestinations::pageEnabled(config_t *profile_config)
 {
 	if (!profile_config)
 		return false;
-	return config_get_bool(profile_config, page_flag_section, page_flag_key);
+	if (config_get_bool(profile_config, page_flag_section, page_flag_key))
+		return true;
+
+	/* A profile that already lists destinations has the feature in everything but name - the list only
+	 * exists because the page (or a hand edit) wrote it, and copying a profile carries the list without the
+	 * flag. Hiding the page in that case leaves a profile streaming to several places with no way to see or
+	 * change them, so the stored list counts as opting in. Flip the flag off in the profile to hide it again. */
+	const char *list = config_get_string(profile_config, list_section, list_key);
+	return list && *list;
 }
 
 void StreamingDestinations::Load(config_t *profile_config, const std::filesystem::path &profile_dir)
