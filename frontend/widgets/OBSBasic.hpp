@@ -921,6 +921,10 @@ public:
 	void NoteDestinationStopped(const std::string &id, long long code);
 	size_t LiveDestinationCount() const;
 	size_t EnabledDestinationCount() const;
+	/* Destinations that belong to the running session: live, or still working their way through setup and
+	 * the handshake. Q13: the session exists as long as this count is above zero, which is what keeps one
+	 * failed connection from ending a session whose other connections are still going. */
+	size_t RunningDestinationCount() const;
 
 	std::optional<OBSProfile> GetProfileByName(const std::string &profileName) const;
 	std::optional<OBSProfile> GetProfileByDirectoryName(const std::string &directoryName) const;

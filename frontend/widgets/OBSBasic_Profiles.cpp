@@ -872,6 +872,16 @@ size_t OBSBasic::EnabledDestinationCount() const
 	return count;
 }
 
+size_t OBSBasic::RunningDestinationCount() const
+{
+	size_t count = 0;
+	for (const auto &runtime : streamRuntimes) {
+		if (runtime.isRunning())
+			count++;
+	}
+	return count;
+}
+
 void OBSBasic::UpdateProfileEncoders()
 {
 	InitBasicConfigDefaults2();

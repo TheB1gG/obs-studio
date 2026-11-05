@@ -830,13 +830,23 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	return false;
 }
 
-/* Signal handlers of the extra destination outputs. They only report the destination they belong to: a
- * failed connection takes nothing else with it (Q13), and the primary destination's own signals still drive
- * the session UI exactly as before. */
+/* Signal handlers of the extra destination outputs. They run on the thread of the output that emitted them,
+ * while everything they lead into - the runtime entries, the status bar, the tray, dialogs - belongs to the
+ * GUI thread, so the report is marshalled exactly like the primary output's handlers do in
+ * BasicOutputHandler.cpp. Only values are captured: an entry can be gone before the queued call runs. */
+extern volatile bool streaming_active;
+
 static void ExtraStreamStarted(void *data, calldata_t *)
 {
 	auto *stream = static_cast<AdvancedOutput::ExtraDestinationStream *>(data);
-	stream->owner->NoteDestinationStarted(stream->id);
+	OBSBasic *owner = stream->owner;
+	std::string id = stream->id;
+
+	/* The session is up as soon as any of its connections is, even when the first destination never got
+	 * through: the frontend API and the status bar ask for this flag. */
+	os_atomic_set_bool(&streaming_active, true);
+
+	QMetaObject::invokeMethod(owner, [owner, id] { owner->NoteDestinationStarted(id); }, Qt::QueuedConnection);
 }
 
 static void ExtraStreamStopped(void *data, calldata_t *params)
@@ -845,18 +855,23 @@ static void ExtraStreamStopped(void *data, calldata_t *params)
 	long long code = 0;
 	calldata_get_int(params, "code", &code);
 	stream->stopPending = false;
-	stream->owner->NoteDestinationStopped(stream->id, code);
+
+	OBSBasic *owner = stream->owner;
+	std::string id = stream->id;
+	QMetaObject::invokeMethod(
+		owner, [owner, id, code] { owner->NoteDestinationStopped(id, code); }, Qt::QueuedConnection);
 }
 
-/* Slice 2b, first step of the fan-out: start the destinations after the first one.
+/* Slice 2b, the fan-out: start the destinations after the first one.
  *
  * The first enabled destination is served by the existing streamOutput path (Q42), so it is skipped here.
  * Every remaining one gets its own output object on top of the same encoders: the media is encoded once and
  * uploaded once per connection, which is what the feature is for.
  *
- * A destination that cannot be started is logged and left out; it never undoes the session, and the session's
- * own UI state still follows the first destination until that state becomes a live-destination count in the
- * next step of this slice. */
+ * A destination that cannot be started is logged and left out; it never undoes the session. The session's UI
+ * state follows the whole set of connections since Q13 was flipped: OBSBasic asks the output handler and the
+ * runtime entries what is still attempting or uploading, so a destination that failed here has to be marked
+ * stopped rather than left in "connecting" - otherwise it would keep a session alive that has nothing in it. */
 void AdvancedOutput::StartExtraDestinations()
 {
 	/* Nothing of the previous session may linger: stop and disconnect before the entries are dropped,
@@ -881,14 +896,28 @@ void AdvancedOutput::StartExtraDestinations()
 			continue;
 		}
 
+		/* A destination that never gets an output running must not stay counted as one of the session's
+		 * connections: OBSBasic asks how many runtime entries are still running to decide whether the
+		 * session goes on, so a failed one has to be put back to "stopped" here. */
+		auto markNotStarted = [&dest, this](const char *why) {
+			blog(LOG_WARNING, "streaming destination '%s' not started: %s", dest.name.c_str(), why);
+			if (StreamDestinationRuntime *runtime = main->RuntimeForId(dest.id)) {
+				runtime->state = StreamDestinationRuntime::State::Stopped;
+				runtime->output = nullptr;
+				runtime->service = nullptr;
+				runtime->encoderGroupId.clear();
+			}
+		};
+
 		OBSService service = destinations.createService(dest.id);
-		if (!service)
+		if (!service) {
+			markNotStarted("its service could not be created");
 			continue;
+		}
 
 		const char *type = GetStreamOutputType(service);
 		if (!type) {
-			blog(LOG_WARNING, "streaming destination '%s': no streaming output supports this service",
-			     dest.id.c_str());
+			markNotStarted("no streaming output supports this service");
 			continue;
 		}
 
@@ -899,8 +928,7 @@ void AdvancedOutput::StartExtraDestinations()
 		stream->service = service;
 		stream->output = obs_output_create(type, dest.id.c_str(), nullptr, nullptr);
 		if (!stream->output) {
-			blog(LOG_WARNING, "streaming destination '%s': could not create an output of type '%s'",
-			     dest.id.c_str(), type);
+			markNotStarted("no output object could be created");
 			continue;
 		}
 
@@ -946,10 +974,11 @@ void AdvancedOutput::StartExtraDestinations()
 
 		if (!obs_output_start(stream->output)) {
 			const char *error = obs_output_get_last_error(stream->output);
-			blog(LOG_WARNING, "streaming destination '%s' failed to start%s%s", dest.name.c_str(),
-			     (error && *error) ? ": " : "", (error && *error) ? error : "");
+			const string reason = string("the output refused to start") +
+					      ((error && *error) ? (": " + string(error)) : string());
 			stream->startSignal.Disconnect();
 			stream->stopSignal.Disconnect();
+			markNotStarted(reason.c_str());
 			continue;
 		}
 
@@ -1166,7 +1195,18 @@ void AdvancedOutput::StopReplayBuffer(bool force)
 
 bool AdvancedOutput::StreamingActive() const
 {
-	return obs_output_active(StreamingOutput());
+	if (obs_output_active(StreamingOutput()))
+		return true;
+
+	/* Q13: the session is every connection it owns, not only the first one. stopPending covers the extra
+	 * outputs from the moment they are started until their stop signal arrives, which includes the
+	 * handshake - an output that is still connecting is not "active" for libobs but is very much part of
+	 * the session. */
+	for (const auto &stream : extraStreams) {
+		if (stream->stopPending)
+			return true;
+	}
+	return false;
 }
 
 bool AdvancedOutput::RecordingActive() const

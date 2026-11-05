@@ -62,7 +62,9 @@ struct AdvancedOutput : BasicOutputHandler {
 		OBSSignal stopSignal;
 		OBSSignal startSignal;
 		/* Set once the output has been started and cleared by its stop signal: an output that is still
-		 * connecting has to be stopped just as much as one that is already uploading. */
+		 * connecting has to be stopped just as much as one that is already uploading. Written by the
+		 * output's own thread, read by the GUI thread - same arrangement as the handler flags in
+		 * BasicOutputHandler. */
 		bool stopPending = false;
 	};
 
