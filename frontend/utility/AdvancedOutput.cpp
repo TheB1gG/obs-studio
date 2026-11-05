@@ -862,6 +862,29 @@ static void ExtraStreamStopped(void *data, calldata_t *params)
 		owner, [owner, id, code] { owner->NoteDestinationStopped(id, code); }, Qt::QueuedConnection);
 }
 
+/* The reconnect signals of an extra destination's output: same arrangement - the handler runs on the output's
+ * thread and only copies what the GUI thread needs, and the connection lives as long as the entry does. */
+static void ExtraStreamReconnect(void *data, calldata_t *params)
+{
+	auto *stream = static_cast<AdvancedOutput::ExtraDestinationStream *>(data);
+	long long seconds = 0;
+	calldata_get_int(params, "timeout_sec", &seconds);
+
+	OBSBasic *owner = stream->owner;
+	std::string id = stream->id;
+	QMetaObject::invokeMethod(
+		owner, [owner, id, seconds] { owner->NoteDestinationReconnect(id, seconds); }, Qt::QueuedConnection);
+}
+
+static void ExtraStreamReconnected(void *data, calldata_t *)
+{
+	auto *stream = static_cast<AdvancedOutput::ExtraDestinationStream *>(data);
+
+	OBSBasic *owner = stream->owner;
+	std::string id = stream->id;
+	QMetaObject::invokeMethod(owner, [owner, id] { owner->NoteDestinationReconnected(id); }, Qt::QueuedConnection);
+}
+
 /* Slice 2b, the fan-out: start the destinations after the first one.
  *
  * The first enabled destination is served by the existing streamOutput path (Q42), so it is skipped here.
@@ -881,6 +904,8 @@ void AdvancedOutput::StartExtraDestinations()
 			obs_output_force_stop(previous->output);
 		previous->startSignal.Disconnect();
 		previous->stopSignal.Disconnect();
+		previous->reconnectSignal.Disconnect();
+		previous->reconnectSuccessSignal.Disconnect();
 		previous->output = nullptr;
 	}
 	extraStreams.clear();
@@ -1010,6 +1035,10 @@ bool AdvancedOutput::StartDestinationOutput(const StreamingDestination &dest)
 				    stream.get());
 	stream->stopSignal.Connect(obs_output_get_signal_handler(stream->output), "stop", ExtraStreamStopped,
 				   stream.get());
+	stream->reconnectSignal.Connect(obs_output_get_signal_handler(stream->output), "reconnect",
+					ExtraStreamReconnect, stream.get());
+	stream->reconnectSuccessSignal.Connect(obs_output_get_signal_handler(stream->output), "reconnect_success",
+					       ExtraStreamReconnected, stream.get());
 
 	if (!obs_output_start(stream->output)) {
 		const char *error = obs_output_get_last_error(stream->output);
@@ -1017,6 +1046,8 @@ bool AdvancedOutput::StartDestinationOutput(const StreamingDestination &dest)
 			string("the output refused to start") + ((error && *error) ? (": " + string(error)) : string());
 		stream->startSignal.Disconnect();
 		stream->stopSignal.Disconnect();
+		stream->reconnectSignal.Disconnect();
+		stream->reconnectSuccessSignal.Disconnect();
 		markNotStarted(reason.c_str());
 		return false;
 	}

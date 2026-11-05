@@ -923,6 +923,13 @@ public:
 	StreamDestinationRuntime *RuntimeForId(std::string_view id);
 	void NoteDestinationStarted(const std::string &id);
 	void NoteDestinationStopped(const std::string &id, long long code);
+	/* The reconnect of an extra destination reaches the status bar through here: the output handler owns
+	 * that connection and its signal handlers, so the widget never points at an entry that can disappear. */
+	void NoteDestinationReconnect(const std::string &id, long long seconds);
+	void NoteDestinationReconnected(const std::string &id);
+	/* Hand the current set of session connections to the status bar (which of them are up, which one is
+	 * between attempts). Called on every session transition. */
+	void PushStreamConnections();
 	size_t LiveDestinationCount() const;
 	size_t EnabledDestinationCount() const;
 	/* Destinations that belong to the running session: live, or still working their way through setup and

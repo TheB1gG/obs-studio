@@ -19,6 +19,7 @@
 
 #include "OBSBasic.hpp"
 #include "OBSBasicControls.hpp"
+#include "OBSBasicStatusBar.hpp"
 
 #include <components/UIValidation.hpp>
 #ifdef YOUTUBE_ENABLED
@@ -81,6 +82,7 @@ void OBSBasic::NoteDestinationStarted(const std::string &id)
 	runtime->reconnectAttempt = 0;
 	blog(LOG_INFO, "streaming destination '%s' is live (%zu of %zu enabled destinations up)", runtime->name.c_str(),
 	     LiveDestinationCount(), EnabledDestinationCount());
+	PushStreamConnections();
 }
 
 void OBSBasic::NoteDestinationStopped(const std::string &id, long long code)
@@ -102,6 +104,7 @@ void OBSBasic::NoteDestinationStopped(const std::string &id, long long code)
 	blog(LOG_INFO, "streaming destination '%s' stopped after %s, code %lld%s (%zu of %zu enabled destinations up)",
 	     runtime->name.c_str(), previousState, code, killed ? " - killed ungracefully" : "", LiveDestinationCount(),
 	     EnabledDestinationCount());
+	PushStreamConnections();
 
 	/* Only a stop that leaves nothing of the session up has to bring the session down. While another
 	 * destination is still attempting or uploading this was a per-destination failure, and StreamingStop
@@ -116,6 +119,46 @@ void OBSBasic::NoteDestinationStopped(const std::string &id, long long code)
 	}
 
 	StreamingStop(killed ? OBS_OUTPUT_SUCCESS : static_cast<int>(code), QString());
+}
+
+/* The status bar shows the session, so every transition pushes the current connection list and the reconnect
+ * reports of the extra destinations are routed through here (the handler owns their signals). */
+void OBSBasic::PushStreamConnections()
+{
+	if (!ui || !ui->statusbar)
+		return;
+
+	std::vector<OBSBasicStatusBar::StreamConnectionInfo> list;
+	for (const auto &entry : StreamSessionSnapshot())
+		list.push_back({entry.id, entry.name, entry.output, entry.reconnecting});
+
+	ui->statusbar->SetStreamConnections(list);
+}
+
+void OBSBasic::NoteDestinationReconnect(const std::string &id, long long seconds)
+{
+	if (StreamDestinationRuntime *runtime = RuntimeForId(id)) {
+		runtime->state = StreamDestinationRuntime::State::Reconnecting;
+		runtime->reconnectAttempt++;
+		blog(LOG_INFO, "streaming destination '%s' is reconnecting (attempt %d, next try in %lld s)",
+		     runtime->name.c_str(), runtime->reconnectAttempt, seconds);
+	}
+
+	if (ui && ui->statusbar)
+		ui->statusbar->NoteStreamReconnect(id, static_cast<int>(seconds));
+}
+
+void OBSBasic::NoteDestinationReconnected(const std::string &id)
+{
+	if (StreamDestinationRuntime *runtime = RuntimeForId(id)) {
+		if (runtime->state == StreamDestinationRuntime::State::Reconnecting)
+			runtime->state = StreamDestinationRuntime::State::Live;
+		runtime->reconnectAttempt = 0;
+		blog(LOG_INFO, "streaming destination '%s' reconnected", runtime->name.c_str());
+	}
+
+	if (ui && ui->statusbar)
+		ui->statusbar->NoteStreamReconnectSuccess(id);
 }
 
 void OBSBasic::StartStreaming()
@@ -182,6 +225,7 @@ void OBSBasic::StartStreaming()
 			 * restart and kill - can reach the connection instead of only the extra ones. */
 			runtime->output = outputHandler->StreamingOutput();
 			runtime->service = service;
+			PushStreamConnections();
 		}
 
 		if (autoStartBroadcast) {
@@ -364,6 +408,7 @@ void OBSBasic::StopDestination(std::string id, bool force)
 	 * other connections are up (Q13) - the transition is reported by the signal, not here. */
 	runtime->state = StreamDestinationRuntime::State::Stopping;
 	outputHandler->StopDestination(runtime->id, force);
+	PushStreamConnections();
 }
 
 bool OBSBasic::RestartDestination(const std::string &id)
@@ -386,7 +431,9 @@ bool OBSBasic::RestartDestination(const std::string &id)
 		return false;
 	}
 
-	return outputHandler->StartDestination(runtime->id);
+	const bool started = outputHandler->StartDestination(runtime->id);
+	PushStreamConnections();
+	return started;
 }
 
 std::vector<OBSBasic::StreamSessionEntry> OBSBasic::StreamSessionSnapshot() const
@@ -627,6 +674,10 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 		blog(LOG_INFO, "Streaming destination '%s' stopped after %s (%zu of %zu enabled destinations up)",
 		     runtime->name.c_str(), previousState, LiveDestinationCount(), EnabledDestinationCount());
 	}
+
+	/* The bar shows the session, so it has to learn about this connection going down even when the session
+	 * itself continues. */
+	PushStreamConnections();
 
 	/* Q13 (b): one connection going down does not end the session while other destinations of the session
 	 * are still up. Nothing that describes the session as a whole may change here - not the status bar,

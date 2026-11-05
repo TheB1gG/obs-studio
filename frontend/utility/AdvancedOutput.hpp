@@ -64,6 +64,8 @@ struct AdvancedOutput : BasicOutputHandler {
 		OBSOutput output; /* released when the entry goes away */
 		OBSSignal stopSignal;
 		OBSSignal startSignal;
+		OBSSignal reconnectSignal;
+		OBSSignal reconnectSuccessSignal;
 		/* Set once the output has been started and cleared by its stop signal: an output that is still
 		 * connecting has to be stopped just as much as one that is already uploading. Written by the
 		 * output's own thread, read by the GUI thread - same arrangement as the handler flags in
