@@ -946,7 +946,9 @@ public:
 	bool RestartDestination(const std::string &id);
 	/* What the widgets that show the session need: one entry per destination that is live or still
 	 * attempting, with its output, its state and its reconnect counter. Copies on purpose - a widget ticks
-	 * on its own and must not hold on to the runtime vector. */
+	 * on its own and must not hold on to the runtime vector. With includeStopped the destinations that
+	 * belong to a running session but are not uploading come along too (marked stopped): that is where a
+	 * restart action has to be offered. */
 	struct StreamSessionEntry {
 		std::string id;
 		std::string name;
@@ -954,8 +956,9 @@ public:
 		StreamDestinationRuntime::State state = StreamDestinationRuntime::State::Stopped;
 		int reconnectAttempt = 0;
 		bool reconnecting = false;
+		bool stopped = false;
 	};
-	std::vector<StreamSessionEntry> StreamSessionSnapshot() const;
+	std::vector<StreamSessionEntry> StreamSessionSnapshot(bool includeStopped = false) const;
 
 	std::optional<OBSProfile> GetProfileByName(const std::string &profileName) const;
 	std::optional<OBSProfile> GetProfileByDirectoryName(const std::string &directoryName) const;

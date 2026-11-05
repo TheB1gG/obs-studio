@@ -14,9 +14,11 @@
 
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 #include "moc_OBSBasicStats.cpp"
@@ -55,6 +57,15 @@ static QString MakeMissedFramesText(uint32_t total_lagged, uint32_t total_render
 {
 	return QString("%1 / %2 (%3%)")
 		.arg(QString::number(total_lagged), QString::number(total_rendered), QString::number(num, 'f', 1));
+}
+
+/* Theme-aware icon, same arrangement as the status bar's icons: the dark theme ships its own copy of the
+ * icons the main window uses (data/themes/Dark/...), the light build falls back to the compiled-in ones. */
+static QIcon ThemedIcon(const QString &name)
+{
+	const QString prefix = obs_frontend_is_theme_dark() ? QStringLiteral("theme:Dark/")
+							    : QStringLiteral(":/res/images/");
+	return QIcon(prefix + name);
 }
 
 /* EXPERIMENT (option G): on while the layout is being evaluated. Turn it off without a
@@ -138,7 +149,7 @@ OBSBasicStats::OBSBasicStats(QWidget *parent, bool closable)
 	/* --------------------------------------------- */
 
 	AddOutputLabels(QTStr("Basic.Stats.Output.Stream"));
-	AddOutputLabels(QTStr("Basic.Stats.Output.Recording"));
+	AddOutputLabels(QTStr("Basic.Stats.Output.Recording"), true);
 	RebuildOutputGrid();
 
 	/* --------------------------------------------- */
@@ -255,11 +266,63 @@ enum StatsColumn {
 	StatsColCount,
 };
 
-void OBSBasicStats::AddOutputLabels(QString name)
+void OBSBasicStats::AddOutputLabels(QString name, bool recording)
 {
 	OutputLabels ol;
 	ol.title = name;
+	ol.recording = recording;
 	outputLabels.push_back(ol);
+}
+
+/* One section per connection of the streaming session, plus the recording section. The section of a
+ * destination keeps its counters when only its title or order changes; when its output object was replaced
+ * (a restart), its rendition rows are dropped because the delivery-path baselines cannot be carried over to a
+ * new connection. */
+bool OBSBasicStats::SyncSections(const std::vector<SectionInfo> &session, obs_output_t *recOutput)
+{
+	bool changed = outputLabels.size() != session.size() + 1;
+
+	QList<OutputLabels> next;
+	next.reserve(int(session.size()) + 1);
+
+	for (const SectionInfo &info : session) {
+		OutputLabels section;
+		for (const OutputLabels &old : outputLabels) {
+			if (!old.recording && old.id == info.id) {
+				section = old;
+				break;
+			}
+		}
+
+		if (section.watched != info.output) {
+			section.rows.clear();
+			section.watched = info.output;
+			changed = true;
+		}
+
+		section.id = info.id;
+		section.title = info.title;
+		section.recording = false;
+		section.present = info.present;
+		next.push_back(section);
+	}
+
+	for (const OutputLabels &old : outputLabels) {
+		if (!old.recording)
+			continue;
+		OutputLabels section = old;
+		section.present = recOutput != nullptr;
+		if (section.watched != recOutput) {
+			section.rows.clear();
+			section.watched = recOutput;
+			changed = true;
+		}
+		next.push_back(section);
+		break;
+	}
+
+	outputLabels = next;
+	return changed;
 }
 
 /* Create the whole table from the model: one header row naming the rendition columns, then
@@ -302,7 +365,9 @@ void OBSBasicStats::RebuildOutputGrid()
 	row++;
 
 	for (OutputLabels &section : outputLabels) {
-		if (!section.active)
+		/* A destination that is part of the session but not uploading gets a bar too: that is where its
+		 * restart action lives. Its rendition rows stay hidden. */
+		if (!section.active && !section.present)
 			continue;
 
 		/* The output itself: one bar spanning the table, with the status and the
@@ -332,6 +397,59 @@ void OBSBasicStats::RebuildOutputGrid()
 		barLayout->addWidget(new QLabel(QStringLiteral("·"), bar));
 		barLayout->addWidget(section.droppedLabel.data());
 		barLayout->addStretch();
+
+		/* The actions of one connection (Q13): stop or kill this destination while the others keep
+		 * uploading, and bring back one that dropped. Only for the destinations of a session with more than
+		 * the plain single stream - with one unnamed connection the main window's own Start/Stop and skull
+		 * buttons are exactly these actions, so showing them twice would only invite confusion. */
+		if (!section.recording && !section.id.empty()) {
+			OBSBasic *main = OBSBasic::Get();
+			const std::string id = section.id;
+
+			auto addButton = [&](QPointer<QToolButton> &slot, const QString &icon, const char *textLoc,
+					     const char *tipLoc, void (OBSBasic::*action)(std::string, bool)) {
+				QToolButton *button = new QToolButton(bar);
+				button->setIcon(ThemedIcon(icon));
+				button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+				button->setText(QTStr(textLoc));
+				button->setToolTip(QTStr(tipLoc));
+				button->setAutoRaise(true);
+				button->setStyleSheet("font-size: 9pt;");
+				QObject::connect(button, &QToolButton::clicked, this,
+						 [main, id, action] { (main->*action)(id, false); });
+				barLayout->addWidget(button);
+				slot = button;
+			};
+
+			addButton(section.stopButton, "media/media_stop.svg", "Basic.Stats.Bar.Stop.Text",
+				  "Basic.Stats.Bar.Stop.ToolTip", &OBSBasic::StopDestination);
+
+			/* The kill takes the force flag the stop does not: the same action, ending the connection
+			 * without any end-of-stream data (Q41). */
+			QToolButton *kill = new QToolButton(bar);
+			kill->setIcon(ThemedIcon("settings/skull.svg"));
+			kill->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+			kill->setText(QTStr("Basic.Stats.Bar.Kill.Text"));
+			kill->setToolTip(QTStr("Basic.Stats.Bar.Kill.ToolTip"));
+			kill->setAutoRaise(true);
+			kill->setStyleSheet("font-size: 9pt;");
+			QObject::connect(kill, &QToolButton::clicked, this,
+					 [main, id] { main->KillDestinationUngracefully(id); });
+			barLayout->addWidget(kill);
+			section.killButton = kill;
+
+			QToolButton *restart = new QToolButton(bar);
+			restart->setIcon(ThemedIcon("media/media_restart.svg"));
+			restart->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+			restart->setText(QTStr("Basic.Stats.Bar.Restart.Text"));
+			restart->setToolTip(QTStr("Basic.Stats.Bar.Restart.ToolTip"));
+			restart->setAutoRaise(true);
+			restart->setStyleSheet("font-size: 9pt;");
+			QObject::connect(restart, &QToolButton::clicked, this,
+					 [main, id] { main->RestartDestination(id); });
+			barLayout->addWidget(restart);
+			section.restartButton = restart;
+		}
 
 		outputLayout->addWidget(bar, row++, 0, 1, StatsColCount);
 
@@ -436,7 +554,25 @@ void OBSBasicStats::Update()
 	OBSOutputAutoRelease strOutput = obs_frontend_get_streaming_output();
 	OBSOutputAutoRelease recOutput = obs_frontend_get_recording_output();
 
-	if (!strOutput && !recOutput)
+	/* The session's connections: since slice 2b every destination of a session has its own output, and the
+	 * legacy getter only reports the first one - a session whose first destination dropped but whose others
+	 * still upload has nothing to do with "no stream output", so the tick is gated on the snapshot instead.
+	 * includeStopped keeps the destinations that are part of the session but currently not uploading: that
+	 * is where their restart action lives. */
+	std::vector<OBSBasic::StreamSessionEntry> session = OBSBasic::Get()->StreamSessionSnapshot(true);
+	obs_output_t *rec = recOutput;
+
+	auto outputFor = [&](const OutputLabels &section) -> obs_output_t * {
+		if (section.recording)
+			return rec;
+		for (const auto &entry : session) {
+			if (entry.id == section.id)
+				return entry.output;
+		}
+		return nullptr;
+	};
+
+	if (session.empty() && !recOutput)
 		return;
 
 	/* ------------------------------------------- */
@@ -519,8 +655,16 @@ void OBSBasicStats::Update()
 	/* Encoding lag belongs to the delivery mix of each encoder, not to the base
 	 * canvas: with the high-fidelity master canvas the base canvas mix has no
 	 * consumers of its own, so obs_get_video() would report 0/0 forever. Sum the
-	 * counters of every encoder feeding the active outputs instead. */
-	OBS::EncoderFrameCounters counters = OBS::outputFrameCounters({strOutput, recOutput});
+	 * counters of every encoder feeding the active outputs instead - for a session
+	 * with several destinations that is every connection, since they all attach to
+	 * the same encoders and the sum counts each encoder and mix once. */
+	std::vector<const obs_output_t *> counted;
+	counted.reserve(session.size() + 1);
+	for (const auto &entry : session)
+		counted.push_back(entry.output);
+	counted.push_back(recOutput);
+
+	OBS::EncoderFrameCounters counters = OBS::outputFrameCounters(counted);
 	uint64_t total_encoded = counters.delivered;
 	uint64_t total_skipped = counters.lagSkipped;
 
@@ -580,26 +724,47 @@ void OBSBasicStats::Update()
 	 * encoders, so those pointers stay valid while the output runs - and the table is laid
 	 * out again only when the set of rows really changed. Laying out re-creates the section
 	 * labels as well, which is why the output row text is written after it. */
-	bool rowsChanged = outputLabels[0].SyncRenditions(strOutput);
-	rowsChanged |= outputLabels[1].SyncRenditions(recOutput);
-	if (rowsChanged)
+	std::vector<SectionInfo> sections;
+	sections.reserve(session.size());
+	for (const auto &entry : session) {
+		SectionInfo info;
+		info.id = entry.id;
+		/* Named by the destination so its rows can be told apart; a single unnamed destination keeps the
+		 * plain "Stream" title, which leaves the single-stream look unchanged. */
+		info.title = entry.name.empty() ? QTStr("Basic.Stats.Output.Stream") : QT_UTF8(entry.name.c_str());
+		info.output = entry.output;
+		info.present = true;
+		sections.push_back(info);
+	}
+
+	bool structureChanged = SyncSections(sections, rec);
+
+	bool rowsChanged = false;
+	for (OutputLabels &section : outputLabels)
+		rowsChanged |= section.SyncRenditions(outputFor(section));
+
+	if (structureChanged || rowsChanged)
 		RebuildOutputGrid();
 
-	outputLabels[0].Update(strOutput, false);
-	outputLabels[1].Update(recOutput, true);
+	for (OutputLabels &section : outputLabels)
+		section.Update(outputFor(section), section.recording);
 
 	MarkSharedMixes();
-	outputLabels[0].UpdateRenditions();
-	outputLabels[1].UpdateRenditions();
+	for (OutputLabels &section : outputLabels)
+		section.UpdateRenditions();
 
 	/* EXPERIMENT (option G) begin */
 	if (renditionInspector)
 		renditionInspector->Update(strOutput, recOutput);
 	/* EXPERIMENT (option G) end */
 
-	if (obs_output_active(recOutput)) {
-		long double kbps = outputLabels[1].kbps;
-		bitrates.push_back(kbps);
+	if (obs_output_active(rec)) {
+		for (const OutputLabels &section : outputLabels) {
+			if (section.recording) {
+				bitrates.push_back(section.kbps);
+				break;
+			}
+		}
 	}
 }
 
@@ -653,16 +818,33 @@ void OBSBasicStats::Reset()
 	first_rendered = 0xFFFFFFFF;
 	first_lagged = 0xFFFFFFFF;
 
-	OBSOutputAutoRelease strOutput = obs_frontend_get_streaming_output();
 	OBSOutputAutoRelease recOutput = obs_frontend_get_recording_output();
+
+	/* Re-baseline every section against the connection it is showing right now, the same way Update()
+	 * resolves them: the first destination's output is not the whole session any more. */
+	std::vector<OBSBasic::StreamSessionEntry> session = OBSBasic::Get()->StreamSessionSnapshot(true);
+	obs_output_t *rec = recOutput;
 
 	/* Drop the rendition rows as well: Update() re-creates them with baselines taken at
 	 * the current counter values, which is what "reset" means for a delta-based display. */
-	for (OutputLabels &section : outputLabels)
+	for (OutputLabels &section : outputLabels) {
 		section.rows.clear();
 
-	outputLabels[0].Reset(strOutput);
-	outputLabels[1].Reset(recOutput);
+		obs_output_t *out = nullptr;
+		if (section.recording) {
+			out = rec;
+		} else {
+			for (const auto &entry : session) {
+				if (entry.id == section.id) {
+					out = entry.output;
+					break;
+				}
+			}
+		}
+
+		section.Reset(out);
+	}
+
 	Update();
 }
 
@@ -705,11 +887,26 @@ void OBSBasicStats::OutputLabels::Update(obs_output_t *output, bool rec)
 				str = QTStr("Basic.Stats.Status.Live");
 				styling = "text-success";
 			}
+		} else if (present && !id.empty()) {
+			/* Part of a session that is still running, but this connection is not uploading: either it
+			 * never started or its attempts are over. The restart action below is what Q13 promises for
+			 * this case. */
+			str = QTStr("Basic.Stats.Status.NotUploading");
+			styling = "text-warning";
 		}
 	}
 
 	statusLabel->setText(str);
 	setClasses(statusLabel, styling);
+
+	/* The actions follow the state: while the connection is up it can be stopped or killed, once it is down
+	 * only restarting it makes sense. */
+	if (stopButton)
+		stopButton->setVisible(active);
+	if (killButton)
+		killButton->setVisible(active);
+	if (restartButton)
+		restartButton->setVisible(!active && present);
 
 	long double num = (long double)totalBytes / (1024.0l * 1024.0l);
 	const char *unit = "MiB";
@@ -717,8 +914,7 @@ void OBSBasicStats::OutputLabels::Update(obs_output_t *output, bool rec)
 		num /= 1024;
 		unit = "GiB";
 	}
-	sentLabel->setText(QTStr("Basic.Stats.Bar.Sent.Text")
-				   .arg(QString("%1 %2").arg(num, 0, 'f', 1).arg(unit)));
+	sentLabel->setText(QTStr("Basic.Stats.Bar.Sent.Text").arg(QString("%1 %2").arg(num, 0, 'f', 1).arg(unit)));
 
 	num = kbps;
 	unit = "kb/s";

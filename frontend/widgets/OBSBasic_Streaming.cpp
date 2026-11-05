@@ -436,12 +436,19 @@ bool OBSBasic::RestartDestination(const std::string &id)
 	return started;
 }
 
-std::vector<OBSBasic::StreamSessionEntry> OBSBasic::StreamSessionSnapshot() const
+std::vector<OBSBasic::StreamSessionEntry> OBSBasic::StreamSessionSnapshot(bool includeStopped) const
 {
 	std::vector<StreamSessionEntry> entries;
+	const bool sessionLive = outputHandler && outputHandler->StreamingActive();
 
 	for (const auto &runtime : streamRuntimes) {
-		if (!runtime.enabled || !runtime.isRunning())
+		if (!runtime.enabled)
+			continue;
+
+		const bool running = runtime.isRunning();
+		/* A destination that is not part of a live session has nothing to show: after the session ended,
+		 * the entries stay in the list to remember their configuration, not to be reported as down. */
+		if (!running && !(includeStopped && sessionLive))
 			continue;
 
 		StreamSessionEntry entry;
@@ -451,6 +458,7 @@ std::vector<OBSBasic::StreamSessionEntry> OBSBasic::StreamSessionSnapshot() cons
 		entry.state = runtime.state;
 		entry.reconnectAttempt = runtime.reconnectAttempt;
 		entry.reconnecting = runtime.output ? obs_output_reconnecting(runtime.output) : false;
+		entry.stopped = !running;
 		entries.push_back(std::move(entry));
 	}
 

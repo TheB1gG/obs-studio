@@ -13,6 +13,10 @@
 class QLabel;
 class QWidget;
 class QGridLayout;
+class QToolButton;
+
+#include <string>
+#include <vector>
 
 /* EXPERIMENT (option G) - remove together with widgets/OBSStatsRenditionInspector.{hpp,cpp}. */
 class OBSStatsRenditionInspector;
@@ -95,8 +99,22 @@ class OBSBasicStats : public QFrame {
 
 		/* A section (its bar and its rendition rows) only exists in the table while the
 		 * output is running - an idle Stream/Recording row is noise when renditions can be
-		 * several rows deep. `active` mirrors what RebuildOutputGrid() laid out. */
+		 * several rows deep. `active` mirrors what RebuildOutputGrid() laid out.
+		 *
+		 * A streaming session can hold several connections (slice 2b), so a destination that is
+		 * part of the session but currently not uploading still gets a bar (`present`): that is
+		 * where its restart action lives. Its rendition rows stay hidden. */
 		bool active = false;
+		bool present = false;
+
+		/* The destination this section belongs to; empty for the recording section and for the
+		 * single-destination case. Identity only - never dereferenced, the output is handed to
+		 * Update()/SyncRenditions() on every tick. */
+		std::string id;
+		bool recording = false;
+		/* The output this section was last built for, so a replaced connection (a restart) can be
+		 * noticed without throwing the section's counters away. */
+		obs_output_t *watched = nullptr;
 
 		/* One bar spanning the table width:
 		 *   "Stream · LIVE · sent 2.1 GiB · 24.8 Mb/s · dropped 0 / 117741 (0.0%)"
@@ -108,6 +126,12 @@ class OBSBasicStats : public QFrame {
 		QPointer<QLabel> sentLabel;
 		QPointer<QLabel> bitrateLabel;
 		QPointer<QLabel> droppedLabel;
+
+		/* Per-connection actions (Q13): stop or kill one destination without ending the session, and
+		 * bring a dropped one back while the rest keeps uploading. */
+		QPointer<QToolButton> stopButton;
+		QPointer<QToolButton> killButton;
+		QPointer<QToolButton> restartButton;
 
 		uint64_t lastBytesSent = 0;
 		uint64_t lastBytesSentTime = 0;
@@ -131,7 +155,21 @@ class OBSBasicStats : public QFrame {
 
 	QList<OutputLabels> outputLabels;
 
-	void AddOutputLabels(QString name);
+	/* One connection of the streaming session as the stats window is told about it. The output pointer is
+	 * borrowed for the duration of the call; the caller (Update) keeps the references alive while it ticks. */
+	struct SectionInfo {
+		std::string id;
+		QString title;
+		obs_output_t *output = nullptr;
+		bool present = false;
+	};
+
+	void AddOutputLabels(QString name, bool recording = false);
+	/* Bring the stream sections in line with the connections of the session: one section per destination,
+	 * named by destination, with the recording section kept. Counters of a section that stays are carried
+	 * over, so a rebuild does not reset the deltas. Returns true when the set changed and the table has to
+	 * be laid out again. */
+	bool SyncSections(const std::vector<SectionInfo> &session, obs_output_t *recOutput);
 	/* (Re-)create every label of the output table from the current model. */
 	void RebuildOutputGrid();
 	/* Flag the rows whose delivery mix feeds more than one encoder (mix reuse). */
