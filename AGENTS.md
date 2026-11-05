@@ -61,25 +61,36 @@ Rules:
   has permanent value), no commented-out code, no unrelated formatting changes.
 - Revert cosmetic-only edits to files that are not part of the fix.
 
-## 3. CI gate via test tags (mandatory before pushing program code)
+## 3. CI gate via test tags (bulk, not per commit)
 
-Before pushing program-code changes to this repository, verify that they build
-on all supported platforms by running CI on a test tag:
+Per-commit test-tag gates are too slow for the current feature work - the Ubuntu
+runner alone often needs 30+ minutes. The agreed workflow is:
 
-1. Commit the changes locally.
-2. Create and push a test tag pointing at that commit:
+1. Commit locally, verify with the local build plus the local harnesses
+   (`scratch/tmp/*.ps1`), then push the branch freely. No test tag per commit.
+2. Record every pushed commit that has not been through CI in
+   `scratch/plan/CI-PENDING.md` - one line each: short sha + subject + which
+   platforms (if any) were verified.
+3. When a batch of commits has piled up, or before anything is released, run a
+   single test tag over the **newest** commit of the batch:
    - Tag schema: `test-<problem-or-feature>` - the name of the problem being
      fixed or the feature being added, **no whitespace** (use hyphens), e.g.
      `test-qsv-hevc-444-colors`.
    - `git tag test-... <commit> && git push origin test-...`
-3. Wait for the "Test Tag" workflow (`.github/workflows/test-tag.yaml`) to
-   finish green. It builds Windows (x64/arm64), macOS (arm64/x86_64) and
-   Ubuntu 26.04 - no Flatpak. The built artifacts are available on the
-   workflow run page (Actions → run → Artifacts) for verification.
-4. Only after the build succeeds, push the branch/commit to the repository.
-5. After the changes have been pushed, delete the test tag again (mandatory -
-   test tags are a temporary CI gate, not part of the release history):
+   - The tag builds the commit it points at, which contains all earlier pushed
+     commits, so one run gates the whole batch.
+4. Read the individual jobs of the "Test Tag" workflow
+   (`.github/workflows/test-tag.yaml`), not the run conclusion: Windows x64 and
+   arm64 must be green. macOS runners are offline (cancelled jobs are the
+   expected state - do not edit the workflow). Ubuntu is slow; skipping it needs
+   the user's go-ahead, and the CI-PENDING entry must then say so. A red Ubuntu
+   job whose **Build** step passed but whose **Package** step died on a network
+   error is an infrastructure flake, not a code failure (see scratch/plan/CI-NOTES.md).
+5. After the batch is green, push (if anything is still unpushed) and delete the
+   test tag again (mandatory - test tags are a temporary CI gate, not part of
+   the release history):
    `git tag -d test-... && git push origin --delete test-...`
+   Then remove the covered commits from `scratch/plan/CI-PENDING.md`.
 
 Exception: changes that only touch `.github/workflows` (CI configuration) do not
 change program code and do **not** require the test-tag build gate.
