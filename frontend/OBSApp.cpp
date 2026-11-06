@@ -307,14 +307,18 @@ void OBSApp::InitUserConfigDefaults()
 	config_set_default_bool(userConfig, "BasicWindow", "MediaControlsCountdownTimer", true);
 
 	/* Appearance defaults for this fork. Font scale 8 is the bottom of the slider (the form range is
-	 * 8..12, OBSBasicSettings.ui), i.e. the compact text size the harnesses assert against. Density -1 is
-	 * the "Classic" choice: uic registers the four density radios in form order (appearanceDensity1 =
-	 * Classic, 2 = Compact, 3 = Normal, 4 = Comfortable) and QButtonGroup auto-assigns negative ids in
-	 * that order, which is the same id space getPaddingForDensityId() in OBSApp_Themes.cpp reads and
-	 * LoadAppearanceSettings() looks up with appearanceDensityButtonGroup->button(). The upstream default
-	 * of 1 matched no button at all, so the form quietly kept its own checked widget. */
+	 * 8..12, OBSBasicSettings.ui), i.e. the compact text size the harnesses assert against. Density picks
+	 * the "Classic" choice; its id is documented at the call below. The first attempt here used -1, which
+	 * belongs to no button at all: LoadAppearanceSettings() then finds nothing and the dialog shows the
+	 * form's own checked widget (Normal) - the same failure mode as upstream's default of 1. */
 	config_set_default_int(userConfig, "Appearance", "FontScale", 8);
-	config_set_default_int(userConfig, "Appearance", "Density", -1);
+	/* Classic, verified: the four density buttons carry the auto-ids -2 (Classic), -3 (Compact),
+	 * -4 (Normal), -5 (Comfortable) - the same four values getPaddingForDensityId() maps to
+	 * 0.25/2/4/6 padding. Confirmed by clicking Classic in the dialog and reading [Appearance] Density
+	 * back: -2. The value -1 belongs to no button, so LoadAppearanceSettings() finds nothing and the form
+	 * falls back to its .ui-checked widget, which is Normal - that is how upstream's default of 1 behaved,
+	 * and it is the mistake this line used to make. */
+	config_set_default_int(userConfig, "Appearance", "Density", -2);
 }
 
 static bool do_mkdir(const char *path)

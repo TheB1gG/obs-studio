@@ -102,6 +102,15 @@ void OBSBasicSettings::LoadAppearanceSettings(bool reload)
 	QAbstractButton *densityButton = ui->appearanceDensityButtonGroup->button(densityId);
 	if (densityButton) {
 		densityButton->setChecked(true);
+	} else {
+		/* The density ids are the QButtonGroup auto-ids of the four buttons (-2 Classic, -3 Compact,
+		 * -4 Normal, -5 Comfortable). Anything else - upstream's old default of 1, a hand edit, a value
+		 * from a build with a different button order - selects nothing, which the user can only notice as
+		 * "the spacing is not what the config says". Say which control the form is actually showing. */
+		QAbstractButton *shown = ui->appearanceDensityButtonGroup->checkedButton();
+		blog(LOG_WARNING,
+		     "Settings: [Appearance] Density=%d matches no density control; the dialog shows %s",
+		     densityId, shown ? QT_TO_UTF8(shown->text()) : QT_TO_UTF8(QStringLiteral("nothing")));
 	}
 	updateAppearanceControls();
 
