@@ -762,22 +762,17 @@ bool OBSBasic::InitBasicConfigDefaults()
 	}
 
 	if (droppedSimpleSettings) {
-		/* Said once per profile: the settings page still writes the old keys until its own rebuild, and the
-		 * notice must not come back on every load because of that. */
-		if (!config_get_string(activeConfiguration, "General", "SimpleOutputRemoved")) {
-			blog(LOG_WARNING,
-			     "output settings: the removed simple output mode left values in this profile, they were "
-			     "dropped and the output is back to its defaults");
-			const QString text = QTStr("Output.SimpleModeRemoved.Text");
-			/* Non-modal on purpose: a dialog here would sit in front of the profile load and stop the
-			 * start-up actions (and any automated run) until somebody clicks it away. The tray bubble plus the
-			 * status bar say it without blocking, and the line above keeps it in the log. */
-			QTimer::singleShot(2500, this, [this, text] {
-				SysTrayNotify(text, QSystemTrayIcon::Warning);
-				ShowStatusBarMessage(text);
-			});
-			config_set_string(activeConfiguration, "General", "SimpleOutputRemoved", "1");
-		}
+		/* Quiet on purpose. This used to announce itself once per profile with a warning line in the log, a
+		 * tray bubble and a status-bar line; the keys are dropped, the [AdvOut]/[Stream1] defaults set in this
+		 * same function describe what the output is back to, and the announcement only kept coming back on
+		 * every profile that had ever been in simple mode. */
+		changed = true;
+	}
+
+	/* The marker key that gated that notice goes the same way: nothing reads it any more, and leaving it in
+	 * basic.ini would be a dead key like the ones above. */
+	if (config_has_user_value(activeConfiguration, "General", "SimpleOutputRemoved")) {
+		config_remove_value(activeConfiguration, "General", "SimpleOutputRemoved");
 		changed = true;
 	}
 
