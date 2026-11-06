@@ -122,7 +122,17 @@ Related facts:
   built/instrumented DLLs only exist in `build_x64/rundir/`.
 - Logs of this fork are written to `%APPDATA%\obs-studio\logs` and named
   `<YYYY-MM-DD HH-MM-SS>.txt` (no `obs` prefix). Crash reports from the OBS
-  crash handler land in the same directory as `crash-<timestamp>.txt`.
+  crash handler do **not** land there: they go to a sibling `crashes` folder as
+  `Crash <YYYY-MM-DD HH-MM-SS>.txt` (portable mode:
+  `build_x64/rundir/RelWithDebInfo/config/obs-studio/crashes/`, see section 6).
+- That report is the fastest way to a Windows crash here: it names the exception
+  code, the faulting module and the **symbolised stack of the crashed thread**,
+  so it beats both the Event Viewer (which often blames a module that was merely
+  loaded last) and reproducing by hand. Read it before guessing.
+- One exception: `0xc0000409` (`__fastfail`, e.g. a CEF/obs-browser abort or a
+  MSVC stack-buffer-overrun check) never reaches the OBS handler, so no report
+  file appears and only Windows Error Reporting knows about it. A genuine
+  access violation (`0xc0000005`) does get a report written.
 
 ## 5. Temporary / scratch files (mandatory)
 
@@ -178,13 +188,16 @@ Portable layout (relative to the repository root, CWD = `bin/64bit`):
 | Profiles | `build_x64/rundir/RelWithDebInfo/config/obs-studio/basic/profiles/<profile>/basic.ini` |
 | Scene collections | `build_x64/rundir/RelWithDebInfo/config/obs-studio/basic/scenes/<collection>.json` |
 | Logs | `build_x64/rundir/RelWithDebInfo/config/obs-studio/logs/<YYYY-MM-DD HH-MM-SS>.txt` |
+| Crash reports | `build_x64/rundir/RelWithDebInfo/config/obs-studio/crashes/Crash <YYYY-MM-DD HH-MM-SS>.txt` |
 
 Gotchas (all hit during the QSV HEVC ABR tests):
 - **CWD must be `bin/64bit`.** From any other CWD, `BASE_PATH` (`../..`) resolves to a
   different folder - portable config lands somewhere unexpected and/or data files are not
   found (see section 4).
-- Advanced output mode is selected with `[Output] Mode=Advanced` in the profile's
-  `basic.ini` (not `Service=Advanced`).
+- There is no simple/advanced output-mode split any more: the advanced handler is
+  always built, `[Output] Mode` is not read and is removed from the profile on
+  load (the `[SimpleOutput]` section is swept at the same time). Older
+  documents/harnesses that set `Mode=Advanced` are harmless but pointless.
 - A media source in a scene JSON uses the key `local_file` (not `input`); use forward
   slashes. Point it at a file that actually exists - a missing file encodes to near-black
   at ~177 kbps and invalidates any bitrate measurement.
