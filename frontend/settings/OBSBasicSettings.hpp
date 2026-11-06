@@ -99,9 +99,9 @@ private:
 	OBSPropertiesView *streamEncoderProps = nullptr;
 	OBSPropertiesView *recordEncoderProps = nullptr;
 
-	/* Streaming destinations page (Settings -> "Streaming destinations"). The page exists in the .ui
-	 * either way so that page indices and the themed list icons stay consistent; it is only populated
-	 * when the profile opts in with [General] StreamingDestinationsPage=true. */
+	/* Streaming destinations page (Settings -> "Streaming destinations"). The page is always populated now
+	 * that destinations are the default output surface; it lives in the .ui unconditionally so that page
+	 * indices and the themed list icons stay consistent for every profile. */
 	QPointer<QVBoxLayout> destinationsPageLayout;
 	QPointer<QListWidget> destinationsList;
 	QPointer<QLabel> destinationsEmptyLabel;

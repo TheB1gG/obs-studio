@@ -35,11 +35,6 @@ struct StreamingDestination {
  * output handler start using it. */
 class StreamingDestinations {
 public:
-	/* Profile-ini flag that turns the multi-destination page on. Everything below is unreachable
-	 * while it is false, which is how the feature ships dark. */
-	static constexpr const char *page_flag_section = "General";
-	static constexpr const char *page_flag_key = "StreamingDestinationsPage";
-
 	/* Where the destination list itself lives in basic.ini. */
 	static constexpr const char *list_section = "Streaming";
 	static constexpr const char *list_key = "Destinations";
@@ -62,8 +57,6 @@ public:
 	static constexpr const char *profile_section = "Output";
 
 	using list_type = std::vector<StreamingDestination>;
-
-	static bool pageEnabled(config_t *profile_config);
 
 	void Load(config_t *profile_config, const std::filesystem::path &profile_dir);
 	/* Write the model to disk: the ini keys, the JSON file of every listed destination, and the file
