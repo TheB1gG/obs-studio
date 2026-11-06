@@ -142,8 +142,6 @@ private:
 	uint32_t outputCX = 0;
 	uint32_t outputCY = 0;
 
-	QPointer<QCheckBox> simpleVodTrack;
-
 	QPointer<QCheckBox> vodTrackCheckbox;
 	QPointer<QWidget> vodTrackContainer;
 	QPointer<QRadioButton> vodTrack[MAX_AUDIO_MIXES];
@@ -284,7 +282,6 @@ private slots:
 
 private:
 	/* output */
-	void LoadSimpleOutputSettings();
 	void LoadAdvOutputStreamingSettings();
 	void LoadAdvOutputStreamingEncoderProperties();
 	void LoadAdvOutputRecordingSettings();
@@ -337,7 +334,6 @@ private:
 
 	void SearchHotkeys(const QString &text, obs_key_combination_t filterCombo);
 
-	void UpdateSimpleOutStreamDelayEstimate();
 	void UpdateAdvOutStreamDelayEstimate();
 
 	void FillSimpleRecordingValues();
@@ -370,7 +366,6 @@ private:
 	QIcon GetAdvancedIcon() const;
 
 	int CurrentFLVTrack();
-	int SimpleOutGetSelectedAudioTracks();
 	int AdvOutGetSelectedAudioTracks();
 	int AdvOutGetStreamingSelectedAudioTracks();
 

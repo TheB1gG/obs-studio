@@ -714,6 +714,17 @@ bool OBSBasic::InitBasicConfigDefaults()
 		droppedSimpleSettings = true;
 	config_remove_value(activeConfiguration, "Output", "Mode");
 
+	/* Two keys of the section are not simple-mode settings at all: the replay-buffer file naming fields on the
+	 * Advanced settings page were written to [SimpleOutput] and read back from there by the advanced engine.
+	 * They keep their meaning without simple mode, so they move to [AdvOut] instead of being dropped. */
+	for (const char *key : {"RecRBPrefix", "RecRBSuffix"}) {
+		if (!config_has_user_value(activeConfiguration, "SimpleOutput", key))
+			continue;
+		const char *value = config_get_string(activeConfiguration, "SimpleOutput", key);
+		if (value && *value && !config_has_user_value(activeConfiguration, "AdvOut", key))
+			config_set_string(activeConfiguration, "AdvOut", key, value);
+	}
+
 	static const char *const simple_keys[] = {"ABitrate",
 						  "ABitrateMode",
 						  "AMDAV1Preset",
@@ -744,7 +755,8 @@ bool OBSBasic::InitBasicConfigDefaults()
 						  "x264Settings"};
 
 	for (const char *key : simple_keys) {
-		if (config_has_user_value(activeConfiguration, "SimpleOutput", key))
+		const bool carried = (astrcmpi(key, "RecRBPrefix") == 0 || astrcmpi(key, "RecRBSuffix") == 0);
+		if (config_has_user_value(activeConfiguration, "SimpleOutput", key) && !carried)
 			droppedSimpleSettings = true;
 		config_remove_value(activeConfiguration, "SimpleOutput", key);
 	}
