@@ -511,8 +511,8 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 #endif
 	HookWidget(ui->filenameFormatting,   EDIT_CHANGED,   ADV_CHANGED);
 	HookWidget(ui->overwriteIfExists,    CHECK_CHANGED,  ADV_CHANGED);
-	HookWidget(ui->simpleRBPrefix,       EDIT_CHANGED,   ADV_CHANGED);
-	HookWidget(ui->simpleRBSuffix,       EDIT_CHANGED,   ADV_CHANGED);
+	HookWidget(ui->advRBPrefix,       EDIT_CHANGED,   ADV_CHANGED);
+	HookWidget(ui->advRBSuffix,       EDIT_CHANGED,   ADV_CHANGED);
 	HookWidget(ui->streamDelayEnable,    CHECK_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->streamDelaySec,       SCROLL_CHANGED, ADV_CHANGED);
 	HookWidget(ui->streamDelayPreserve,  CHECK_CHANGED,  ADV_CHANGED);
@@ -2086,15 +2086,6 @@ void OBSBasicSettings::LoadOutputSettings()
 
 	ResetEncoders();
 
-	/* There is one output engine now, so the mode selector and the page it chose between are gone: the
-	 * stack permanently shows the advanced settings. The simple widgets are still sitting in the form, but
-	 * nothing reads or writes settings through them any more - they leave with the form itself. */
-	delete ui->outputModeLabel;
-	ui->outputModeLabel = nullptr;
-	delete ui->outputMode;
-	ui->outputMode = nullptr;
-	ui->outputModePages->setCurrentIndex(1);
-
 	LoadAdvOutputStreamingSettings();
 	LoadAdvOutputStreamingEncoderProperties();
 
@@ -2455,8 +2446,8 @@ void OBSBasicSettings::LoadAdvancedSettings()
 
 	ui->filenameFormatting->setText(filename);
 	ui->overwriteIfExists->setChecked(overwriteIfExists);
-	ui->simpleRBPrefix->setText(rbPrefix);
-	ui->simpleRBSuffix->setText(rbSuffix);
+	ui->advRBPrefix->setText(rbPrefix);
+	ui->advRBSuffix->setText(rbSuffix);
 
 	ui->advReplayBuf->setChecked(replayBuf);
 	ui->advRBSecMax->setValue(rbTime);
@@ -3092,8 +3083,8 @@ void OBSBasicSettings::SaveAdvancedSettings()
 		config_set_bool(App()->GetUserConfig(), "General", "ConfirmOnExit", ui->confirmOnExit->isChecked());
 
 	SaveEdit(ui->filenameFormatting, "Output", "FilenameFormatting");
-	SaveEdit(ui->simpleRBPrefix, "AdvOut", "RecRBPrefix");
-	SaveEdit(ui->simpleRBSuffix, "AdvOut", "RecRBSuffix");
+	SaveEdit(ui->advRBPrefix, "AdvOut", "RecRBPrefix");
+	SaveEdit(ui->advRBSuffix, "AdvOut", "RecRBSuffix");
 	SaveCheckBox(ui->overwriteIfExists, "Output", "OverwriteIfExists");
 	SaveCheckBox(ui->streamDelayEnable, "Output", "DelayEnable");
 	SaveSpinBox(ui->streamDelaySec, "Output", "DelaySec");
