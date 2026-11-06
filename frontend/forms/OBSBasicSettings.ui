@@ -98,15 +98,6 @@
        </item>
        <item>
         <property name="text">
-         <string>Basic.Settings.Stream.Destinations</string>
-        </property>
-        <property name="icon">
-         <iconset resource="obs.qrc">
-          <normaloff>:/settings/images/settings/output.svg</normaloff>:/settings/images/settings/output.svg</iconset>
-        </property>
-       </item>
-       <item>
-        <property name="text">
          <string>Basic.Settings.Audio</string>
         </property>
         <property name="icon">
@@ -2402,6 +2393,14 @@
                     <property name="bottomMargin">
                      <number>0</number>
                     </property>
+                    <item>
+                     <widget class="QGroupBox" name="advOutDestinationsGroup">
+                      <property name="title">
+                       <string>Basic.Settings.Stream.Destinations</string>
+                      </property>
+                      <layout class="QVBoxLayout" name="destinationsPageLayout"/>
+                     </widget>
+                    </item>
                     <item>
                      <widget class="QScrollArea" name="scrollArea_3">
                       <property name="frameShape">
@@ -5477,9 +5476,6 @@
           </widget>
          </item>
         </layout>
-       </widget>
-       <widget class="QWidget" name="destinationsPage">
-        <layout class="QVBoxLayout" name="destinationsPageLayout"/>
        </widget>
        <widget class="QWidget" name="audioPage">
         <layout class="QVBoxLayout" name="formLayout">

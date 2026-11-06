@@ -80,6 +80,9 @@ void OBSBasicSettings::SetupDestinationsPage()
 	list->setSelectionMode(QAbstractItemView::SingleSelection);
 	list->setDragDropMode(QAbstractItemView::InternalMove);
 	list->setDefaultDropAction(Qt::MoveAction);
+	/* The cards live inside the Output tab's streaming page now, above the shared encoder controls, and the
+	 * page gives them no height of its own: without a minimum the whole list collapses to one block. */
+	list->setMinimumHeight(260);
 	list->reordered = [this]() {
 		/* Still inside the view's own move handling here: rebuilding destroys the items the view is
 		 * working with, so it has to wait for the next event-loop turn. */

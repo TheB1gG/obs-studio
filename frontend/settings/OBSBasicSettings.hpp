@@ -56,7 +56,9 @@ class OBSBasicSettings : public QDialog {
 	Q_PROPERTY(QIcon accessibilityIcon READ GetAccessibilityIcon WRITE SetAccessibilityIcon DESIGNABLE true)
 	Q_PROPERTY(QIcon advancedIcon READ GetAdvancedIcon WRITE SetAdvancedIcon DESIGNABLE true)
 
-	enum Pages { GENERAL, APPEARANCE, STREAM, OUTPUT, DESTINATIONS, AUDIO, VIDEO, HOTKEYS, ACCESSIBILITY, ADVANCED,
+	/* One row of the settings list and one page of the stack, in the order they appear in the form. The
+	 * streaming destinations have no page of their own since the Output tab took them over. */
+	enum Pages { GENERAL, APPEARANCE, STREAM, OUTPUT, AUDIO, VIDEO, HOTKEYS, ACCESSIBILITY, ADVANCED,
 		   NUM_PAGES };
 
 private:
