@@ -59,8 +59,6 @@ target_sources(
     utility/ScreenshotObj.cpp
     utility/ScreenshotObj.hpp
     utility/SettingsEventFilter.hpp
-    utility/SimpleOutput.cpp
-    utility/SimpleOutput.hpp
     utility/StartMultiTrackVideoStreamingGuard.hpp
     utility/StreamingDestinations.cpp
     utility/StreamingDestinations.hpp
