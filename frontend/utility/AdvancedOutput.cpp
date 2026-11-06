@@ -666,10 +666,6 @@ inline void AdvancedOutput::SetupVodTrack(obs_service_t *service)
 std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 							SetupStreamingContinuation_t continuation)
 {
-	int multiTrackAudioMixes = config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes");
-
-	bool is_multitrack_output = allowsMultiTrack();
-
 	if (!useStreamEncoder || (!ffmpegOutput && !obs_output_active(fileOutput))) {
 		UpdateStreamSettings();
 	}
@@ -727,20 +723,7 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 			outputType = type;
 		}
 
-		obs_output_set_video_encoder(streamOutput, videoStreaming);
-		obs_output_set_audio_encoder(streamOutput, streamAudioEnc, 0);
-
-		if (!is_multitrack_output) {
-			obs_output_set_audio_encoder(streamOutput, streamAudioEnc, 0);
-		} else {
-			int idx = 0;
-			for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
-				if ((multiTrackAudioMixes & (1 << i)) != 0) {
-					obs_output_set_audio_encoder(streamOutput, streamTrack[i], idx);
-					idx++;
-				}
-			}
-		}
+		AttachStreamEncoders(streamOutput);
 
 		return true;
 	};
@@ -749,6 +732,54 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 				    VodTrackMixerIdx(service), [=](std::optional<bool> res) {
 					    continuation(handle_multitrack_video_result(res));
 				    });
+}
+
+/* Attach the streaming encoders to one connection's output: the same video encoder and the same audio mix
+ * for every connection of the session, a multitrack service getting its per-mix tracks. Both the handler's
+ * own output and the destination outputs are wired through here, so the first connection of a session can
+ * never send different media than the ones after it. */
+void AdvancedOutput::AttachStreamEncoders(obs_output_t *output)
+{
+	const int multiTrackAudioMixes = config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes");
+
+	obs_output_set_video_encoder(output, videoStreaming);
+
+	if (!allowsMultiTrack()) {
+		obs_output_set_audio_encoder(output, streamAudioEnc, 0);
+		return;
+	}
+
+	for (int i = 0, idx = 0; i < MAX_AUDIO_MIXES; i++) {
+		if ((multiTrackAudioMixes & (1 << i)) != 0)
+			obs_output_set_audio_encoder(output, streamTrack[i], idx++);
+	}
+}
+
+/* The profile's connection-level settings for one output: the socket options, dynamic bitrate, and the delay
+ * state. Q12/Q15: libobs keeps delay_active and delay_restart_refs per output, so each connection counts down
+ * on its own and one destination counting down never drags the others; the delay *values* are still the
+ * profile's for all of them until per-connection values exist. Reconnect values are deliberately left to the
+ * callers: the primary resolves them through the profile plus the destination override (ApplyDestinationReconnect),
+ * a destination through StreamingDestinations::reconnectPolicy() - folding those together belongs to the step
+ * that makes the primary destination id authoritative. */
+void AdvancedOutput::ApplyConnectionSettings(obs_output_t *output, bool dynBitrate)
+{
+	OBSDataAutoRelease settings = obs_data_create();
+	obs_data_set_string(settings, "bind_ip", config_get_string(main->Config(), "Output", "BindIP"));
+	obs_data_set_string(settings, "ip_family", config_get_string(main->Config(), "Output", "IPFamily"));
+#ifdef _WIN32
+	obs_data_set_bool(settings, "new_socket_loop_enabled",
+			  config_get_bool(main->Config(), "Output", "NewSocketLoopEnable"));
+	obs_data_set_bool(settings, "low_latency_mode_enabled",
+			  config_get_bool(main->Config(), "Output", "LowLatencyEnable"));
+#endif
+	obs_data_set_bool(settings, "dyn_bitrate", dynBitrate);
+	obs_output_update(output, settings);
+
+	const bool useDelay = config_get_bool(main->Config(), "Output", "DelayEnable");
+	const int delaySec = static_cast<int>(config_get_int(main->Config(), "Output", "DelaySec"));
+	const bool preserveDelay = config_get_bool(main->Config(), "Output", "DelayPreserve");
+	obs_output_set_delay(output, useDelay ? delaySec : 0, preserveDelay ? OBS_OUTPUT_DELAY_PRESERVE : 0);
 }
 
 bool AdvancedOutput::StartStreaming(obs_service_t *service)
@@ -760,15 +791,8 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	int maxRetries = config_get_int(main->Config(), "Output", "MaxRetries");
 	/* Q14: the destination being streamed may carry its own reconnect values; a no-op when it does not. */
 	main->ApplyDestinationReconnect(reconnect, retryDelay, maxRetries);
-	bool useDelay = config_get_bool(main->Config(), "Output", "DelayEnable");
-	int delaySec = config_get_int(main->Config(), "Output", "DelaySec");
-	bool preserveDelay = config_get_bool(main->Config(), "Output", "DelayPreserve");
-	const char *bindIP = config_get_string(main->Config(), "Output", "BindIP");
-	const char *ipFamily = config_get_string(main->Config(), "Output", "IPFamily");
-#ifdef _WIN32
-	bool enableNewSocketLoop = config_get_bool(main->Config(), "Output", "NewSocketLoopEnable");
-	bool enableLowLatencyMode = config_get_bool(main->Config(), "Output", "LowLatencyEnable");
-#endif
+	/* Not const: MultitrackVideoOutput::HandleIncompatibleSettings() takes it by reference and may turn
+	 * dynamic bitrate off for a service that cannot have it. */
 	bool enableDynBitrate = config_get_bool(main->Config(), "Output", "DynamicBitrate");
 
 	if (multitrackVideo && multitrackVideoActive &&
@@ -785,23 +809,12 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 			is_rtmp = true;
 	}
 
-	OBSDataAutoRelease settings = obs_data_create();
-	obs_data_set_string(settings, "bind_ip", bindIP);
-	obs_data_set_string(settings, "ip_family", ipFamily);
-#ifdef _WIN32
-	obs_data_set_bool(settings, "new_socket_loop_enabled", enableNewSocketLoop);
-	obs_data_set_bool(settings, "low_latency_mode_enabled", enableLowLatencyMode);
-#endif
-	obs_data_set_bool(settings, "dyn_bitrate", enableDynBitrate);
-
 	auto streamOutput = StreamingOutput(); // shadowing is sort of bad, but also convenient
 
-	obs_output_update(streamOutput, settings);
+	ApplyConnectionSettings(streamOutput, enableDynBitrate);
 
 	if (!reconnect)
 		maxRetries = 0;
-
-	obs_output_set_delay(streamOutput, useDelay ? delaySec : 0, preserveDelay ? OBS_OUTPUT_DELAY_PRESERVE : 0);
 
 	obs_output_set_reconnect_settings(streamOutput, maxRetries, retryDelay);
 	if (is_rtmp) {
@@ -995,42 +1008,14 @@ bool AdvancedOutput::StartDestinationOutput(const StreamingDestination &dest)
 		return false;
 	}
 
-	/* Same encoder attachment as the primary output, so all destinations send identical media. */
-	obs_output_set_video_encoder(stream->output, videoStreaming);
-	if (!allowsMultiTrack()) {
-		obs_output_set_audio_encoder(stream->output, streamAudioEnc, 0);
-	} else {
-		int multiTrackAudioMixes = config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes");
-		int idx = 0;
-		for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
-			if ((multiTrackAudioMixes & (1 << i)) != 0)
-				obs_output_set_audio_encoder(stream->output, streamTrack[i], idx++);
-		}
-	}
+	/* Same encoder attachment and connection settings as the primary output: both helpers are shared with
+	 * it on purpose, so the first connection of a session and the destinations behind it cannot be
+	 * configured differently. */
+	AttachStreamEncoders(stream->output);
 
 	obs_output_set_service(stream->output, stream->service);
 
-	OBSDataAutoRelease settings = obs_data_create();
-	obs_data_set_string(settings, "bind_ip", config_get_string(main->Config(), "Output", "BindIP"));
-	obs_data_set_string(settings, "ip_family", config_get_string(main->Config(), "Output", "IPFamily"));
-#ifdef _WIN32
-	obs_data_set_bool(settings, "new_socket_loop_enabled",
-			  config_get_bool(main->Config(), "Output", "NewSocketLoopEnable"));
-	obs_data_set_bool(settings, "low_latency_mode_enabled",
-			  config_get_bool(main->Config(), "Output", "LowLatencyEnable"));
-#endif
-	obs_data_set_bool(settings, "dyn_bitrate", config_get_bool(main->Config(), "Output", "DynamicBitrate"));
-
-	/* Q12/Q15: every connection carries its own delay state - libobs keeps delay_active and
-	 * delay_restart_refs per output - so the profile's delay settings apply to each of them individually
-	 * and one destination counting down never drags the others with it. Per-destination delay *values*
-	 * are the next step; the separation of the state is already here. */
-	const bool useDelay = config_get_bool(main->Config(), "Output", "DelayEnable");
-	const int delaySec = static_cast<int>(config_get_int(main->Config(), "Output", "DelaySec"));
-	const bool preserveDelay = config_get_bool(main->Config(), "Output", "DelayPreserve");
-	obs_output_set_delay(stream->output, useDelay ? delaySec : 0, preserveDelay ? OBS_OUTPUT_DELAY_PRESERVE : 0);
-
-	obs_output_update(stream->output, settings);
+	ApplyConnectionSettings(stream->output, config_get_bool(main->Config(), "Output", "DynamicBitrate"));
 
 	/* Q14: its own reconnect values. The attempt counter, the backoff and the retry thread are per
 		 * output inside libobs already, so one destination can never spend another's attempts. */
