@@ -946,7 +946,6 @@ void OBSApp::AppInit()
 	config_set_default_string(userConfig, "Basic", "ProfileDir", Str("Untitled"));
 	config_set_default_string(userConfig, "Basic", "SceneCollection", Str("Untitled"));
 	config_set_default_string(userConfig, "Basic", "SceneCollectionFile", Str("Untitled"));
-	config_set_default_bool(userConfig, "Basic", "ConfigOnNewProfile", true);
 
 	const std::string_view profileName{config_get_string(userConfig, "Basic", "Profile")};
 

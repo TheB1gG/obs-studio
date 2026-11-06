@@ -1324,16 +1324,12 @@ void OBSBasic::OBSInit()
 	disableColorSpaceConversion(this);
 #endif
 
-	bool has_last_version = config_has_user_value(App()->GetAppConfig(), "General", "LastVersion");
 	bool first_run = config_get_bool(App()->GetUserConfig(), "General", "FirstRun");
 
 	if (!first_run) {
 		config_set_bool(App()->GetUserConfig(), "General", "FirstRun", true);
 		config_save_safe(App()->GetUserConfig(), "tmp", nullptr);
 	}
-
-	if (!first_run && !has_last_version && !Active())
-		QMetaObject::invokeMethod(this, "on_autoConfigure_triggered", Qt::QueuedConnection);
 
 #if (defined(_WIN32) || defined(__APPLE__)) && (OBS_RELEASE_CANDIDATE > 0 || OBS_BETA > 0)
 	/* Automatically set branch to "beta" the first time a pre-release build is run. */

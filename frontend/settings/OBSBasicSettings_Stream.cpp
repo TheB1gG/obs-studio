@@ -1193,7 +1193,28 @@ bool OBSBasicSettings::ResFPSValid(obs_service_resolution *res_list, size_t res_
 	return true;
 }
 
-extern void set_closest_res(int &cx, int &cy, struct obs_service_resolution *res_list, size_t count);
+/* Snap a resolution choice to the service's supported list: the service can restrict what the user
+ * may pick, and the settings page has to land on a resolution the service accepts. This helper used
+ * to live in the auto-configuration wizard, which the single output engine made redundant. */
+static void set_closest_res(int &cx, int &cy, struct obs_service_resolution *res_list, size_t count)
+{
+	int best_pixel_diff = 0x7FFFFFFF;
+	int start_cx = cx;
+	int start_cy = cy;
+
+	for (size_t i = 0; i < count; i++) {
+		struct obs_service_resolution &res = res_list[i];
+		int pixel_cx_diff = abs(start_cx - res.cx);
+		int pixel_cy_diff = abs(start_cy - res.cy);
+		int pixel_diff = pixel_cx_diff + pixel_cy_diff;
+
+		if (pixel_diff < best_pixel_diff) {
+			best_pixel_diff = pixel_diff;
+			cx = res.cx;
+			cy = res.cy;
+		}
+	}
+}
 
 /* Checks for and updates the resolution and FPS limits of a service, if any.
  *

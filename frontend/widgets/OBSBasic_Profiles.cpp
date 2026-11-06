@@ -20,7 +20,6 @@
 #ifdef YOUTUBE_ENABLED
 #include <docks/YouTubeAppDock.hpp>
 #endif
-#include <wizards/AutoConfig.hpp>
 
 #include <qt-wrappers.hpp>
 
@@ -67,23 +66,14 @@ void updateSortedProfiles(const OBSProfileCache &profiles)
 
 // MARK: - Main Profile Management Functions
 
-void OBSBasic::SetupNewProfile(const std::string &profileName, bool useWizard)
+void OBSBasic::SetupNewProfile(const std::string &profileName)
 {
 	const OBSProfile &newProfile = CreateProfile(profileName);
-
-	config_set_bool(App()->GetUserConfig(), "Basic", "ConfigOnNewProfile", useWizard);
 
 	ActivateProfile(newProfile, true);
 
 	blog(LOG_INFO, "Created profile '%s' (clean, %s)", newProfile.name.c_str(), newProfile.directoryName.c_str());
 	blog(LOG_INFO, "------------------------------------------------");
-
-	if (useWizard) {
-		AutoConfig wizard(this);
-		wizard.setModal(true);
-		wizard.show();
-		wizard.exec();
-	}
 }
 
 void OBSBasic::SetupDuplicateProfile(const std::string &profileName)
@@ -416,8 +406,6 @@ std::optional<OBSProfile> OBSBasic::GetProfileByDirectoryName(const std::string 
 
 void OBSBasic::on_actionNewProfile_triggered()
 {
-	bool useProfileWizard = config_get_bool(App()->GetUserConfig(), "Basic", "ConfigOnNewProfile");
-
 	const OBSPromptCallback profilePromptCallback = [this](const OBSPromptResult &result) {
 		if (GetProfileByName(result.promptValue)) {
 			return false;
@@ -426,8 +414,7 @@ void OBSBasic::on_actionNewProfile_triggered()
 		return true;
 	};
 
-	const OBSPromptRequest request{Str("AddProfile.Title"),          Str("AddProfile.Text"), "", true,
-				       Str("AddProfile.WizardCheckbox"), useProfileWizard};
+	const OBSPromptRequest request{Str("AddProfile.Title"), Str("AddProfile.Text"), "", false};
 
 	OBSPromptResult result = PromptForName(request, profilePromptCallback);
 
@@ -436,7 +423,7 @@ void OBSBasic::on_actionNewProfile_triggered()
 	}
 
 	try {
-		SetupNewProfile(result.promptValue, result.optionValue);
+		SetupNewProfile(result.promptValue);
 	} catch (const std::invalid_argument &error) {
 		blog(LOG_ERROR, "%s", error.what());
 	} catch (const std::logic_error &error) {

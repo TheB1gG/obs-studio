@@ -53,7 +53,6 @@ include(cmake/ui-qt.cmake)
 include(cmake/ui-settings.cmake)
 include(cmake/ui-utility.cmake)
 include(cmake/ui-widgets.cmake)
-include(cmake/ui-wizards.cmake)
 
 if(NOT OAUTH_BASE_URL)
   set(OAUTH_BASE_URL "https://auth.obsproject.com/" CACHE STRING "Default OAuth base URL")
