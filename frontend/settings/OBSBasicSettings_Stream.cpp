@@ -1136,7 +1136,6 @@ void OBSBasicSettings::DisplayEnforceWarning(bool checked)
 		return;
 
 	if (!checked) {
-		SimpleRecordingEncoderChanged();
 		return;
 	}
 
@@ -1153,7 +1152,6 @@ void OBSBasicSettings::DisplayEnforceWarning(bool checked)
 		return;
 	}
 
-	SimpleRecordingEncoderChanged();
 }
 
 bool OBSBasicSettings::ResFPSValid(obs_service_resolution *res_list, size_t res_count, int max_fps)
