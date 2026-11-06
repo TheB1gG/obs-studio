@@ -2394,14 +2394,6 @@
                      <number>0</number>
                     </property>
                     <item>
-                     <widget class="QGroupBox" name="advOutDestinationsGroup">
-                      <property name="title">
-                       <string>Basic.Settings.Stream.Destinations</string>
-                      </property>
-                      <layout class="QVBoxLayout" name="destinationsPageLayout"/>
-                     </widget>
-                    </item>
-                    <item>
                      <widget class="QScrollArea" name="scrollArea_3">
                       <property name="frameShape">
                        <enum>QFrame::NoFrame</enum>
@@ -2437,6 +2429,20 @@
                         <property name="bottomMargin">
                          <number>0</number>
                         </property>
+                        <item>
+                         <widget class="QGroupBox" name="advOutDestinationsGroup">
+                          <property name="title">
+                           <string>Basic.Settings.Stream.Destinations</string>
+                          </property>
+                          <property name="sizePolicy">
+                           <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                            <horstretch>0</horstretch>
+                            <verstretch>0</verstretch>
+                           </sizepolicy>
+                          </property>
+                          <layout class="QVBoxLayout" name="destinationsPageLayout"/>
+                         </widget>
+                        </item>
                         <item>
                          <widget class="QGroupBox" name="advOutTopContainer">
                           <property name="title">

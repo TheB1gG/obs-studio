@@ -101,11 +101,15 @@ private:
 	OBSPropertiesView *streamEncoderProps = nullptr;
 	OBSPropertiesView *recordEncoderProps = nullptr;
 
-	/* Streaming destinations page (Settings -> "Streaming destinations"). The page is always populated now
-	 * that destinations are the default output surface; it lives in the .ui unconditionally so that page
-	 * indices and the themed list icons stay consistent for every profile. */
+	/* Streaming destinations, shown as collapsible blocks in the Output tab's streaming page. The surface is
+	 * always populated now that destinations are the default output surface; it lives in the .ui
+	 * unconditionally so that page indices and the themed list icons stay consistent for every profile. */
 	QPointer<QVBoxLayout> destinationsPageLayout;
-	QPointer<QListWidget> destinationsList;
+	/* The blocks, one per destination, inside a container of their own: a rebuild drops the container's children
+	 * and never touches the bar or the empty label that sit above them. They are not in a QListWidget - the
+	 * nested scroll area it brings fights the tab's own one and leaves a slab of dead space below the blocks. */
+	QPointer<QWidget> destinationsBlocks;
+	QPointer<QVBoxLayout> destinationsBlocksLayout;
 	QPointer<QLabel> destinationsEmptyLabel;
 	QPointer<QLabel> destinationsTotalBitrateLabel;
 	QPointer<QPushButton> addDestinationButton;
@@ -113,6 +117,9 @@ private:
 	 * list changes, so their state labels are remembered here and refreshed on a timer; the state itself stays
 	 * in OBSBasic's runtime entries, this page only reads it. */
 	std::map<std::string, QPointer<QLabel>> destinationStateLabels;
+	/* Which blocks the user left open, by destination id: a structural change rebuilds the blocks, and the
+	 * rebuild has to respect what was open rather than open everything again. */
+	std::map<std::string, bool> destinationBlockOpen;
 	QPointer<QTimer> destinationsStateTimer;
 	/* The dialog edits a copy: Apply/OK commits it into OBSBasic and to disk, Cancel drops it. */
 	StreamingDestinations destinationEdits;
@@ -220,7 +227,6 @@ private:
 	void RebuildDestinationBlocks();
 	void RefreshDestinationStates();
 	void MarkDestinationsChanged();
-	void ApplyDestinationOrder();
 	void MoveDestination(const std::string &id, int delta);
 	bool AskDestinationNameAndId(QString &name, QString &id, bool idEditable, const QString &title);
 	void AddDestination();
