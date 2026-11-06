@@ -402,14 +402,24 @@ long long StreamingDestinations::totalUploadKbps() const
 	return total;
 }
 
+std::filesystem::path StreamingDestinations::serviceFileOf(const StreamingDestination &dest) const
+{
+	if (dest.inherits_legacy_section) {
+		std::error_code ec;
+		const std::filesystem::path legacy = pathOf(legacy_service_file);
+		if (std::filesystem::exists(legacy, ec))
+			return legacy;
+	}
+	return pathOf(dest.serviceFileName());
+}
+
 std::string StreamingDestinations::serviceType(std::string_view id) const
 {
 	const StreamingDestination *dest = find(id);
 	if (!dest)
 		return std::string();
 
-	OBSDataAutoRelease data =
-		obs_data_create_from_json_file_safe(pathOf(dest->serviceFileName()).u8string().c_str(), "bak");
+	OBSDataAutoRelease data = obs_data_create_from_json_file_safe(serviceFileOf(*dest).u8string().c_str(), "bak");
 	if (!data)
 		return std::string();
 
@@ -424,8 +434,9 @@ OBSService StreamingDestinations::createService(std::string_view id) const
 	if (!dest)
 		return OBSService();
 
-	OBSDataAutoRelease data =
-		obs_data_create_from_json_file_safe(pathOf(dest->serviceFileName()).u8string().c_str(), "bak");
+	/* Through serviceFileOf(): an inheriting destination is described by the profile's service.json, so a
+	 * service change made in the Stream settings page is what this connection actually uploads to. */
+	OBSDataAutoRelease data = obs_data_create_from_json_file_safe(serviceFileOf(*dest).u8string().c_str(), "bak");
 	if (!data) {
 		blog(LOG_WARNING, "streaming destination '%.*s' has no readable service file",
 		     static_cast<int>(id.size()), id.data());

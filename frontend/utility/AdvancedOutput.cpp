@@ -784,7 +784,38 @@ void AdvancedOutput::ApplyConnectionSettings(obs_output_t *output, bool dynBitra
 
 bool AdvancedOutput::StartStreaming(obs_service_t *service)
 {
-	obs_output_set_service(streamOutput, service);
+	/* The first connection of a session is a destination like the ones after it, so its service is resolved the
+	 * same way the fan-out resolves them - through StreamingDestinations::createService(). For a destination
+	 * that still inherits the pre-multi-destination layout that reads the very service.json the Stream settings
+	 * page writes, so existing profiles keep streaming to the same place; the difference is that the destination
+	 * engine is now the one answering, which is what per-destination control (restart one connection, change one
+	 * destination's settings while the others run) needs.
+	 * The wrapper lives in the handler for the duration of the session because the runtime entry keeps a
+	 * borrowed pointer to it. A destination without a readable service file falls back to the profile service,
+	 * which is what this function used before. */
+	const StreamDestinationRuntime *primary = main->PrimaryRuntime();
+	const bool havePrimaryDestination = primary && !primary->id.empty();
+	primaryConnectionService = havePrimaryDestination ? main->Destinations().createService(primary->id)
+							   : OBSService();
+
+	obs_service_t *connectionService = service;
+	if (havePrimaryDestination && !primaryConnectionService)
+		blog(LOG_WARNING, "streaming destination '%s': no readable service file, streaming with the profile service",
+		     primary->name.c_str());
+	else if (havePrimaryDestination)
+		connectionService = primaryConnectionService.Get();
+
+	obs_output_set_service(streamOutput, connectionService);
+
+	/* Record the connection on its destination's runtime entry, the way the extras do it in
+	 * StartDestinationOutput(), so the per-destination widgets, the stop/restart/kill actions and the stats
+	 * rows all look at the same pair of objects for every connection of the session. */
+	if (havePrimaryDestination) {
+		if (StreamDestinationRuntime *runtime = main->RuntimeForId(primary->id)) {
+			runtime->service = connectionService;
+			runtime->output = streamOutput;
+		}
+	}
 
 	bool reconnect = config_get_bool(main->Config(), "Output", "Reconnect");
 	int retryDelay = config_get_int(main->Config(), "Output", "RetryDelay");
@@ -796,13 +827,17 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	bool enableDynBitrate = config_get_bool(main->Config(), "Output", "DynamicBitrate");
 
 	if (multitrackVideo && multitrackVideoActive &&
-	    !multitrackVideo->HandleIncompatibleSettings(main, main->Config(), service, enableDynBitrate)) {
+	    !multitrackVideo->HandleIncompatibleSettings(main, main->Config(), connectionService,
+							enableDynBitrate)) {
 		multitrackVideoActive = false;
 		return false;
 	}
 
 	bool is_rtmp = false;
-	obs_service_t *service_obj = main->GetService();
+	/* The protocol question is about the connection being started, not about the profile service object: for a
+	 * destination that inherits the legacy layout they describe the same service, and for a detached one it is
+	 * the destination's own service that the ingest will actually see. */
+	obs_service_t *service_obj = connectionService;
 	const char *protocol = obs_service_get_protocol(service_obj);
 	if (protocol) {
 		if (astrcmpi_n(protocol, RTMP_PROTOCOL, strlen(RTMP_PROTOCOL)) == 0)
@@ -818,7 +853,7 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 
 	obs_output_set_reconnect_settings(streamOutput, maxRetries, retryDelay);
 	if (is_rtmp) {
-		SetupVodTrack(service);
+		SetupVodTrack(connectionService);
 	}
 	if (obs_output_start(streamOutput)) {
 		if (multitrackVideo && multitrackVideoActive)
@@ -946,15 +981,24 @@ void AdvancedOutput::StartExtraDestinations()
 
 	const StreamingDestinations &destinations = main->Destinations();
 	size_t started = 0;
-	bool firstEnabled = true;
+
+	/* The connection this handler serves with its own output is skipped by **id**, not by position: the
+	 * runtime model already knows which destination that is (PrimaryRuntime() is the same rule that picked it),
+	 * and a position rule goes wrong as soon as the first entry of the list is disabled or the user reorders
+	 * the destinations - it then skips a connection that was never started by the handler and leaves the real
+	 * primary one started twice. The position rule is only kept as the fallback for a profile with no
+	 * destination list at all, where the handler's output is by definition the one and only connection. */
+	const StreamDestinationRuntime *primary = main->PrimaryRuntime();
+	const bool skipById = primary && !primary->id.empty();
+	size_t enabledIndex = 0;
 
 	for (const auto &dest : destinations.destinations()) {
 		if (!dest.enabled)
 			continue;
-		if (firstEnabled) {
-			firstEnabled = false;
+		const bool served_by_handler = skipById ? (dest.id == primary->id) : (enabledIndex == 0);
+		enabledIndex++;
+		if (served_by_handler)
 			continue;
-		}
 
 		if (StartDestinationOutput(dest))
 			started++;

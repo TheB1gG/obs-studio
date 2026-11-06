@@ -283,9 +283,10 @@ void OBSBasic::StartStreaming()
 			runtime->state = StreamDestinationRuntime::State::Connecting;
 			/* The first destination is served by the handler's own output (Q42); its runtime entry keeps
 			 * a reference to it so that the per-destination widgets - and the per-destination stop,
-			 * restart and kill - can reach the connection instead of only the extra ones. */
+			 * restart and kill - can reach the connection instead of only the extra ones. The service is not
+			 * assigned here any more: the handler recorded the destination's own service when it resolved it,
+			 * and putting the profile service back would make the entry disagree with the connection. */
 			runtime->output = outputHandler->StreamingOutput();
-			runtime->service = service;
 			PushStreamConnections();
 		}
 

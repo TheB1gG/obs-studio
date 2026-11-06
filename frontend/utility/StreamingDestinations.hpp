@@ -165,6 +165,11 @@ private:
 	void writeTracksFile(const StreamingDestination &dest) const;
 	void removeDestinationFiles(const StreamingDestination &dest) const;
 	std::filesystem::path pathOf(const std::string &file_name) const;
+	/* Which service file describes one destination. A destination that still inherits the pre-multi-destination
+	 * layout *is* the profile's single service, so the Stream settings page's service.json describes it - the
+	 * service_<id>.json copy made at import only takes over once the destination is detached from [Stream1].
+	 * Same fallback idea as configString()/configBool()/configInt() reading the [Stream1] section. */
+	std::filesystem::path serviceFileOf(const StreamingDestination &dest) const;
 
 	config_t *config_ = nullptr;
 	std::filesystem::path dir_;

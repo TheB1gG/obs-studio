@@ -74,6 +74,10 @@ struct AdvancedOutput : BasicOutputHandler {
 	};
 
 	std::vector<std::unique_ptr<ExtraDestinationStream>> extraStreams;
+	/* The service of the first connection of the session, resolved through the destination engine and kept
+	 * here while the session runs: the runtime entry of that destination holds a borrowed pointer to it, just
+	 * like the extra destinations' own wrappers do. */
+	OBSService primaryConnectionService;
 
 	void StartExtraDestinations();
 	void StopExtraDestinations(bool force) override;
