@@ -1284,8 +1284,8 @@ bool AdvancedOutput::StartReplayBuffer()
 		overwriteIfExists = config_get_bool(main->Config(), "Output", "OverwriteIfExists");
 		noSpace = config_get_bool(main->Config(), "AdvOut",
 					  ffmpegRecording ? "FFFileNameWithoutSpace" : "RecFileNameWithoutSpace");
-		rbPrefix = config_get_string(main->Config(), "SimpleOutput", "RecRBPrefix");
-		rbSuffix = config_get_string(main->Config(), "SimpleOutput", "RecRBSuffix");
+		rbPrefix = config_get_string(main->Config(), "AdvOut", "RecRBPrefix");
+		rbSuffix = config_get_string(main->Config(), "AdvOut", "RecRBSuffix");
 		rbTime = config_get_int(main->Config(), "AdvOut", "RecRBTime");
 		rbSize = config_get_int(main->Config(), "AdvOut", "RecRBSize");
 

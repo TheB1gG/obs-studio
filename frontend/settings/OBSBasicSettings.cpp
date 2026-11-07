@@ -50,8 +50,6 @@
 
 using namespace std;
 
-extern const char *get_simple_output_encoder(const char *encoder);
-
 extern bool restart;
 extern bool opt_allow_opengl;
 extern bool cef_js_avail;
@@ -199,31 +197,6 @@ static int FindClosestAvailableAudioBitrate(QComboBox *box, int bitrate)
 	return 192;
 }
 #undef INVALID_BITRATE
-
-static void PopulateSimpleBitrates(QComboBox *box, bool opus)
-{
-	auto &bitrateMap = opus ? GetSimpleOpusEncoderBitrateMap() : GetSimpleAACEncoderBitrateMap();
-	if (bitrateMap.empty())
-		return;
-
-	vector<pair<QString, QString>> pairs;
-	for (auto &entry : bitrateMap)
-		pairs.emplace_back(QString::number(entry.first), obs_encoder_get_display_name(entry.second.c_str()));
-
-	QString currentBitrate = box->currentText();
-	box->clear();
-
-	for (auto &pair : pairs) {
-		box->addItem(pair.first);
-		box->setItemData(box->count() - 1, pair.second, Qt::ToolTipRole);
-	}
-
-	if (box->findData(currentBitrate) == -1) {
-		int bitrate = FindClosestAvailableAudioBitrate(box, currentBitrate.toInt());
-		box->setCurrentText(QString::number(bitrate));
-	} else
-		box->setCurrentText(currentBitrate);
-}
 
 static void PopulateAdvancedBitrates(initializer_list<QComboBox *> boxes, const char *stream_id, const char *rec_id)
 {
@@ -410,32 +383,6 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->multitrackVideoConfigOverridePreset1,       TEXT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoConfigOverridePreset2,       TEXT_CHANGED,   STREAM1_CHANGED);
 	HookWidget(ui->multitrackVideoAdditionalCanvas,            COMBO_CHANGED,   STREAM1_CHANGED);
-	HookWidget(ui->outputMode,           COMBO_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutputPath,     EDIT_CHANGED,   OUTPUTS_CHANGED);
-	HookWidget(ui->simpleNoSpace,        CHECK_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutRecFormat,   COMBO_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutputVBitrate, SCROLL_CHANGED, OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutStrEncoder,  COMBO_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutStrAEncoder, COMBO_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutputABitrate, COMBO_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutputABitrateMode, TOOLBUTTON_CHANGED, OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutputAQuality, SCROLL_CHANGED, OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutAdvanced,    CHECK_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutPreset,      COMBO_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutCustom,      EDIT_CHANGED,   OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutRecQuality,  COMBO_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutRecEncoder,  COMBO_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutRecAEncoder, COMBO_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutRecTrack1,   CHECK_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutRecTrack2,   CHECK_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutRecTrack3,   CHECK_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutRecTrack4,   CHECK_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutRecTrack5,   CHECK_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutRecTrack6,   CHECK_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleOutMuxCustom,   EDIT_CHANGED,   OUTPUTS_CHANGED);
-	HookWidget(ui->simpleReplayBuf,      GROUP_CHANGED,  OUTPUTS_CHANGED);
-	HookWidget(ui->simpleRBSecMax,       SCROLL_CHANGED, OUTPUTS_CHANGED);
-	HookWidget(ui->simpleRBMegsMax,      SCROLL_CHANGED, OUTPUTS_CHANGED);
 	HookWidget(ui->advOutEncoder,        COMBO_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutAEncoder,       COMBO_CHANGED,  OUTPUTS_CHANGED);
 	HookWidget(ui->advOutTrack1BitrateMode, TOOLBUTTON_CHANGED, OUTPUTS_CHANGED);
@@ -564,8 +511,8 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 #endif
 	HookWidget(ui->filenameFormatting,   EDIT_CHANGED,   ADV_CHANGED);
 	HookWidget(ui->overwriteIfExists,    CHECK_CHANGED,  ADV_CHANGED);
-	HookWidget(ui->simpleRBPrefix,       EDIT_CHANGED,   ADV_CHANGED);
-	HookWidget(ui->simpleRBSuffix,       EDIT_CHANGED,   ADV_CHANGED);
+	HookWidget(ui->advRBPrefix,       EDIT_CHANGED,   ADV_CHANGED);
+	HookWidget(ui->advRBSuffix,       EDIT_CHANGED,   ADV_CHANGED);
 	HookWidget(ui->streamDelayEnable,    CHECK_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->streamDelaySec,       SCROLL_CHANGED, ADV_CHANGED);
 	HookWidget(ui->streamDelayPreserve,  CHECK_CHANGED,  ADV_CHANGED);
@@ -591,8 +538,6 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 
 #undef ADD_HOTKEY_FOCUS_TYPE
 
-	ui->simpleOutputVBitrate->setSingleStep(50);
-	ui->simpleOutputVBitrate->setSuffix(" Kbps");
 	ui->advOutFFVBitrate->setSingleStep(50);
 	ui->advOutFFVBitrate->setSuffix(" Kbps");
 	ui->advOutFFABitrate->setSuffix(" Kbps");
@@ -677,12 +622,6 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 #endif
 
 	connect(ui->streamDelaySec, &QSpinBox::valueChanged, this, &OBSBasicSettings::UpdateStreamDelayEstimate);
-	connect(ui->outputMode, &QComboBox::currentIndexChanged, this, &OBSBasicSettings::UpdateStreamDelayEstimate);
-	connect(ui->simpleOutputVBitrate, &QSpinBox::valueChanged, this, &OBSBasicSettings::UpdateStreamDelayEstimate);
-	connect(ui->simpleOutputABitrate, &QComboBox::currentIndexChanged, this,
-		&OBSBasicSettings::UpdateStreamDelayEstimate);
-	connect(ui->simpleOutputABitrateMode, &QToolButton::toggled, this,
-		&OBSBasicSettings::SimpleAudioBitrateModeChanged);
 	connect(ui->advOutTrack1Bitrate, &QComboBox::currentIndexChanged, this,
 		&OBSBasicSettings::UpdateStreamDelayEstimate);
 	connect(ui->advOutTrack2Bitrate, &QComboBox::currentIndexChanged, this,
@@ -733,38 +672,12 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	};
 	hotkeyUnregistered.Connect(obs_get_signal_handler(), "hotkey_unregister", ReloadHotkeysIgnore, this);
 
-	FillSimpleRecordingValues();
 	if (obs_audio_monitoring_available())
 		FillAudioMonitoringDevices();
 
 	connect(ui->channelSetup, &QComboBox::currentIndexChanged, this, &OBSBasicSettings::SurroundWarning);
 	connect(ui->channelSetup, &QComboBox::currentIndexChanged, this, &OBSBasicSettings::SpeakerLayoutChanged);
 	connect(ui->lowLatencyBuffering, &QCheckBox::clicked, this, &OBSBasicSettings::LowLatencyBufferingChanged);
-	connect(ui->simpleOutRecQuality, &QComboBox::currentIndexChanged, this,
-		&OBSBasicSettings::SimpleRecordingQualityChanged);
-	connect(ui->simpleOutRecQuality, &QComboBox::currentIndexChanged, this,
-		&OBSBasicSettings::SimpleRecordingQualityLosslessWarning);
-	connect(ui->simpleOutRecFormat, &QComboBox::currentIndexChanged, this,
-		&OBSBasicSettings::SimpleRecordingEncoderChanged);
-	connect(ui->simpleOutStrEncoder, &QComboBox::currentIndexChanged, this,
-		&OBSBasicSettings::SimpleStreamingEncoderChanged);
-	connect(ui->simpleOutStrEncoder, &QComboBox::currentIndexChanged, this,
-		&OBSBasicSettings::SimpleRecordingEncoderChanged);
-	connect(ui->simpleOutRecEncoder, &QComboBox::currentIndexChanged, this,
-		&OBSBasicSettings::SimpleRecordingEncoderChanged);
-	connect(ui->simpleOutRecAEncoder, &QComboBox::currentIndexChanged, this,
-		&OBSBasicSettings::SimpleRecordingEncoderChanged);
-	connect(ui->simpleOutputVBitrate, &QSpinBox::valueChanged, this,
-		&OBSBasicSettings::SimpleRecordingEncoderChanged);
-	connect(ui->simpleOutputABitrate, &QComboBox::currentIndexChanged, this,
-		&OBSBasicSettings::SimpleRecordingEncoderChanged);
-	connect(ui->simpleOutAdvanced, &QCheckBox::toggled, this, &OBSBasicSettings::SimpleRecordingEncoderChanged);
-	connect(ui->ignoreRecommended, &QCheckBox::toggled, this, &OBSBasicSettings::SimpleRecordingEncoderChanged);
-	connect(ui->simpleReplayBuf, &QGroupBox::toggled, this, &OBSBasicSettings::SimpleReplayBufferChanged);
-	connect(ui->simpleOutputVBitrate, &QSpinBox::valueChanged, this, &OBSBasicSettings::SimpleReplayBufferChanged);
-	connect(ui->simpleOutputABitrate, &QComboBox::currentIndexChanged, this,
-		&OBSBasicSettings::SimpleReplayBufferChanged);
-	connect(ui->simpleRBSecMax, &QSpinBox::valueChanged, this, &OBSBasicSettings::SimpleReplayBufferChanged);
 #if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
 	connect(ui->advOutSplitFile, &QCheckBox::checkStateChanged, this, &OBSBasicSettings::AdvOutSplitFileChanged);
 #else
@@ -919,11 +832,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	ui->advOutAEncoder->setPlaceholderText(QTStr("CodecCompat.CodecPlaceholder"));
 	ui->advOutRecEncoder->setPlaceholderText(QTStr("CodecCompat.CodecPlaceholder"));
 	ui->advOutRecAEncoder->setPlaceholderText(QTStr("CodecCompat.CodecPlaceholder"));
-	ui->simpleOutRecEncoder->setPlaceholderText(QTStr("CodecCompat.CodecPlaceholder"));
-	ui->simpleOutRecAEncoder->setPlaceholderText(QTStr("CodecCompat.CodecPlaceholder"));
-	ui->simpleOutRecFormat->setPlaceholderText(QTStr("CodecCompat.ContainerPlaceholder"));
 
-	SimpleRecordingQualityChanged();
 	AdvOutSplitFileChanged();
 	AdvOutRecCheckCodecs();
 	AdvOutRecCheckWarnings();
@@ -946,8 +855,6 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 
 	connect(ui->useStreamKeyAdv, &QCheckBox::clicked, this, &OBSBasicSettings::UseStreamKeyAdvClicked);
 
-	connect(ui->simpleOutStrAEncoder, &QComboBox::currentIndexChanged, this,
-		&OBSBasicSettings::SimpleStreamAudioEncoderChanged);
 	connect(ui->advOutAEncoder, &QComboBox::currentIndexChanged, this, &OBSBasicSettings::AdvAudioEncodersChanged);
 	connect(ui->advOutRecAEncoder, &QComboBox::currentIndexChanged, this,
 		&OBSBasicSettings::AdvAudioEncodersChanged);
@@ -961,7 +868,6 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	UpdateAudioWarnings();
 	UpdateAdvNetworkGroup();
 
-	UpdateSimpleAudioBitrateModeUI();
 
 	ui->audioMsg->setVisible(false);
 	ui->advancedMsg->setVisible(false);
@@ -1070,15 +976,6 @@ void OBSBasicSettings::LoadFormats()
 
 	ui->advOutFFFormat->blockSignals(false);
 
-	ui->simpleOutRecFormat->addItem(FORMAT_STR("FLV"), "flv");
-	ui->simpleOutRecFormat->addItem(FORMAT_STR("MKV"), "mkv");
-	ui->simpleOutRecFormat->addItem(FORMAT_STR("MP4"), "mp4");
-	ui->simpleOutRecFormat->addItem(FORMAT_STR("MOV"), "mov");
-	ui->simpleOutRecFormat->addItem(FORMAT_STR("hMP4"), "hybrid_mp4");
-	ui->simpleOutRecFormat->addItem(FORMAT_STR("hMOV"), "hybrid_mov");
-	ui->simpleOutRecFormat->addItem(FORMAT_STR("fMP4"), "fragmented_mp4");
-	ui->simpleOutRecFormat->addItem(FORMAT_STR("fMOV"), "fragmented_mov");
-	ui->simpleOutRecFormat->addItem(FORMAT_STR("TS"), "mpegts");
 
 	ui->advOutRecFormat->addItem(FORMAT_STR("FLV"), "flv");
 	ui->advOutRecFormat->addItem(FORMAT_STR("MKV"), "mkv");
@@ -1781,115 +1678,6 @@ static inline bool IsSurround(const char *speakers)
 	return false;
 }
 
-void OBSBasicSettings::LoadSimpleOutputSettings()
-{
-	const char *path = config_get_string(main->Config(), "SimpleOutput", "FilePath");
-	bool noSpace = config_get_bool(main->Config(), "SimpleOutput", "FileNameWithoutSpace");
-	const char *format = config_get_string(main->Config(), "SimpleOutput", "RecFormat2");
-	int videoBitrate = config_get_uint(main->Config(), "SimpleOutput", "VBitrate");
-	const char *streamEnc = config_get_string(main->Config(), "SimpleOutput", "StreamEncoder");
-	const char *streamAudioEnc = config_get_string(main->Config(), "SimpleOutput", "StreamAudioEncoder");
-	int audioBitrate = config_get_uint(main->Config(), "SimpleOutput", "ABitrate");
-	bool advanced = config_get_bool(main->Config(), "SimpleOutput", "UseAdvanced");
-	const char *preset = config_get_string(main->Config(), "SimpleOutput", "Preset");
-	const char *qsvPreset = config_get_string(main->Config(), "SimpleOutput", "QSVPreset");
-	const char *nvPreset = config_get_string(main->Config(), "SimpleOutput", "NVENCPreset2");
-	const char *amdPreset = config_get_string(main->Config(), "SimpleOutput", "AMDPreset");
-	const char *amdAV1Preset = config_get_string(main->Config(), "SimpleOutput", "AMDAV1Preset");
-	const char *custom = config_get_string(main->Config(), "SimpleOutput", "x264Settings");
-	const char *recQual = config_get_string(main->Config(), "SimpleOutput", "RecQuality");
-	const char *recEnc = config_get_string(main->Config(), "SimpleOutput", "RecEncoder");
-	const char *recAudioEnc = config_get_string(main->Config(), "SimpleOutput", "RecAudioEncoder");
-	const char *muxCustom = config_get_string(main->Config(), "SimpleOutput", "MuxerCustom");
-	bool replayBuf = config_get_bool(main->Config(), "SimpleOutput", "RecRB");
-	int rbTime = config_get_int(main->Config(), "SimpleOutput", "RecRBTime");
-	int rbSize = config_get_int(main->Config(), "SimpleOutput", "RecRBSize");
-	int tracks = config_get_int(main->Config(), "SimpleOutput", "RecTracks");
-
-	ui->simpleOutRecTrack1->setChecked(tracks & (1 << 0));
-	ui->simpleOutRecTrack2->setChecked(tracks & (1 << 1));
-	ui->simpleOutRecTrack3->setChecked(tracks & (1 << 2));
-	ui->simpleOutRecTrack4->setChecked(tracks & (1 << 3));
-	ui->simpleOutRecTrack5->setChecked(tracks & (1 << 4));
-	ui->simpleOutRecTrack6->setChecked(tracks & (1 << 5));
-
-	curPreset = preset;
-	curQSVPreset = qsvPreset;
-	curNVENCPreset = nvPreset;
-	curAMDPreset = amdPreset;
-	curAMDAV1Preset = amdAV1Preset;
-
-	bool isOpus = strcmp(streamAudioEnc, "opus") == 0;
-	audioBitrate = isOpus ? FindClosestAvailableSimpleOpusBitrate(audioBitrate)
-			      : FindClosestAvailableSimpleAACBitrate(audioBitrate);
-
-	ui->simpleOutputPath->setText(path);
-	ui->simpleNoSpace->setChecked(noSpace);
-	ui->simpleOutputVBitrate->setValue(videoBitrate);
-
-	int idx = ui->simpleOutRecFormat->findData(format);
-	ui->simpleOutRecFormat->setCurrentIndex(idx);
-
-	PopulateSimpleBitrates(ui->simpleOutputABitrate, isOpus);
-
-	const char *speakers = config_get_string(main->Config(), "Audio", "ChannelSetup");
-
-	// restrict list of bitrates when multichannel is OFF
-	if (!IsSurround(speakers))
-		RestrictResetBitrates({ui->simpleOutputABitrate}, 320);
-
-	SetComboByName(ui->simpleOutputABitrate, std::to_string(audioBitrate).c_str());
-
-	ui->simpleOutAdvanced->setChecked(advanced);
-	ui->simpleOutCustom->setText(custom);
-
-	idx = ui->simpleOutRecQuality->findData(QString(recQual));
-	if (idx == -1)
-		idx = 0;
-	ui->simpleOutRecQuality->setCurrentIndex(idx);
-
-	idx = ui->simpleOutStrEncoder->findData(QString(streamEnc));
-	if (idx == -1)
-		idx = 0;
-	ui->simpleOutStrEncoder->setCurrentIndex(idx);
-
-	idx = ui->simpleOutStrAEncoder->findData(QString(streamAudioEnc));
-	if (idx == -1)
-		idx = 0;
-	ui->simpleOutStrAEncoder->setCurrentIndex(idx);
-
-	idx = ui->simpleOutRecEncoder->findData(QString(recEnc));
-	ui->simpleOutRecEncoder->setCurrentIndex(idx);
-
-	idx = ui->simpleOutRecAEncoder->findData(QString(recAudioEnc));
-	ui->simpleOutRecAEncoder->setCurrentIndex(idx);
-
-	const char *abitrateMode = config_get_string(main->Config(), "SimpleOutput", "ABitrateMode");
-	bool vbr_mode = strcmp(abitrateMode, "VBR") == 0;
-	int aquality = (int)config_get_int(main->Config(), "SimpleOutput", "AQualityTarget");
-	if (!vbr_mode && aquality <= 0)
-		aquality = 127; // legacy config: keep the default until VBR is first used
-	if (aquality < 0)
-		aquality = 0;
-	if (aquality > 127)
-		aquality = 127;
-	ui->simpleOutputAQuality->setValue(aquality);
-
-	{
-		QSignalBlocker blocker(ui->simpleOutputABitrateMode);
-		ui->simpleOutputABitrateMode->setChecked(vbr_mode);
-	}
-	UpdateSimpleAudioBitrateModeUI();
-
-	ui->simpleOutMuxCustom->setText(muxCustom);
-
-	ui->simpleReplayBuf->setChecked(replayBuf);
-	ui->simpleRBSecMax->setValue(rbTime);
-	ui->simpleRBMegsMax->setValue(rbSize);
-
-	SimpleStreamingEncoderChanged();
-}
-
 static inline QString makeFormatToolTip()
 {
 	static const char *format_list[][2] = {
@@ -2298,12 +2086,6 @@ void OBSBasicSettings::LoadOutputSettings()
 
 	ResetEncoders();
 
-	const char *mode = config_get_string(main->Config(), "Output", "Mode");
-
-	int modeIdx = astrcmpi(mode, "Advanced") == 0 ? 1 : 0;
-	ui->outputMode->setCurrentIndex(modeIdx);
-
-	LoadSimpleOutputSettings();
 	LoadAdvOutputStreamingSettings();
 	LoadAdvOutputStreamingEncoderProperties();
 
@@ -2320,14 +2102,6 @@ void OBSBasicSettings::LoadOutputSettings()
 	LoadAdvOutputAudioSettings();
 
 	if (obs_video_active()) {
-		ui->outputMode->setEnabled(false);
-		ui->outputModeLabel->setEnabled(false);
-		ui->simpleOutStrEncoderLabel->setEnabled(false);
-		ui->simpleOutStrEncoder->setEnabled(false);
-		ui->simpleOutStrAEncoderLabel->setEnabled(false);
-		ui->simpleOutStrAEncoder->setEnabled(false);
-		ui->simpleRecordingGroupBox->setEnabled(false);
-		ui->simpleReplayBuf->setEnabled(false);
 		// Disable individual streaming output widgets, but keep Rescale (resolution/filter) and FPS
 		// enabled so they can be changed live while streaming (see the live-apply handlers above).
 		ui->advStreamTrackWidget->setEnabled(false);
@@ -2650,8 +2424,8 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	const char *filename = config_get_string(main->Config(), "Output", "FilenameFormatting");
 	bool overwriteIfExists = config_get_bool(main->Config(), "Output", "OverwriteIfExists");
 	const char *bindIP = config_get_string(main->Config(), "Output", "BindIP");
-	const char *rbPrefix = config_get_string(main->Config(), "SimpleOutput", "RecRBPrefix");
-	const char *rbSuffix = config_get_string(main->Config(), "SimpleOutput", "RecRBSuffix");
+	const char *rbPrefix = config_get_string(main->Config(), "AdvOut", "RecRBPrefix");
+	const char *rbSuffix = config_get_string(main->Config(), "AdvOut", "RecRBSuffix");
 	bool replayBuf = config_get_bool(main->Config(), "AdvOut", "RecRB");
 	int rbTime = config_get_int(main->Config(), "AdvOut", "RecRBTime");
 	int rbSize = config_get_int(main->Config(), "AdvOut", "RecRBSize");
@@ -2672,8 +2446,8 @@ void OBSBasicSettings::LoadAdvancedSettings()
 
 	ui->filenameFormatting->setText(filename);
 	ui->overwriteIfExists->setChecked(overwriteIfExists);
-	ui->simpleRBPrefix->setText(rbPrefix);
-	ui->simpleRBSuffix->setText(rbSuffix);
+	ui->advRBPrefix->setText(rbPrefix);
+	ui->advRBSuffix->setText(rbSuffix);
 
 	ui->advReplayBuf->setChecked(replayBuf);
 	ui->advRBSecMax->setValue(rbTime);
@@ -3309,8 +3083,8 @@ void OBSBasicSettings::SaveAdvancedSettings()
 		config_set_bool(App()->GetUserConfig(), "General", "ConfirmOnExit", ui->confirmOnExit->isChecked());
 
 	SaveEdit(ui->filenameFormatting, "Output", "FilenameFormatting");
-	SaveEdit(ui->simpleRBPrefix, "SimpleOutput", "RecRBPrefix");
-	SaveEdit(ui->simpleRBSuffix, "SimpleOutput", "RecRBSuffix");
+	SaveEdit(ui->advRBPrefix, "AdvOut", "RecRBPrefix");
+	SaveEdit(ui->advRBSuffix, "AdvOut", "RecRBSuffix");
 	SaveCheckBox(ui->overwriteIfExists, "Output", "OverwriteIfExists");
 	SaveCheckBox(ui->streamDelayEnable, "Output", "DelayEnable");
 	SaveSpinBox(ui->streamDelaySec, "Output", "DelaySec");
@@ -3334,14 +3108,6 @@ void OBSBasicSettings::SaveAdvancedSettings()
 			     QT_TO_UTF8(ui->monitoringDevice->currentText()), QT_TO_UTF8(newDevice));
 		}
 	}
-}
-
-static inline const char *OutputModeFromIdx(int idx)
-{
-	if (idx == 1)
-		return "Advanced";
-	else
-		return "Simple";
 }
 
 static inline const char *RecTypeFromIdx(int idx)
@@ -3438,67 +3204,6 @@ void OBSBasicSettings::SaveEncoder(QComboBox *combo, const char *section, const 
 
 void OBSBasicSettings::SaveOutputSettings()
 {
-	config_set_string(main->Config(), "Output", "Mode", OutputModeFromIdx(ui->outputMode->currentIndex()));
-
-	QString encoder = ui->simpleOutStrEncoder->currentData().toString();
-	const char *presetType;
-
-	if (encoder == SIMPLE_ENCODER_QSV)
-		presetType = "QSVPreset";
-	else if (encoder == SIMPLE_ENCODER_QSV_AV1)
-		presetType = "QSVPreset";
-	else if (encoder == SIMPLE_ENCODER_NVENC)
-		presetType = "NVENCPreset2";
-	else if (encoder == SIMPLE_ENCODER_NVENC_AV1)
-		presetType = "NVENCPreset2";
-#ifdef ENABLE_HEVC
-	else if (encoder == SIMPLE_ENCODER_AMD_HEVC)
-		presetType = "AMDPreset";
-	else if (encoder == SIMPLE_ENCODER_NVENC_HEVC)
-		presetType = "NVENCPreset2";
-#endif
-	else if (encoder == SIMPLE_ENCODER_AMD)
-		presetType = "AMDPreset";
-	else if (encoder == SIMPLE_ENCODER_AMD_AV1)
-		presetType = "AMDAV1Preset";
-	else if (encoder == SIMPLE_ENCODER_APPLE_H264
-#ifdef ENABLE_HEVC
-		 || encoder == SIMPLE_ENCODER_APPLE_HEVC
-#endif
-	)
-		/* The Apple encoders don't have presets like the other encoders
-         do. This only exists to make sure that the x264 preset doesn't
-         get overwritten with empty data. */
-		presetType = "ApplePreset";
-	else
-		presetType = "Preset";
-
-	SaveSpinBox(ui->simpleOutputVBitrate, "SimpleOutput", "VBitrate");
-	SaveComboData(ui->simpleOutStrEncoder, "SimpleOutput", "StreamEncoder");
-	SaveComboData(ui->simpleOutStrAEncoder, "SimpleOutput", "StreamAudioEncoder");
-	SaveCombo(ui->simpleOutputABitrate, "SimpleOutput", "ABitrate");
-	{
-		bool vbr_mode = ui->simpleOutputABitrateMode->isChecked() &&
-				ui->simpleOutStrAEncoder->currentData().toString() == "aac" &&
-				EncoderAvailable("CoreAudio_AAC");
-		config_set_string(main->Config(), "SimpleOutput", "ABitrateMode", vbr_mode ? "VBR" : "CBR");
-		config_set_int(main->Config(), "SimpleOutput", "AQualityTarget", ui->simpleOutputAQuality->value());
-	}
-	SaveEdit(ui->simpleOutputPath, "SimpleOutput", "FilePath");
-	SaveCheckBox(ui->simpleNoSpace, "SimpleOutput", "FileNameWithoutSpace");
-	SaveComboData(ui->simpleOutRecFormat, "SimpleOutput", "RecFormat2");
-	SaveCheckBox(ui->simpleOutAdvanced, "SimpleOutput", "UseAdvanced");
-	SaveComboData(ui->simpleOutPreset, "SimpleOutput", presetType);
-	SaveEdit(ui->simpleOutCustom, "SimpleOutput", "x264Settings");
-	SaveComboData(ui->simpleOutRecQuality, "SimpleOutput", "RecQuality");
-	SaveComboData(ui->simpleOutRecEncoder, "SimpleOutput", "RecEncoder");
-	SaveComboData(ui->simpleOutRecAEncoder, "SimpleOutput", "RecAudioEncoder");
-	SaveEdit(ui->simpleOutMuxCustom, "SimpleOutput", "MuxerCustom");
-	SaveGroupBox(ui->simpleReplayBuf, "SimpleOutput", "RecRB");
-	SaveSpinBox(ui->simpleRBSecMax, "SimpleOutput", "RecRBTime");
-	SaveSpinBox(ui->simpleRBMegsMax, "SimpleOutput", "RecRBSize");
-	config_set_int(main->Config(), "SimpleOutput", "RecTracks", SimpleOutGetSelectedAudioTracks());
-
 	curAdvStreamEncoder = GetComboData(ui->advOutEncoder);
 
 	SaveComboData(ui->advOutEncoder, "AdvOut", "Encoder");
@@ -3591,7 +3296,6 @@ void OBSBasicSettings::SaveOutputSettings()
 	SaveEdit(ui->advOutTrack6Name, "AdvOut", "Track6Name");
 
 	if (vodTrackCheckbox) {
-		SaveCheckBox(simpleVodTrack, "SimpleOutput", "VodTrackEnabled");
 		SaveCheckBox(vodTrackCheckbox, "AdvOut", "VodTrackEnabled");
 		SaveTrackIndex(main->Config(), "AdvOut", "VodTrackIndex", vodTrack[0], vodTrack[1], vodTrack[2],
 			       vodTrack[3], vodTrack[4], vodTrack[5]);
@@ -3852,34 +3556,21 @@ bool OBSBasicSettings::QueryChanges()
 
 bool OBSBasicSettings::QueryAllowedToClose()
 {
-	bool simple = (ui->outputMode->currentIndex() == 0);
-
 	bool invalidEncoder = false;
 	bool invalidFormat = false;
 	bool invalidTracks = false;
-	if (simple) {
-		if (ui->simpleOutRecEncoder->currentIndex() == -1 || ui->simpleOutStrEncoder->currentIndex() == -1 ||
-		    ui->simpleOutRecAEncoder->currentIndex() == -1 || ui->simpleOutStrAEncoder->currentIndex() == -1)
-			invalidEncoder = true;
+	if (ui->advOutRecEncoder->currentIndex() == -1 || ui->advOutEncoder->currentIndex() == -1 ||
+	    ui->advOutRecAEncoder->currentIndex() == -1 || ui->advOutAEncoder->currentIndex() == -1)
+		invalidEncoder = true;
 
-		if (ui->simpleOutRecFormat->currentIndex() == -1)
-			invalidFormat = true;
+	if (ui->advOutRecFormat->currentIndex() == -1)
+		invalidFormat = true;
 
-		QString qual = ui->simpleOutRecQuality->currentData().toString();
-		QString format = ui->simpleOutRecFormat->currentData().toString();
-		if (SimpleOutGetSelectedAudioTracks() == 0 && qual != "Stream" && format != "flv")
-			invalidTracks = true;
-	} else {
-		if (ui->advOutRecEncoder->currentIndex() == -1 || ui->advOutEncoder->currentIndex() == -1 ||
-		    ui->advOutRecAEncoder->currentIndex() == -1 || ui->advOutAEncoder->currentIndex() == -1)
-			invalidEncoder = true;
-
-		QString format = ui->advOutRecFormat->currentData().toString();
-		if (AdvOutGetSelectedAudioTracks() == 0 && format != "flv")
-			invalidTracks = true;
-		if (AdvOutGetStreamingSelectedAudioTracks() == 0)
-			invalidTracks = true;
-	}
+	QString format = ui->advOutRecFormat->currentData().toString();
+	if (AdvOutGetSelectedAudioTracks() == 0 && format != "flv")
+		invalidTracks = true;
+	if (AdvOutGetStreamingSelectedAudioTracks() == 0)
+		invalidTracks = true;
 
 	if (invalidEncoder) {
 		OBSMessageBox::warning(this, QTStr("CodecCompat.CodecMissingOnExit.Title"),
@@ -3988,16 +3679,6 @@ void OBSBasicSettings::on_buttonBox_clicked(QAbstractButton *button)
 		ClearChanged();
 		close();
 	}
-}
-
-void OBSBasicSettings::on_simpleOutputBrowse_clicked()
-{
-	QString dir =
-		SelectDirectory(this, QTStr("Basic.Settings.Output.SelectDirectory"), ui->simpleOutputPath->text());
-	if (dir.isEmpty())
-		return;
-
-	ui->simpleOutputPath->setText(dir);
 }
 
 void OBSBasicSettings::on_advOutRecPathBrowse_clicked()
@@ -4301,14 +3982,11 @@ void OBSBasicSettings::SpeakerLayoutChanged(int idx)
 	QString speakerLayoutQstr = ui->channelSetup->itemText(idx);
 	std::string speakerLayout = QT_TO_UTF8(speakerLayoutQstr);
 	bool surround = IsSurround(speakerLayout.c_str());
-	bool isOpus = ui->simpleOutStrAEncoder->currentData().toString() == "opus";
 
 	if (surround) {
 		/*
 		 * Display all bitrates
 		 */
-		PopulateSimpleBitrates(ui->simpleOutputABitrate, isOpus);
-
 		string stream_encoder_id = ui->advOutAEncoder->currentData().toString().toStdString();
 		string record_encoder_id = ui->advOutRecAEncoder->currentData().toString().toStdString();
 		PopulateAdvancedBitrates({ui->advOutTrack1Bitrate, ui->advOutTrack2Bitrate, ui->advOutTrack3Bitrate,
@@ -4318,15 +3996,12 @@ void OBSBasicSettings::SpeakerLayoutChanged(int idx)
 								     : record_encoder_id.c_str());
 	} else {
 		/*
-		 * Reset audio bitrate for simple and adv mode, update list of
-		 * bitrates and save setting.
+		 * Reset the audio bitrate, update the list of bitrates and save the setting.
 		 */
-		RestrictResetBitrates({ui->simpleOutputABitrate, ui->advOutTrack1Bitrate, ui->advOutTrack2Bitrate,
-				       ui->advOutTrack3Bitrate, ui->advOutTrack4Bitrate, ui->advOutTrack5Bitrate,
-				       ui->advOutTrack6Bitrate},
+		RestrictResetBitrates({ui->advOutTrack1Bitrate, ui->advOutTrack2Bitrate, ui->advOutTrack3Bitrate,
+				       ui->advOutTrack4Bitrate, ui->advOutTrack5Bitrate, ui->advOutTrack6Bitrate},
 				      320);
 
-		SaveCombo(ui->simpleOutputABitrate, "SimpleOutput", "ABitrate");
 		SaveCombo(ui->advOutTrack1Bitrate, "AdvOut", "Track1Bitrate");
 		SaveCombo(ui->advOutTrack2Bitrate, "AdvOut", "Track2Bitrate");
 		SaveCombo(ui->advOutTrack3Bitrate, "AdvOut", "Track3Bitrate");
@@ -4782,17 +4457,6 @@ static inline QString MakeMemorySizeString(int bitrate, int seconds)
 	return str.arg(QString::number(megabytes));
 }
 
-void OBSBasicSettings::UpdateSimpleOutStreamDelayEstimate()
-{
-	int seconds = ui->streamDelaySec->value();
-	int vBitrate = ui->simpleOutputVBitrate->value();
-	int aBitrate = ui->simpleOutputABitrate->currentText().toInt();
-
-	QString msg = MakeMemorySizeString(vBitrate + aBitrate, seconds);
-
-	ui->streamDelayInfo->setText(msg);
-}
-
 void OBSBasicSettings::UpdateAdvOutStreamDelayEstimate()
 {
 	if (!streamEncoderProps)
@@ -4834,10 +4498,7 @@ void OBSBasicSettings::UpdateAdvOutStreamDelayEstimate()
 
 void OBSBasicSettings::UpdateStreamDelayEstimate()
 {
-	if (ui->outputMode->currentIndex() == 0)
-		UpdateSimpleOutStreamDelayEstimate();
-	else
-		UpdateAdvOutStreamDelayEstimate();
+	UpdateAdvOutStreamDelayEstimate();
 
 	UpdateAutomaticReplayBufferCheckboxes();
 }
@@ -4852,64 +4513,6 @@ bool EncoderAvailable(const char *encoder)
 			return true;
 
 	return false;
-}
-
-void OBSBasicSettings::FillSimpleRecordingValues()
-{
-#define ADD_QUALITY(str) \
-	ui->simpleOutRecQuality->addItem(QTStr("Basic.Settings.Output.Simple.RecordingQuality." str), QString(str));
-#define ENCODER_STR(str) QTStr("Basic.Settings.Output.Simple.Encoder." str)
-
-	ADD_QUALITY("Stream");
-	ADD_QUALITY("Small");
-	ADD_QUALITY("HQ");
-	ADD_QUALITY("Lossless");
-
-	ui->simpleOutRecEncoder->addItem(ENCODER_STR("Software"), QString(SIMPLE_ENCODER_X264));
-	ui->simpleOutRecEncoder->addItem(ENCODER_STR("SoftwareLowCPU"), QString(SIMPLE_ENCODER_X264_LOWCPU));
-	if (EncoderAvailable("obs_qsv11"))
-		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.QSV.H264"), QString(SIMPLE_ENCODER_QSV));
-	if (EncoderAvailable("obs_qsv11_av1"))
-		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.QSV.AV1"), QString(SIMPLE_ENCODER_QSV_AV1));
-	if (EncoderAvailable("ffmpeg_nvenc"))
-		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.NVENC.H264"), QString(SIMPLE_ENCODER_NVENC));
-	if (EncoderAvailable("obs_nvenc_av1_tex"))
-		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.NVENC.AV1"), QString(SIMPLE_ENCODER_NVENC_AV1));
-#ifdef ENABLE_HEVC
-	if (EncoderAvailable("h265_texture_amf"))
-		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.AMD.HEVC"), QString(SIMPLE_ENCODER_AMD_HEVC));
-	if (EncoderAvailable("ffmpeg_hevc_nvenc"))
-		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.NVENC.HEVC"),
-						 QString(SIMPLE_ENCODER_NVENC_HEVC));
-#endif
-	if (EncoderAvailable("h264_texture_amf"))
-		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.AMD.H264"), QString(SIMPLE_ENCODER_AMD));
-	if (EncoderAvailable("av1_texture_amf"))
-		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.AMD.AV1"), QString(SIMPLE_ENCODER_AMD_AV1));
-	if (EncoderAvailable("com.apple.videotoolbox.videoencoder.ave.avc")
-#ifndef __aarch64__
-	    && os_get_emulation_status() == true
-#endif
-	)
-		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.Apple.H264"),
-						 QString(SIMPLE_ENCODER_APPLE_H264));
-#ifdef ENABLE_HEVC
-	if (EncoderAvailable("com.apple.videotoolbox.videoencoder.ave.hevc")
-#ifndef __aarch64__
-	    && os_get_emulation_status() == true
-#endif
-	)
-		ui->simpleOutRecEncoder->addItem(ENCODER_STR("Hardware.Apple.HEVC"),
-						 QString(SIMPLE_ENCODER_APPLE_HEVC));
-#endif
-
-	if (EncoderAvailable("CoreAudio_AAC") || EncoderAvailable("libfdk_aac") || EncoderAvailable("ffmpeg_aac"))
-		ui->simpleOutRecAEncoder->addItem(QTStr("Basic.Settings.Output.Simple.Codec.AAC.Default"), "aac");
-	if (EncoderAvailable("ffmpeg_opus"))
-		ui->simpleOutRecAEncoder->addItem(QTStr("Basic.Settings.Output.Simple.Codec.Opus"), "opus");
-
-#undef ADD_QUALITY
-#undef ENCODER_STR
 }
 
 void OBSBasicSettings::FillAudioMonitoringDevices()
@@ -4929,122 +4532,6 @@ void OBSBasicSettings::FillAudioMonitoringDevices()
 	obs_enum_audio_monitoring_devices(enum_devices, cb);
 }
 
-void OBSBasicSettings::SimpleRecordingQualityChanged()
-{
-	QString qual = ui->simpleOutRecQuality->currentData().toString();
-	bool streamQuality = qual == "Stream";
-	bool losslessQuality = !streamQuality && qual == "Lossless";
-
-	bool showEncoder = !streamQuality && !losslessQuality;
-	ui->simpleOutRecEncoder->setVisible(showEncoder);
-	ui->simpleOutRecEncoderLabel->setVisible(showEncoder);
-	ui->simpleOutRecAEncoder->setVisible(showEncoder);
-	ui->simpleOutRecAEncoderLabel->setVisible(showEncoder);
-	ui->simpleOutRecFormat->setVisible(!losslessQuality);
-	ui->simpleOutRecFormatLabel->setVisible(!losslessQuality);
-
-	UpdateMultitrackVideo();
-	SimpleRecordingEncoderChanged();
-	SimpleReplayBufferChanged();
-}
-
-extern const char *get_simple_output_encoder(const char *encoder);
-
-void OBSBasicSettings::SimpleStreamingEncoderChanged()
-{
-	QString encoder = ui->simpleOutStrEncoder->currentData().toString();
-	QString preset;
-	const char *defaultPreset = nullptr;
-
-	ui->simpleOutAdvanced->setVisible(true);
-	ui->simpleOutPresetLabel->setVisible(true);
-	ui->simpleOutPreset->setVisible(true);
-	ui->simpleOutPreset->clear();
-
-	if (encoder == SIMPLE_ENCODER_QSV || encoder == SIMPLE_ENCODER_QSV_AV1) {
-		ui->simpleOutPreset->addItem("speed", "speed");
-		ui->simpleOutPreset->addItem("balanced", "balanced");
-		ui->simpleOutPreset->addItem("quality", "quality");
-
-		defaultPreset = "balanced";
-		preset = curQSVPreset;
-
-	} else if (encoder == SIMPLE_ENCODER_NVENC || encoder == SIMPLE_ENCODER_NVENC_HEVC ||
-		   encoder == SIMPLE_ENCODER_NVENC_AV1) {
-
-		const char *name = get_simple_output_encoder(QT_TO_UTF8(encoder));
-		const bool isFFmpegEncoder = strncmp(name, "ffmpeg_", 7) == 0;
-		obs_properties_t *props = obs_get_encoder_properties(name);
-
-		obs_property_t *p = obs_properties_get(props, isFFmpegEncoder ? "preset2" : "preset");
-		size_t num = obs_property_list_item_count(p);
-		for (size_t i = 0; i < num; i++) {
-			const char *name = obs_property_list_item_name(p, i);
-			const char *val = obs_property_list_item_string(p, i);
-
-			ui->simpleOutPreset->addItem(QT_UTF8(name), val);
-		}
-
-		obs_properties_destroy(props);
-
-		defaultPreset = "default";
-		preset = curNVENCPreset;
-
-	} else if (encoder == SIMPLE_ENCODER_AMD || encoder == SIMPLE_ENCODER_AMD_HEVC) {
-		ui->simpleOutPreset->addItem("Speed", "speed");
-		ui->simpleOutPreset->addItem("Balanced", "balanced");
-		ui->simpleOutPreset->addItem("Quality", "quality");
-
-		defaultPreset = "balanced";
-		preset = curAMDPreset;
-	} else if (encoder == SIMPLE_ENCODER_APPLE_H264
-#ifdef ENABLE_HEVC
-		   || encoder == SIMPLE_ENCODER_APPLE_HEVC
-#endif
-	) {
-		ui->simpleOutAdvanced->setChecked(false);
-		ui->simpleOutAdvanced->setVisible(false);
-		ui->simpleOutPreset->setVisible(false);
-		ui->simpleOutPresetLabel->setVisible(false);
-
-	} else if (encoder == SIMPLE_ENCODER_AMD_AV1) {
-		ui->simpleOutPreset->addItem("Speed", "speed");
-		ui->simpleOutPreset->addItem("Balanced", "balanced");
-		ui->simpleOutPreset->addItem("Quality", "quality");
-		ui->simpleOutPreset->addItem("High Quality", "highQuality");
-
-		defaultPreset = "balanced";
-		preset = curAMDAV1Preset;
-	} else {
-
-#define PRESET_STR(val) QString(Str("Basic.Settings.Output.EncoderPreset." val)).arg(val)
-		ui->simpleOutPreset->addItem(PRESET_STR("ultrafast"), "ultrafast");
-		ui->simpleOutPreset->addItem("superfast", "superfast");
-		ui->simpleOutPreset->addItem(PRESET_STR("veryfast"), "veryfast");
-		ui->simpleOutPreset->addItem("faster", "faster");
-		ui->simpleOutPreset->addItem(PRESET_STR("fast"), "fast");
-#undef PRESET_STR
-
-		/* Users might have previously selected a preset which is no
-		 * longer available in simple mode. Make sure we don't mess
-		 * with their setups without them knowing. */
-		if (ui->simpleOutPreset->findData(curPreset) == -1) {
-			ui->simpleOutPreset->addItem(curPreset, curPreset);
-			QStandardItemModel *model = qobject_cast<QStandardItemModel *>(ui->simpleOutPreset->model());
-			QStandardItem *item = model->item(model->rowCount() - 1);
-			item->setEnabled(false);
-		}
-
-		defaultPreset = "veryfast";
-		preset = curPreset;
-	}
-
-	int idx = ui->simpleOutPreset->findData(QVariant(preset));
-	if (idx == -1)
-		idx = ui->simpleOutPreset->findData(QVariant(defaultPreset));
-
-	ui->simpleOutPreset->setCurrentIndex(idx);
-}
 
 #define ESTIMATE_STR "Basic.Settings.Output.ReplayBuffer.Estimate"
 #define ESTIMATE_TOO_LARGE_STR "Basic.Settings.Output.ReplayBuffer.EstimateTooLarge"
@@ -5052,82 +4539,12 @@ void OBSBasicSettings::SimpleStreamingEncoderChanged()
 
 void OBSBasicSettings::UpdateAutomaticReplayBufferCheckboxes()
 {
-	bool state = false;
-	switch (ui->outputMode->currentIndex()) {
-	case 0: {
-		const bool lossless = ui->simpleOutRecQuality->currentData().toString() == "Lossless";
-		state = ui->simpleReplayBuf->isChecked();
-		ui->simpleReplayBuf->setEnabled(!obs_frontend_replay_buffer_active() && !lossless);
-		break;
-	}
-	case 1: {
-		state = ui->advReplayBuf->isChecked();
-		bool customFFmpeg = ui->advOutRecType->currentIndex() == 1;
-		ui->advReplayBuf->setEnabled(!obs_frontend_replay_buffer_active() && !customFFmpeg);
-		ui->advReplayBufCustomFFmpeg->setVisible(customFFmpeg);
-		break;
-	}
-	}
+	bool state = ui->advReplayBuf->isChecked();
+	bool customFFmpeg = ui->advOutRecType->currentIndex() == 1;
+	ui->advReplayBuf->setEnabled(!obs_frontend_replay_buffer_active() && !customFFmpeg);
+	ui->advReplayBufCustomFFmpeg->setVisible(customFFmpeg);
 	ui->replayWhileStreaming->setEnabled(state);
 	ui->keepReplayStreamStops->setEnabled(state && ui->replayWhileStreaming->isChecked());
-}
-
-void OBSBasicSettings::SimpleReplayBufferChanged()
-{
-	QString qual = ui->simpleOutRecQuality->currentData().toString();
-	bool streamQuality = qual == "Stream";
-	int abitrate = 0;
-
-	ui->simpleRBMegsMax->setVisible(!streamQuality);
-	ui->simpleRBMegsMaxLabel->setVisible(!streamQuality);
-
-	if (ui->simpleOutRecFormat->currentText().compare("flv") == 0 || streamQuality) {
-		abitrate = ui->simpleOutputABitrate->currentText().toInt();
-	} else {
-		int delta = ui->simpleOutputABitrate->currentText().toInt();
-		if (ui->simpleOutRecTrack1->isChecked())
-			abitrate += delta;
-		if (ui->simpleOutRecTrack2->isChecked())
-			abitrate += delta;
-		if (ui->simpleOutRecTrack3->isChecked())
-			abitrate += delta;
-		if (ui->simpleOutRecTrack4->isChecked())
-			abitrate += delta;
-		if (ui->simpleOutRecTrack5->isChecked())
-			abitrate += delta;
-		if (ui->simpleOutRecTrack6->isChecked())
-			abitrate += delta;
-	}
-
-	int vbitrate = ui->simpleOutputVBitrate->value();
-	int seconds = ui->simpleRBSecMax->value();
-
-	// Set maximum to 75% of installed memory
-	uint64_t memTotal = os_get_sys_total_size();
-	int64_t memMaxMB = memTotal ? memTotal * 3 / 4 / 1024 / 1024 : 8192;
-
-	int64_t memMB = int64_t(seconds) * int64_t(vbitrate + abitrate) * 1000 / 8 / 1024 / 1024;
-	if (memMB < 1)
-		memMB = 1;
-
-	ui->simpleRBEstimate->setObjectName("");
-	if (streamQuality) {
-		if (memMB <= memMaxMB) {
-			ui->simpleRBEstimate->setText(QTStr(ESTIMATE_STR).arg(QString::number(int(memMB))));
-		} else {
-			ui->simpleRBEstimate->setText(
-				QTStr(ESTIMATE_TOO_LARGE_STR)
-					.arg(QString::number(int(memMB)), QString::number(int(memMaxMB))));
-			ui->simpleRBEstimate->setProperty("class", "text-warning");
-		}
-	} else {
-		ui->simpleRBEstimate->setText(QTStr(ESTIMATE_UNKNOWN_STR));
-		ui->simpleRBMegsMax->setMaximum(memMaxMB);
-	}
-
-	ui->simpleRBEstimate->style()->polish(ui->simpleRBEstimate);
-
-	UpdateAutomaticReplayBufferCheckboxes();
 }
 
 #define TEXT_USE_STREAM_ENC QTStr("Basic.Settings.Output.Adv.Recording.UseStreamEncoder")
@@ -5227,197 +4644,6 @@ void OBSBasicSettings::AdvReplayBufferChanged()
 	UpdateAutomaticReplayBufferCheckboxes();
 }
 
-#define SIMPLE_OUTPUT_WARNING(str) QTStr("Basic.Settings.Output.Simple.Warn." str)
-
-static void DisableIncompatibleSimpleCodecs(QComboBox *cbox, const QString &format)
-{
-	/* Unlike in advanced mode the available simple mode encoders are
-	 * hardcoded, so this check is also a simpler, hardcoded one. */
-	QString encoder = cbox->currentData().toString();
-
-	bool currentCompatible = true;
-	for (int idx = 0; idx < cbox->count(); idx++) {
-		QString encName = cbox->itemData(idx).toString();
-		QString codec;
-
-		/* Simple mode does not expose audio encoder variants directly,
-		 * so we have to simply set the codec to the internal name. */
-		if (encName == "opus" || encName == "aac") {
-			codec = encName;
-		} else {
-			const char *encoder_id = get_simple_output_encoder(QT_TO_UTF8(encName));
-			codec = obs_get_encoder_codec(encoder_id);
-		}
-
-		QStandardItemModel *model = dynamic_cast<QStandardItemModel *>(cbox->model());
-		QStandardItem *item = model->item(idx);
-
-		if (ContainerSupportsCodec(format.toStdString(), codec.toStdString())) {
-			item->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled);
-		} else {
-			if (encoder == encName)
-				currentCompatible = false;
-
-			item->setFlags(Qt::NoItemFlags);
-		}
-	}
-
-	if (!currentCompatible)
-		cbox->setCurrentIndex(-1);
-}
-
-static void DisableIncompatibleSimpleContainer(QComboBox *cbox, const QString &currentFormat, const QString &vEncoder,
-					       const QString &aEncoder)
-{
-	/* Similar to above, but works in reverse to disable incompatible formats
-	 * based on the encoder selection. */
-	string vCodec = obs_get_encoder_codec(get_simple_output_encoder(QT_TO_UTF8(vEncoder)));
-	string aCodec = aEncoder.toStdString();
-
-	bool currentCompatible = true;
-	for (int idx = 0; idx < cbox->count(); idx++) {
-		QString format = cbox->itemData(idx).toString();
-		string formatStr = format.toStdString();
-
-		QStandardItemModel *model = dynamic_cast<QStandardItemModel *>(cbox->model());
-		QStandardItem *item = model->item(idx);
-
-		if (ContainerSupportsCodec(formatStr, vCodec) && ContainerSupportsCodec(formatStr, aCodec)) {
-			item->setFlags(Qt::ItemIsSelectable | Qt::ItemIsEnabled);
-		} else {
-			if (format == currentFormat)
-				currentCompatible = false;
-
-			item->setFlags(Qt::NoItemFlags);
-		}
-	}
-
-	if (!currentCompatible)
-		cbox->setCurrentIndex(-1);
-}
-
-void OBSBasicSettings::SimpleRecordingEncoderChanged()
-{
-	QString qual = ui->simpleOutRecQuality->currentData().toString();
-	QString warning;
-	bool enforceBitrate = !ui->ignoreRecommended->isChecked();
-	OBSService service = GetStream1Service();
-
-	delete simpleOutRecWarning;
-
-	if (enforceBitrate && service) {
-		OBSDataAutoRelease videoSettings = obs_data_create();
-		OBSDataAutoRelease audioSettings = obs_data_create();
-		int oldVBitrate = ui->simpleOutputVBitrate->value();
-		int oldABitrate = ui->simpleOutputABitrate->currentText().toInt();
-		obs_data_set_int(videoSettings, "bitrate", oldVBitrate);
-		obs_data_set_int(audioSettings, "bitrate", oldABitrate);
-
-		obs_service_apply_encoder_settings(service, videoSettings, audioSettings);
-
-		int newVBitrate = obs_data_get_int(videoSettings, "bitrate");
-		int newABitrate = obs_data_get_int(audioSettings, "bitrate");
-
-		if (newVBitrate < oldVBitrate)
-			warning = SIMPLE_OUTPUT_WARNING("VideoBitrate").arg(newVBitrate);
-		if (newABitrate < oldABitrate) {
-			if (!warning.isEmpty())
-				warning += "\n\n";
-			warning += SIMPLE_OUTPUT_WARNING("AudioBitrate").arg(newABitrate);
-		}
-	}
-
-	QString format = ui->simpleOutRecFormat->currentData().toString();
-	/* Set tooltip if available */
-	QString tooltip = QTStr("Basic.Settings.Output.Format.TT." + format.toUtf8());
-
-	if (!tooltip.startsWith("Basic.Settings.Output"))
-		ui->simpleOutRecFormat->setToolTip(tooltip);
-	else
-		ui->simpleOutRecFormat->setToolTip(nullptr);
-
-	if (qual == "Lossless") {
-		if (!warning.isEmpty())
-			warning += "\n\n";
-		warning += SIMPLE_OUTPUT_WARNING("Lossless");
-		warning += "\n\n";
-		warning += SIMPLE_OUTPUT_WARNING("Encoder");
-
-	} else if (qual != "Stream") {
-		QString enc = ui->simpleOutRecEncoder->currentData().toString();
-		QString streamEnc = ui->simpleOutStrEncoder->currentData().toString();
-		bool x264RecEnc = (enc == SIMPLE_ENCODER_X264 || enc == SIMPLE_ENCODER_X264_LOWCPU);
-
-		if (streamEnc == SIMPLE_ENCODER_X264 && x264RecEnc) {
-			if (!warning.isEmpty())
-				warning += "\n\n";
-			warning += SIMPLE_OUTPUT_WARNING("Encoder");
-		}
-
-		/* Prevent function being called recursively if changes happen. */
-		ui->simpleOutRecEncoder->blockSignals(true);
-		ui->simpleOutRecAEncoder->blockSignals(true);
-		DisableIncompatibleSimpleCodecs(ui->simpleOutRecEncoder, format);
-		DisableIncompatibleSimpleCodecs(ui->simpleOutRecAEncoder, format);
-		ui->simpleOutRecAEncoder->blockSignals(false);
-		ui->simpleOutRecEncoder->blockSignals(false);
-
-		if (ui->simpleOutRecEncoder->currentIndex() == -1 || ui->simpleOutRecAEncoder->currentIndex() == -1) {
-			if (!warning.isEmpty())
-				warning += "\n\n";
-			warning += QTStr("OutputWarnings.CodecIncompatible");
-		}
-	} else {
-		/* When using stream encoders do the reverse; Disable containers that are incompatible. */
-		QString streamEnc = ui->simpleOutStrEncoder->currentData().toString();
-		QString streamAEnc = ui->simpleOutStrAEncoder->currentData().toString();
-
-		ui->simpleOutRecFormat->blockSignals(true);
-		DisableIncompatibleSimpleContainer(ui->simpleOutRecFormat, format, streamEnc, streamAEnc);
-		ui->simpleOutRecFormat->blockSignals(false);
-
-		if (ui->simpleOutRecFormat->currentIndex() == -1) {
-			if (!warning.isEmpty())
-				warning += "\n\n";
-			warning += SIMPLE_OUTPUT_WARNING("IncompatibleContainer");
-		}
-
-		if (!warning.isEmpty())
-			warning += "\n\n";
-		warning += SIMPLE_OUTPUT_WARNING("CannotPause");
-	}
-
-	if (qual != "Lossless" && (format == "mp4" || format == "mov")) {
-		if (!warning.isEmpty())
-			warning += "\n\n";
-		warning += QTStr("OutputWarnings.MP4Recording");
-		ui->autoRemux->setText(QTStr("Basic.Settings.Advanced.AutoRemux").arg("mp4") + " " +
-				       QTStr("Basic.Settings.Advanced.AutoRemux.MP4"));
-	} else {
-		ui->autoRemux->setText(QTStr("Basic.Settings.Advanced.AutoRemux").arg("mp4"));
-	}
-
-	if (qual == "Stream") {
-		ui->simpleRecTrackWidget->setCurrentWidget(ui->simpleFlvTracks);
-	} else if (qual == "Lossless") {
-		ui->simpleRecTrackWidget->setCurrentWidget(ui->simpleRecTracks);
-	} else {
-		if (format == "flv") {
-			ui->simpleRecTrackWidget->setCurrentWidget(ui->simpleFlvTracks);
-		} else {
-			ui->simpleRecTrackWidget->setCurrentWidget(ui->simpleRecTracks);
-		}
-	}
-
-	if (warning.isEmpty())
-		return;
-
-	simpleOutRecWarning = new QLabel(warning, this);
-	simpleOutRecWarning->setProperty("class", "text-warning");
-	simpleOutRecWarning->setWordWrap(true);
-	ui->simpleOutInfoLayout->addWidget(simpleOutRecWarning);
-}
-
 void OBSBasicSettings::SurroundWarning(int idx)
 {
 	if (idx == lastChannelSetupIdx || idx == -1)
@@ -5495,36 +4721,6 @@ void OBSBasicSettings::LowLatencyBufferingChanged(bool checked)
 
 	QMetaObject::invokeMethod(this, "UpdateAudioWarnings", Qt::QueuedConnection);
 	QMetaObject::invokeMethod(this, "AudioChangedRestart");
-}
-
-void OBSBasicSettings::SimpleRecordingQualityLosslessWarning(int idx)
-{
-	if (idx == lastSimpleRecQualityIdx || idx == -1)
-		return;
-
-	QString qual = ui->simpleOutRecQuality->itemData(idx).toString();
-
-	if (loading) {
-		lastSimpleRecQualityIdx = idx;
-		return;
-	}
-
-	if (qual == "Lossless") {
-		QMessageBox::StandardButton button;
-
-		QString warningString =
-			SIMPLE_OUTPUT_WARNING("Lossless") + QString("\n\n") + SIMPLE_OUTPUT_WARNING("Lossless.Msg");
-
-		button = OBSMessageBox::question(this, SIMPLE_OUTPUT_WARNING("Lossless.Title"), warningString);
-
-		if (button == QMessageBox::No) {
-			QMetaObject::invokeMethod(ui->simpleOutRecQuality, "setCurrentIndex", Qt::QueuedConnection,
-						  Q_ARG(int, lastSimpleRecQualityIdx));
-			return;
-		}
-	}
-
-	lastSimpleRecQualityIdx = idx;
 }
 
 void OBSBasicSettings::on_disableOSXVSync_clicked()
@@ -5643,17 +4839,6 @@ int OBSBasicSettings::CurrentFLVTrack()
 		return 6;
 
 	return 0;
-}
-
-int OBSBasicSettings::SimpleOutGetSelectedAudioTracks()
-{
-	int tracks = (ui->simpleOutRecTrack1->isChecked() ? (1 << 0) : 0) |
-		     (ui->simpleOutRecTrack2->isChecked() ? (1 << 1) : 0) |
-		     (ui->simpleOutRecTrack3->isChecked() ? (1 << 2) : 0) |
-		     (ui->simpleOutRecTrack4->isChecked() ? (1 << 3) : 0) |
-		     (ui->simpleOutRecTrack5->isChecked() ? (1 << 4) : 0) |
-		     (ui->simpleOutRecTrack6->isChecked() ? (1 << 5) : 0);
-	return tracks;
 }
 
 int OBSBasicSettings::AdvOutGetSelectedAudioTracks()
@@ -5800,31 +4985,6 @@ void OBSBasicSettings::UpdateMultitrackVideo()
 	ui->multitrackVideoConfigOverrideLabel->setEnabled(override_live_editable);
 	ui->multitrackVideoConfigOverride->setEnabled(override_live_editable);
 
-	auto update_simple_output_settings = [&](bool mtv_enabled) {
-		auto recording_uses_stream_encoder = ui->simpleOutRecQuality->currentData().toString() == "Stream";
-		mtv_enabled = mtv_enabled && !recording_uses_stream_encoder;
-
-		ui->simpleOutputVBitrateLabel->setDisabled(mtv_enabled);
-		ui->simpleOutputVBitrate->setDisabled(mtv_enabled);
-
-		ui->simpleOutputABitrateLabel->setDisabled(mtv_enabled);
-		ui->simpleOutputABitrate->setDisabled(mtv_enabled);
-		ui->simpleOutputABitrateMode->setDisabled(mtv_enabled);
-		ui->simpleOutputAQuality->setDisabled(mtv_enabled);
-
-		ui->simpleOutStrEncoderLabel->setDisabled(mtv_enabled);
-		ui->simpleOutStrEncoder->setDisabled(mtv_enabled);
-
-		ui->simpleOutPresetLabel->setDisabled(mtv_enabled);
-		ui->simpleOutPreset->setDisabled(mtv_enabled);
-
-		ui->simpleOutCustomLabel->setDisabled(mtv_enabled);
-		ui->simpleOutCustom->setDisabled(mtv_enabled);
-
-		ui->simpleOutStrAEncoderLabel->setDisabled(mtv_enabled);
-		ui->simpleOutStrAEncoder->setDisabled(mtv_enabled);
-	};
-
 	auto update_advanced_output_settings = [&](bool mtv_enabled) {
 		auto recording_uses_stream_video_encoder = ui->advOutRecEncoder->currentText() == TEXT_USE_STREAM_ENC;
 		auto recording_uses_stream_audio_encoder = ui->advOutRecAEncoder->currentData() == "none";
@@ -5930,61 +5090,14 @@ void OBSBasicSettings::UpdateMultitrackVideo()
 		auto mtv_enabled = ui->enableMultitrackVideo->isChecked();
 		ui->multitrackVideoNoticeBox->setVisible(mtv_enabled);
 
-		update_simple_output_settings(mtv_enabled);
 		update_advanced_output_settings(mtv_enabled);
 		update_advanced_output_audio_tracks(mtv_enabled);
 	} else {
 		ui->multitrackVideoNoticeBox->setVisible(false);
 
-		update_simple_output_settings(false);
 		update_advanced_output_settings(false);
 		update_advanced_output_audio_tracks(false);
 	}
-}
-
-void OBSBasicSettings::SimpleStreamAudioEncoderChanged()
-{
-	PopulateSimpleBitrates(ui->simpleOutputABitrate, ui->simpleOutStrAEncoder->currentData().toString() == "opus");
-
-	if (IsSurround(QT_TO_UTF8(ui->channelSetup->currentText())))
-		return;
-
-	RestrictResetBitrates({ui->simpleOutputABitrate}, 320);
-
-	UpdateSimpleAudioBitrateModeUI();
-}
-
-void OBSBasicSettings::SimpleAudioBitrateModeChanged(bool /*vbr*/)
-{
-	UpdateSimpleAudioBitrateModeUI();
-}
-
-void OBSBasicSettings::UpdateSimpleAudioBitrateModeUI()
-{
-	bool available = ui->simpleOutStrAEncoder->currentData().toString() == "aac" && EncoderAvailable("CoreAudio_AAC");
-
-	if (!available) {
-		QSignalBlocker blocker(ui->simpleOutputABitrateMode);
-		ui->simpleOutputABitrateMode->setChecked(false);
-	}
-
-	bool vbr = available && ui->simpleOutputABitrateMode->isChecked();
-
-	ui->simpleOutputABitrateMode->setText(vbr ? "VBR" : "CBR");
-	ui->simpleOutputABitrateMode->setEnabled(available);
-	ui->simpleOutputABitrateMode->setToolTip(
-			QTStr(available ? "Basic.Settings.Output.Simple.ABitrateMode.VBR.Tooltip"
-			     : "Basic.Settings.Output.Simple.ABitrateMode.VBR.Unavailable.Tooltip"));
-	ui->simpleOutputAQuality->setToolTip(QTStr("Basic.Settings.Output.Simple.AQualityTarget.Tooltip"));
-
-	ui->simpleOutputABitrateLabel->setText(vbr ? QTStr("Basic.Settings.Output.AudioQuality")
-	                                         : QTStr("Basic.Settings.Output.AudioBitrate"));
-	if (vbr)
-		ui->simpleOutputABitrateLabel->setBuddy(ui->simpleOutputAQuality);
-	else
-		ui->simpleOutputABitrateLabel->setBuddy(ui->simpleOutputABitrate);
-	ui->simpleOutputABitrate->setVisible(!vbr);
-	ui->simpleOutputAQuality->setVisible(vbr);
 }
 
 void OBSBasicSettings::AdvAudioEncodersChanged()

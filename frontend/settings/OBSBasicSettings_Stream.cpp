@@ -1015,30 +1015,11 @@ void OBSBasicSettings::UpdateVodTrackSetting()
 	if (!enableVodTrack) {
 		delete vodTrackCheckbox;
 		delete vodTrackContainer;
-		delete simpleVodTrack;
 		return;
 	}
 
 	/* -------------------------------------- */
-	/* simple output mode vod track widgets   */
-
-	bool simpleAdv = ui->simpleOutAdvanced->isChecked();
-	bool vodTrackEnabled = config_get_bool(main->Config(), "SimpleOutput", "VodTrackEnabled");
-
-	simpleVodTrack = new QCheckBox(this);
-	simpleVodTrack->setText(QTStr("Basic.Settings.Output.Simple.TwitchVodTrack"));
-	simpleVodTrack->setVisible(simpleAdv);
-	simpleVodTrack->setChecked(vodTrackEnabled);
-
-	int pos;
-	ui->simpleStreamingLayout->getWidgetPosition(ui->simpleOutAdvanced, &pos, nullptr);
-	ui->simpleStreamingLayout->insertRow(pos + 1, nullptr, simpleVodTrack);
-
-	HookWidget(simpleVodTrack.data(), &QCheckBox::clicked, &OBSBasicSettings::OutputsChanged);
-	connect(ui->simpleOutAdvanced, &QCheckBox::toggled, simpleVodTrack.data(), &QCheckBox::setVisible);
-
-	/* -------------------------------------- */
-	/* advanced output mode vod track widgets */
+	/* vod track widgets                          */
 
 	vodTrackCheckbox = new QCheckBox(this);
 	vodTrackCheckbox->setText(QTStr("Basic.Settings.Output.Adv.TwitchVodTrack"));
@@ -1062,7 +1043,7 @@ void OBSBasicSettings::UpdateVodTrackSetting()
 
 	ui->advOutTopLayout->insertRow(2, vodTrackCheckbox, vodTrackContainer);
 
-	vodTrackEnabled = config_get_bool(main->Config(), "AdvOut", "VodTrackEnabled");
+	bool vodTrackEnabled = config_get_bool(main->Config(), "AdvOut", "VodTrackEnabled");
 	vodTrackCheckbox->setChecked(vodTrackEnabled);
 	vodTrackContainer->setEnabled(vodTrackEnabled);
 
@@ -1155,7 +1136,6 @@ void OBSBasicSettings::DisplayEnforceWarning(bool checked)
 		return;
 
 	if (!checked) {
-		SimpleRecordingEncoderChanged();
 		return;
 	}
 
@@ -1172,7 +1152,6 @@ void OBSBasicSettings::DisplayEnforceWarning(bool checked)
 		return;
 	}
 
-	SimpleRecordingEncoderChanged();
 }
 
 bool OBSBasicSettings::ResFPSValid(obs_service_resolution *res_list, size_t res_count, int max_fps)
@@ -1434,16 +1413,6 @@ static bool service_supports_codec(const char **codecs, const char *codec)
 }
 
 extern bool EncoderAvailable(const char *encoder);
-extern const char *get_simple_output_encoder(const char *name);
-
-static inline bool service_supports_encoder(const char **codecs, const char *encoder)
-{
-	if (!EncoderAvailable(encoder))
-		return false;
-
-	const char *codec = obs_get_encoder_codec(encoder);
-	return service_supports_codec(codecs, codec);
-}
 
 static bool return_first_id(void *data, const char *id)
 {
@@ -1455,19 +1424,12 @@ static bool return_first_id(void *data, const char *id)
 
 bool OBSBasicSettings::ServiceAndVCodecCompatible()
 {
-	bool simple = (ui->outputMode->currentIndex() == 0);
 	bool ret;
 
 	const char *codec;
 
-	if (simple) {
-		QString encoder = ui->simpleOutStrEncoder->currentData().toString();
-		const char *id = get_simple_output_encoder(QT_TO_UTF8(encoder));
-		codec = obs_get_encoder_codec(id);
-	} else {
-		QString encoder = ui->advOutEncoder->currentData().toString();
-		codec = obs_get_encoder_codec(QT_TO_UTF8(encoder));
-	}
+	QString encoder = ui->advOutEncoder->currentData().toString();
+	codec = obs_get_encoder_codec(QT_TO_UTF8(encoder));
 
 	OBSService service = SpawnTempService();
 	const char **codecs = obs_service_get_supported_video_codecs(service);
@@ -1492,17 +1454,12 @@ bool OBSBasicSettings::ServiceAndVCodecCompatible()
 
 bool OBSBasicSettings::ServiceAndACodecCompatible()
 {
-	bool simple = (ui->outputMode->currentIndex() == 0);
 	bool ret;
 
 	QString codec;
 
-	if (simple) {
-		codec = ui->simpleOutStrAEncoder->currentData().toString();
-	} else {
-		QString encoder = ui->advOutAEncoder->currentData().toString();
-		codec = obs_get_encoder_codec(QT_TO_UTF8(encoder));
-	}
+	QString encoder = ui->advOutAEncoder->currentData().toString();
+	codec = obs_get_encoder_codec(QT_TO_UTF8(encoder));
 
 	OBSService service = SpawnTempService();
 	const char **codecs = obs_service_get_supported_audio_codecs(service);
@@ -1555,19 +1512,6 @@ static QString get_adv_audio_fallback(const QString &enc)
 	return aac_default;
 }
 
-static QString get_simple_fallback(const QString &enc)
-{
-	if (enc == SIMPLE_ENCODER_NVENC_HEVC || enc == SIMPLE_ENCODER_NVENC_AV1)
-		return SIMPLE_ENCODER_NVENC;
-	if (enc == SIMPLE_ENCODER_AMD_HEVC || enc == SIMPLE_ENCODER_AMD_AV1)
-		return SIMPLE_ENCODER_AMD;
-	if (enc == SIMPLE_ENCODER_APPLE_HEVC)
-		return SIMPLE_ENCODER_APPLE_H264;
-	if (enc == SIMPLE_ENCODER_QSV_AV1)
-		return SIMPLE_ENCODER_QSV;
-	return SIMPLE_ENCODER_X264;
-}
-
 bool OBSBasicSettings::ServiceSupportsCodecCheck()
 {
 	if (loading)
@@ -1587,40 +1531,21 @@ bool OBSBasicSettings::ServiceSupportsCodecCheck()
 	QString fb_video_name;
 	QString cur_audio_name;
 	QString fb_audio_name;
-	bool simple = (ui->outputMode->currentIndex() == 0);
 
 	/* ------------------------------------------------- */
 	/* get current codec                                 */
 
-	if (simple) {
-		QString cur_enc = ui->simpleOutStrEncoder->currentData().toString();
-		QString fb_enc = get_simple_fallback(cur_enc);
+	QString cur_enc = ui->advOutEncoder->currentData().toString();
+	QString fb_enc = get_adv_fallback(cur_enc);
 
-		int cur_idx = ui->simpleOutStrEncoder->findData(cur_enc);
-		int fb_idx = ui->simpleOutStrEncoder->findData(fb_enc);
+	cur_video_name = obs_encoder_get_display_name(QT_TO_UTF8(cur_enc));
+	fb_video_name = obs_encoder_get_display_name(QT_TO_UTF8(fb_enc));
 
-		cur_video_name = ui->simpleOutStrEncoder->itemText(cur_idx);
-		fb_video_name = ui->simpleOutStrEncoder->itemText(fb_idx);
+	cur_enc = ui->advOutAEncoder->currentData().toString();
+	fb_enc = get_adv_audio_fallback(cur_enc);
 
-		cur_enc = ui->simpleOutStrAEncoder->currentData().toString();
-		fb_enc = (cur_enc == "opus") ? "aac" : "opus";
-
-		cur_audio_name = ui->simpleOutStrAEncoder->itemText(ui->simpleOutStrAEncoder->findData(cur_enc));
-		fb_audio_name = (cur_enc == "opus") ? QTStr("Basic.Settings.Output.Simple.Codec.AAC")
-						    : QTStr("Basic.Settings.Output.Simple.Codec.Opus");
-	} else {
-		QString cur_enc = ui->advOutEncoder->currentData().toString();
-		QString fb_enc = get_adv_fallback(cur_enc);
-
-		cur_video_name = obs_encoder_get_display_name(QT_TO_UTF8(cur_enc));
-		fb_video_name = obs_encoder_get_display_name(QT_TO_UTF8(fb_enc));
-
-		cur_enc = ui->advOutAEncoder->currentData().toString();
-		fb_enc = get_adv_audio_fallback(cur_enc);
-
-		cur_audio_name = obs_encoder_get_display_name(QT_TO_UTF8(cur_enc));
-		fb_audio_name = obs_encoder_get_display_name(QT_TO_UTF8(fb_enc));
-	}
+	cur_audio_name = obs_encoder_get_display_name(QT_TO_UTF8(cur_enc));
+	fb_audio_name = obs_encoder_get_display_name(QT_TO_UTF8(fb_enc));
 
 #define WARNING_VAL(x) QTStr("Basic.Settings.Output.Warn.ServiceCodecCompatibility." x)
 
@@ -1651,9 +1576,7 @@ bool OBSBasicSettings::ServiceSupportsCodecCheck()
 void OBSBasicSettings::ResetEncoders(bool streamOnly)
 {
 	QString lastAdvVideoEnc = ui->advOutEncoder->currentData().toString();
-	QString lastVideoEnc = ui->simpleOutStrEncoder->currentData().toString();
 	QString lastAdvAudioEnc = ui->advOutAEncoder->currentData().toString();
-	QString lastAudioEnc = ui->simpleOutStrAEncoder->currentData().toString();
 	OBSService service = SpawnTempService();
 	const char **vcodecs = obs_service_get_supported_video_codecs(service);
 	const char **acodecs = obs_service_get_supported_audio_codecs(service);
@@ -1678,17 +1601,13 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 		acodecs = (const char **)output_acodecs.Get();
 	}
 
-	QSignalBlocker s1(ui->simpleOutStrEncoder);
 	QSignalBlocker s2(ui->advOutEncoder);
-	QSignalBlocker s3(ui->simpleOutStrAEncoder);
 	QSignalBlocker s4(ui->advOutAEncoder);
 
 	/* ------------------------------------------------- */
 	/* clear encoder lists                               */
 
-	ui->simpleOutStrEncoder->clear();
 	ui->advOutEncoder->clear();
-	ui->simpleOutStrAEncoder->clear();
 	ui->advOutAEncoder->clear();
 
 	if (!streamOnly) {
@@ -1736,65 +1655,6 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 	}
 
 	/* ------------------------------------------------- */
-	/* load simple stream encoders                       */
-
-#define ENCODER_STR(str) QTStr("Basic.Settings.Output.Simple.Encoder." str)
-
-	ui->simpleOutStrEncoder->addItem(ENCODER_STR("Software"), QString(SIMPLE_ENCODER_X264));
-#ifdef _WIN32
-	if (service_supports_encoder(vcodecs, "obs_qsv11"))
-		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.QSV.H264"), QString(SIMPLE_ENCODER_QSV));
-	if (service_supports_encoder(vcodecs, "obs_qsv11_av1"))
-		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.QSV.AV1"), QString(SIMPLE_ENCODER_QSV_AV1));
-#endif
-	if (service_supports_encoder(vcodecs, "ffmpeg_nvenc"))
-		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.NVENC.H264"), QString(SIMPLE_ENCODER_NVENC));
-	if (service_supports_encoder(vcodecs, "obs_nvenc_av1_tex"))
-		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.NVENC.AV1"), QString(SIMPLE_ENCODER_NVENC_AV1));
-#ifdef ENABLE_HEVC
-	if (service_supports_encoder(vcodecs, "h265_texture_amf"))
-		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.AMD.HEVC"), QString(SIMPLE_ENCODER_AMD_HEVC));
-	if (service_supports_encoder(vcodecs, "ffmpeg_hevc_nvenc"))
-		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.NVENC.HEVC"),
-						 QString(SIMPLE_ENCODER_NVENC_HEVC));
-#endif
-	if (service_supports_encoder(vcodecs, "h264_texture_amf"))
-		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.AMD.H264"), QString(SIMPLE_ENCODER_AMD));
-	if (service_supports_encoder(vcodecs, "av1_texture_amf"))
-		ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.AMD.AV1"), QString(SIMPLE_ENCODER_AMD_AV1));
-/* Preprocessor guard required for the macOS version check */
-#ifdef __APPLE__
-	if (service_supports_encoder(vcodecs, "com.apple.videotoolbox.videoencoder.ave.avc")
-#ifndef __aarch64__
-	    && os_get_emulation_status() == true
-#endif
-	) {
-		if (__builtin_available(macOS 13.0, *)) {
-			ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.Apple.H264"),
-							 QString(SIMPLE_ENCODER_APPLE_H264));
-		}
-	}
-#ifdef ENABLE_HEVC
-	if (service_supports_encoder(vcodecs, "com.apple.videotoolbox.videoencoder.ave.hevc")
-#ifndef __aarch64__
-	    && os_get_emulation_status() == true
-#endif
-	) {
-		if (__builtin_available(macOS 13.0, *)) {
-			ui->simpleOutStrEncoder->addItem(ENCODER_STR("Hardware.Apple.HEVC"),
-							 QString(SIMPLE_ENCODER_APPLE_HEVC));
-		}
-	}
-#endif
-#endif
-	if (service_supports_encoder(acodecs, "CoreAudio_AAC") || service_supports_encoder(acodecs, "libfdk_aac") ||
-	    service_supports_encoder(acodecs, "ffmpeg_aac"))
-		ui->simpleOutStrAEncoder->addItem(QTStr("Basic.Settings.Output.Simple.Codec.AAC.Default"), "aac");
-	if (service_supports_encoder(acodecs, "ffmpeg_opus"))
-		ui->simpleOutStrAEncoder->addItem(QTStr("Basic.Settings.Output.Simple.Codec.Opus"), "opus");
-#undef ENCODER_STR
-
-	/* ------------------------------------------------- */
 	/* Find fallback encoders                            */
 
 	if (!lastAdvVideoEnc.isEmpty()) {
@@ -1821,31 +1681,5 @@ void OBSBasicSettings::ResetEncoders(bool streamOnly)
 		idx = ui->advOutAEncoder->findData(lastAdvAudioEnc);
 		s4.unblock();
 		ui->advOutAEncoder->setCurrentIndex(idx);
-	}
-
-	if (!lastVideoEnc.isEmpty()) {
-		int idx = ui->simpleOutStrEncoder->findData(lastVideoEnc);
-		if (idx == -1) {
-			lastVideoEnc = get_simple_fallback(lastVideoEnc);
-			ui->simpleOutStrEncoder->setProperty("changed", QVariant(true));
-			OutputsChanged();
-		}
-
-		idx = ui->simpleOutStrEncoder->findData(lastVideoEnc);
-		s1.unblock();
-		ui->simpleOutStrEncoder->setCurrentIndex(idx);
-	}
-
-	if (!lastAudioEnc.isEmpty()) {
-		int idx = ui->simpleOutStrAEncoder->findData(lastAudioEnc);
-		if (idx == -1) {
-			lastAudioEnc = (lastAudioEnc == "opus") ? "aac" : "opus";
-			ui->simpleOutStrAEncoder->setProperty("changed", QVariant(true));
-			OutputsChanged();
-		}
-
-		idx = ui->simpleOutStrAEncoder->findData(lastAudioEnc);
-		s3.unblock();
-		ui->simpleOutStrAEncoder->setCurrentIndex(idx);
 	}
 }

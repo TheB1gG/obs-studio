@@ -165,7 +165,6 @@ public:
 private:
 	std::vector<std::string> ids() const;
 	/* Is this profile using advanced output? Decides where the audio bitrates live. */
-	bool advancedMode() const;
 	/* Does this destination's service take the extra VOD audio track? */
 	bool usesVodTrack(std::string_view id) const;
 	/* Does the tracks file of 'from' reference 'target' (shared_from / copied_from)? */

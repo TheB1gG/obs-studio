@@ -1,6 +1,5 @@
 #include "BasicOutputHandler.hpp"
 #include "AdvancedOutput.hpp"
-#include "SimpleOutput.hpp"
 
 #include <utility/MultitrackVideoError.hpp>
 #include <utility/StartMultiTrackVideoStreamingGuard.hpp>
@@ -591,8 +590,8 @@ OBSDataAutoRelease BasicOutputHandler::GenerateMultitrackVideoStreamDumpConfig()
 	if (!stream_dump_enabled)
 		return nullptr;
 
-	const char *path = config_get_string(main->Config(), "SimpleOutput", "FilePath");
-	bool noSpace = config_get_bool(main->Config(), "SimpleOutput", "FileNameWithoutSpace");
+	const char *path = main->GetCurrentOutputPath();
+	bool noSpace = config_get_bool(main->Config(), "AdvOut", "RecFileNameWithoutSpace");
 	const char *filenameFormat = config_get_string(main->Config(), "Output", "FilenameFormatting");
 	bool overwriteIfExists = config_get_bool(main->Config(), "Output", "OverwriteIfExists");
 	bool useMP4 = config_get_bool(main->Config(), "Stream1", "MultitrackVideoStreamDumpAsMP4");
@@ -612,11 +611,6 @@ OBSDataAutoRelease BasicOutputHandler::GenerateMultitrackVideoStreamDumpConfig()
 	}
 
 	return settings;
-}
-
-BasicOutputHandler *CreateSimpleOutputHandler(OBSBasic *main)
-{
-	return new SimpleOutput(main);
 }
 
 BasicOutputHandler *CreateAdvancedOutputHandler(OBSBasic *main)

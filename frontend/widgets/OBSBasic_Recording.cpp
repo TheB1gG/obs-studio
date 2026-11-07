@@ -29,14 +29,11 @@
 
 void OBSBasic::on_actionShow_Recordings_triggered()
 {
-	const char *mode = config_get_string(activeConfiguration, "Output", "Mode");
 	const char *type = config_get_string(activeConfiguration, "AdvOut", "RecType");
 	const char *adv_path = strcmp(type, "Standard")
 				       ? config_get_string(activeConfiguration, "AdvOut", "FFFilePath")
 				       : config_get_string(activeConfiguration, "AdvOut", "RecFilePath");
-	const char *path = strcmp(mode, "Advanced") ? config_get_string(activeConfiguration, "SimpleOutput", "FilePath")
-						    : adv_path;
-	QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+	QDesktopServices::openUrl(QUrl::fromLocalFile(adv_path));
 }
 
 #define RECORDING_START "==== Recording Start ==============================================="
@@ -53,23 +50,9 @@ void OBSBasic::AutoRemux(QString input, bool no_show)
 	if (!autoRemux)
 		return;
 
-	bool isSimpleMode = false;
-
-	const char *mode = config_get_string(config, "Output", "Mode");
-	if (!mode) {
-		isSimpleMode = true;
-	} else {
-		isSimpleMode = strcmp(mode, "Simple") == 0;
-	}
-
-	if (!isSimpleMode) {
-		const char *recType = config_get_string(config, "AdvOut", "RecType");
-
-		bool ffmpegOutput = astrcmpi(recType, "FFmpeg") == 0;
-
-		if (ffmpegOutput)
-			return;
-	}
+	const char *recType = config_get_string(config, "AdvOut", "RecType");
+	if (astrcmpi(recType, "FFmpeg") == 0)
+		return;
 
 	if (input.isEmpty())
 		return;
@@ -89,7 +72,7 @@ void OBSBasic::AutoRemux(QString input, bool no_show)
 
 	const obs_encoder_t *videoEncoder = obs_output_get_video_encoder(outputHandler->fileOutput);
 	const char *vCodecName = obs_encoder_get_codec(videoEncoder);
-	const char *format = config_get_string(config, isSimpleMode ? "SimpleOutput" : "AdvOut", "RecFormat2");
+	const char *format = config_get_string(config, "AdvOut", "RecFormat2");
 
 	/* Retain original container for fMP4/fMOV */
 	if (strncmp(format, "fragmented", 10) == 0) {
@@ -349,22 +332,14 @@ void OBSBasic::RecordPauseToggled()
 
 void OBSBasic::UpdateIsRecordingPausable()
 {
-	const char *mode = config_get_string(activeConfiguration, "Output", "Mode");
-	bool adv = astrcmpi(mode, "Advanced") == 0;
+	const char *recType = config_get_string(activeConfiguration, "AdvOut", "RecType");
 	bool shared = true;
 
-	if (adv) {
-		const char *recType = config_get_string(activeConfiguration, "AdvOut", "RecType");
-
-		if (astrcmpi(recType, "FFmpeg") == 0) {
-			shared = config_get_bool(activeConfiguration, "AdvOut", "FFOutputToFile");
-		} else {
-			const char *recordEncoder = config_get_string(activeConfiguration, "AdvOut", "RecEncoder");
-			shared = astrcmpi(recordEncoder, "none") == 0;
-		}
+	if (astrcmpi(recType, "FFmpeg") == 0) {
+		shared = config_get_bool(activeConfiguration, "AdvOut", "FFOutputToFile");
 	} else {
-		const char *quality = config_get_string(activeConfiguration, "SimpleOutput", "RecQuality");
-		shared = strcmp(quality, "Stream") == 0;
+		const char *recordEncoder = config_get_string(activeConfiguration, "AdvOut", "RecEncoder");
+		shared = astrcmpi(recordEncoder, "none") == 0;
 	}
 
 	isRecordingPausable = !shared;

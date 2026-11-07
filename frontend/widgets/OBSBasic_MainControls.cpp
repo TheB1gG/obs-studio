@@ -169,9 +169,7 @@ void OBSBasic::on_actionRemux_triggered()
 		return;
 	}
 
-	const char *mode = config_get_string(activeConfiguration, "Output", "Mode");
-	const char *path = strcmp(mode, "Advanced") ? config_get_string(activeConfiguration, "SimpleOutput", "FilePath")
-						    : config_get_string(activeConfiguration, "AdvOut", "RecFilePath");
+	const char *path = GetCurrentOutputPath();
 
 	OBSRemux *remuxDlg;
 	remuxDlg = new OBSRemux(path, this);

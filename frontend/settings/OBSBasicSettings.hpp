@@ -85,7 +85,6 @@ private:
 	bool llBufferingEnabled = false;
 	bool hotkeysLoaded = false;
 
-	int lastSimpleRecQualityIdx = 0;
 	int lastServiceIdx = -1;
 	int lastIgnoreRecommended = -1;
 	int lastChannelSetupIdx = 0;
@@ -117,7 +116,6 @@ private:
 	StreamingDestinations destinationEdits;
 
 	QPointer<QLabel> advOutRecWarning;
-	QPointer<QLabel> simpleOutRecWarning;
 
 	QString curPreset;
 	QString curQSVPreset;
@@ -141,8 +139,6 @@ private:
 
 	uint32_t outputCX = 0;
 	uint32_t outputCY = 0;
-
-	QPointer<QCheckBox> simpleVodTrack;
 
 	QPointer<QCheckBox> vodTrackCheckbox;
 	QPointer<QWidget> vodTrackContainer;
@@ -284,7 +280,6 @@ private slots:
 
 private:
 	/* output */
-	void LoadSimpleOutputSettings();
 	void LoadAdvOutputStreamingSettings();
 	void LoadAdvOutputStreamingEncoderProperties();
 	void LoadAdvOutputRecordingSettings();
@@ -337,10 +332,8 @@ private:
 
 	void SearchHotkeys(const QString &text, obs_key_combination_t filterCombo);
 
-	void UpdateSimpleOutStreamDelayEstimate();
 	void UpdateAdvOutStreamDelayEstimate();
 
-	void FillSimpleRecordingValues();
 	void FillAudioMonitoringDevices();
 
 	void RecalcOutputResPixels(const char *resText);
@@ -370,7 +363,6 @@ private:
 	QIcon GetAdvancedIcon() const;
 
 	int CurrentFLVTrack();
-	int SimpleOutGetSelectedAudioTracks();
 	int AdvOutGetSelectedAudioTracks();
 	int AdvOutGetStreamingSelectedAudioTracks();
 
@@ -393,7 +385,6 @@ private slots:
 
 	void on_service_currentIndexChanged(int idx);
 	void on_customServer_textChanged(const QString &text);
-	void on_simpleOutputBrowse_clicked();
 	void on_advOutRecPathBrowse_clicked();
 	void on_advOutFFPathBrowse_clicked();
 	void on_advOutEncoder_currentIndexChanged();
@@ -455,14 +446,9 @@ private slots:
 	void AdvOutRecCheckWarnings();
 	void AdvOutRecCheckCodecs();
 
-	void SimpleRecordingQualityChanged();
-	void SimpleRecordingEncoderChanged();
-	void SimpleRecordingQualityLosslessWarning(int idx);
 
-	void SimpleReplayBufferChanged();
 	void AdvReplayBufferChanged();
 
-	void SimpleStreamingEncoderChanged();
 
 	OBSService SpawnTempService();
 
@@ -478,11 +464,8 @@ private slots:
 
 	void UseStreamKeyAdvClicked();
 
-	void SimpleStreamAudioEncoderChanged();
 	void AdvAudioEncodersChanged();
 
-	void SimpleAudioBitrateModeChanged(bool vbr);
-	void UpdateSimpleAudioBitrateModeUI();
 	void AdvTrackBitrateModeChanged(bool vbr);
 	void UpdateAdvTrackBitrateModeUI();
 
