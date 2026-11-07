@@ -6,14 +6,11 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFormLayout>
-#include <QGridLayout>
+#include <QFrame>
 #include <QGraphicsOpacityEffect>
-#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
-#include <QListWidget>
-#include <QListWidgetItem>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
@@ -23,28 +20,152 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
-#include <functional>
+#include <string>
+#include <vector>
 
 namespace {
 
-/* The destinations are shown as one block per destination inside a QListWidget, because that gives
- * drag-to-reorder (InternalMove) for free: the item carries the destination id in Qt::UserRole, so the
- * visual order can be written back to the model after a drop. The up/down buttons do the same thing
- * without a mouse, which QListWidget dragging cannot offer. */
-class DestinationListWidget : public QListWidget {
+/* A one-line label that survives a narrow dialog. The summary lines carry everything a closed block knows,
+ * and they are longer than the settings dialog can be made: left alone, the label's size hint becomes the
+ * minimum width of the row, which pushes the whole Output tab past its own viewport - the tab grows a
+ * horizontal scrollbar and the text is cut mid-glyph anyway. This one takes the width it is handed and
+ * elides the tail, and keeps the whole line in its tooltip so nothing is lost.
+ *
+ * The size policy is the part that is easy to get wrong: a QLabel in a box layout keeps its size hint as a
+ * minimum unless the policy tells the layout otherwise, and setTextInteractionFlags() replaces the policy -
+ * so both are set here, and callers that set interaction flags afterwards must set the policy again. */
+class ElidedLabel : public QLabel {
 public:
-	using QListWidget::QListWidget;
+	explicit ElidedLabel(const QString &text = QString(), QWidget *parent = nullptr) : QLabel(parent)
+	{
+		/* Ignored: the layout decides the width, the label's own hint does not get a vote. Paired with a
+		 * stretch factor at the call site, that is the "take what is left" line the mock draws. */
+		setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+		setMinimumWidth(0);
+		setFullText(text);
+	}
 
-	std::function<void()> reordered;
+	void setFullText(const QString &text)
+	{
+		full_ = text;
+		/* The tooltip is the un-elided line by the definition of this class, so it has to follow the text
+		 * every time: a section header line is re-stated whenever the user changes what it describes
+		 * (toggling the reconnect override does exactly that), and a tooltip that was only set once would
+		 * then go on describing the old value. */
+		setToolTip(full_);
+		/* Start from the whole line; resizeEvent elides it once the layout has handed over a width. */
+		QLabel::setText(full_);
+	}
+
+	/* Where the dots go when the line does not fit. The destination line ends with the bitrate, which is the
+	 * one number worth comparing between destinations, so that line elides in the middle instead. */
+	void setElideMode(Qt::TextElideMode mode)
+	{
+		elide_ = mode;
+		relabel();
+	}
 
 protected:
-	void dropEvent(QDropEvent *event) override
+	void resizeEvent(QResizeEvent *event) override
 	{
-		QListWidget::dropEvent(event);
-		if (reordered)
-			reordered();
+		QLabel::resizeEvent(event);
+		relabel();
 	}
+
+private:
+	void relabel()
+	{
+		/* setText() invalidates the layout, which can come straight back around to resizeEvent. */
+		if (relabelling_)
+			return;
+		relabelling_ = true;
+		const int available = qMax(0, width());
+		const QString shown = fontMetrics().horizontalAdvance(full_) <= available
+					      ? full_
+					      : fontMetrics().elidedText(full_, elide_, available);
+		if (shown != QLabel::text())
+			QLabel::setText(shown);
+		relabelling_ = false;
+	}
+
+	QString full_;
+	Qt::TextElideMode elide_ = Qt::ElideRight;
+	bool relabelling_ = false;
 };
+
+/* A titled, collapsible part of a destination block - the shape the mock uses for its sections. The header line
+ * carries a one-liner summarising what is inside, so a collapsed block still answers the question the section
+ * is about, which is what makes the whole list scannable. */
+class DestinationSection : public QWidget {
+public:
+	explicit DestinationSection(const QString &title, QWidget *parent = nullptr) : QWidget(parent)
+	{
+		auto layout = new QVBoxLayout(this);
+		layout->setContentsMargins(0, 0, 0, 0);
+		layout->setSpacing(3);
+
+		auto header = new QHBoxLayout;
+		header->setContentsMargins(0, 0, 0, 0);
+
+		toggle_ = new QToolButton(this);
+		toggle_->setObjectName("destinationSectionToggle");
+		toggle_->setCheckable(true);
+		toggle_->setChecked(true);
+		toggle_->setAutoRaise(true);
+		toggle_->setArrowType(Qt::DownArrow);
+
+		auto label = new QLabel(title, this);
+		QFont bold = label->font();
+		bold.setBold(true);
+		label->setFont(bold);
+
+		summary_ = new ElidedLabel(QString(), this);
+		summary_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+		summary_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+
+		header->addWidget(toggle_);
+		header->addWidget(label);
+		header->addWidget(summary_, 1);
+		layout->addLayout(header);
+
+		body_ = new QWidget(this);
+		bodyLayout_ = new QVBoxLayout(body_);
+		bodyLayout_->setContentsMargins(SECTION_INDENT, 0, 0, 0);
+		bodyLayout_->setSpacing(4);
+		layout->addWidget(body_);
+
+		connect(toggle_, &QToolButton::toggled, body_, &QWidget::setVisible);
+		connect(toggle_, &QToolButton::toggled, this,
+			[this](bool open) { toggle_->setArrowType(open ? Qt::DownArrow : Qt::RightArrow); });
+	}
+
+	QVBoxLayout *bodyLayout() const { return bodyLayout_; }
+	void setSummary(const QString &text) { summary_->setFullText(text); }
+
+private:
+	/* Lines the body up under the section title instead of under the chevron. */
+	static constexpr int SECTION_INDENT = 24;
+
+	QToolButton *toggle_ = nullptr;
+	ElidedLabel *summary_ = nullptr;
+	QWidget *body_ = nullptr;
+	QVBoxLayout *bodyLayout_ = nullptr;
+};
+
+/* A label that reads as secondary text: smaller rather than coloured, because the themes own the palette and a
+ * hard-coded grey looks wrong in the light ones. Word wrap so a long sentence (the bandwidth breakdown, the
+ * reconnect values) wraps inside the block instead of asking the whole tab for more width than it has. */
+QLabel *SecondaryLabel(const QString &text, QWidget *parent = nullptr)
+{
+	auto label = new QLabel(text, parent);
+	QFont font = label->font();
+	font.setPointSizeF(font.pointSizeF() * 0.9);
+	label->setFont(font);
+	label->setWordWrap(true);
+	label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+	label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+	return label;
+}
 
 /* A disabled destination stays fully interactive (its buttons must still work), so it is dimmed with an
  * opacity effect instead of setEnabled(false). */
@@ -63,41 +184,41 @@ void DimBlockIfNeeded(QWidget *block, bool dim)
 void OBSBasicSettings::SetupDestinationsPage()
 {
 	destinationsPageLayout = ui->destinationsPageLayout;
+	destinationsPageLayout->setContentsMargins(9, 2, 9, 9);
+	destinationsPageLayout->setSpacing(6);
 
-	auto intro = new QLabel(QTStr("Basic.Settings.Stream.Destinations.Desc"));
-	intro->setWordWrap(true);
-	destinationsPageLayout->addWidget(intro);
+	/* The group box title already names this surface, so the paragraph that used to sit under it becomes the
+	 * group's tooltip: the explanation is still there, it just stops eating two lines of the Output tab. */
+	ui->advOutDestinationsGroup->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Desc"));
 
-	destinationsEmptyLabel = new QLabel(QTStr("Basic.Settings.Stream.Destinations.Empty"));
-	destinationsEmptyLabel->setWordWrap(true);
-	destinationsEmptyLabel->setAlignment(Qt::AlignCenter);
-	destinationsPageLayout->addWidget(destinationsEmptyLabel);
-
-	auto list = new DestinationListWidget;
-	list->setFrameShape(QFrame::NoFrame);
-	list->setResizeMode(QListWidget::Adjust);
-	list->setSpacing(6);
-	list->setSelectionMode(QAbstractItemView::SingleSelection);
-	list->setDragDropMode(QAbstractItemView::InternalMove);
-	list->setDefaultDropAction(Qt::MoveAction);
-	list->reordered = [this]() {
-		/* Still inside the view's own move handling here: rebuilding destroys the items the view is
-		 * working with, so it has to wait for the next event-loop turn. */
-		QTimer::singleShot(0, this, [this]() { ApplyDestinationOrder(); });
-	};
-	destinationsList = list;
-	destinationsPageLayout->addWidget(list, 1);
-
+	/* One bar at the top rather than a button at the bottom of a list: what you reach for first is the thing
+	 * that has to be easiest to find, and the running total belongs next to it, not under a scroll. */
 	auto bar = new QHBoxLayout;
 	addDestinationButton = new QPushButton(QTStr("Basic.Settings.Stream.Destinations.Add"));
 	connect(addDestinationButton, &QPushButton::clicked, this, &OBSBasicSettings::AddDestination);
 	bar->addWidget(addDestinationButton);
 	bar->addStretch();
 	destinationsTotalBitrateLabel = new QLabel;
+	destinationsTotalBitrateLabel->setToolTip(QTStr("Basic.Settings.Stream.Destinations.TotalUpload.ToolTip"));
 	bar->addWidget(destinationsTotalBitrateLabel);
 	destinationsPageLayout->addLayout(bar);
 
-	/* While a session is running the page also says what each destination is doing: the state lives in
+	destinationsEmptyLabel = new QLabel(QTStr("Basic.Settings.Stream.Destinations.Empty"));
+	destinationsEmptyLabel->setWordWrap(true);
+	destinationsEmptyLabel->setAlignment(Qt::AlignCenter);
+	destinationsPageLayout->addWidget(destinationsEmptyLabel);
+
+	/* One block per destination, in a container of their own so a rebuild can drop every block without touching
+	 * the bar or the empty label. Deliberately not a QListWidget: the item view brings a second scroll area
+	 * inside the tab's own one, needs a size hint per item to avoid clipping its own widgets, and shows a
+	 * selection highlight on a row that has nothing to select. */
+	destinationsBlocks = new QWidget;
+	destinationsBlocksLayout = new QVBoxLayout(destinationsBlocks);
+	destinationsBlocksLayout->setContentsMargins(0, 0, 0, 0);
+	destinationsBlocksLayout->setSpacing(6);
+	destinationsPageLayout->addWidget(destinationsBlocks);
+
+	/* While a session is running the blocks also say what each destination is doing: the state lives in
 	 * OBSBasic's runtime entries and this page only borrows it, so nothing here can change a session. When no
 	 * session is running the state labels stay empty and the page looks exactly like it always did. */
 	destinationsStateTimer = new QTimer(this);
@@ -111,12 +232,16 @@ void OBSBasicSettings::SetupDestinationsPage()
 
 void OBSBasicSettings::RebuildDestinationBlocks()
 {
-	if (!destinationsList)
+	if (!destinationsBlocksLayout)
 		return;
 
-	destinationsList->clear();
-	/* The labels of the previous blocks are being deleted with them; only the ids that are still listed get
-	 * remembered again below. */
+	/* Drop the blocks of the previous run - the bar and the empty label sit in the layout above this one, so
+	 * they survive. Their state labels go with them and are remembered again below. */
+	while (QLayoutItem *previous = destinationsBlocksLayout->takeAt(0)) {
+		if (QWidget *widget = previous->widget())
+			widget->deleteLater();
+		delete previous;
+	}
 	destinationStateLabels.clear();
 
 	StreamingDestinations &destinations = destinationEdits;
@@ -127,51 +252,78 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		const StreamingDestination &dest = list[index];
 		const std::string id = dest.id;
 
-		auto item = new QListWidgetItem(destinationsList);
-		item->setData(Qt::UserRole, QString::fromStdString(id));
+		/* A page of four fully opened blocks is what made this unreadable, so a block starts open only if
+		 * the user left it open: everything the header line answers (where it goes, what it costs, whether
+		 * it is up) is readable shut. The choice is remembered by id, because any structural change rebuilds
+		 * the blocks and a rebuild must not reopen what somebody just closed. */
+		const auto remembered = destinationBlockOpen.find(id);
+		const bool open = remembered != destinationBlockOpen.end() ? remembered->second : (index == 0);
+		destinationBlockOpen[id] = open;
 
-		auto group = new QGroupBox;
-		auto groupLayout = new QVBoxLayout(group);
+		auto block = new QFrame;
+		block->setObjectName("destinationBlock");
+		/* A thin frame around each destination: without one, the header line of a block and the section header
+		 * of the block above it sit at the same weight and the list reads as one long form. */
+		block->setFrameShape(QFrame::StyledPanel);
+		block->setFrameShadow(QFrame::Plain);
+		auto blockLayout = new QVBoxLayout(block);
+		blockLayout->setContentsMargins(8, 6, 8, 6);
+		blockLayout->setSpacing(4);
 
+		/* The header line is the point of the whole block: with everything closed it has to answer which
+		 * destination this is, where it goes, what it costs and whether it is up - that is what makes a list
+		 * of three or four of them readable at a glance instead of a wall of fields. */
 		auto header = new QHBoxLayout;
+		header->setContentsMargins(0, 0, 0, 0);
+		header->setSpacing(6);
 
-		auto moveUp = new QToolButton;
-		moveUp->setArrowType(Qt::UpArrow);
-		moveUp->setToolTip(QTStr("Basic.Settings.Stream.Destinations.MoveUp"));
-		moveUp->setEnabled(index > 0);
-		connect(moveUp, &QToolButton::clicked, this, [this, id]() { MoveDestination(id, -1); });
+		auto expander = new QToolButton;
+		expander->setObjectName("destinationExpander");
+		expander->setCheckable(true);
+		expander->setChecked(open);
+		expander->setAutoRaise(true);
+		expander->setArrowType(Qt::DownArrow);
+		expander->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Toggle"));
 
-		auto moveDown = new QToolButton;
-		moveDown->setArrowType(Qt::DownArrow);
-		moveDown->setToolTip(QTStr("Basic.Settings.Stream.Destinations.MoveDown"));
-		moveDown->setEnabled(index + 1 < count);
-		connect(moveDown, &QToolButton::clicked, this, [this, id]() { MoveDestination(id, 1); });
+		/* No text on the box: it sits at the head of the line it belongs to, the block dims when it is off and
+		 * the state label says the rest. The words stay in the tooltip and the accessible name. */
+		auto enable = new QCheckBox;
+		enable->setChecked(dest.enabled);
+		enable->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Enable"));
+		enable->setAccessibleName(QTStr("Basic.Settings.Stream.Destinations.Enable"));
+		connect(enable, &QCheckBox::toggled, this, [this, id](bool on) {
+			destinationEdits.setEnabled(id, on);
+			MarkDestinationsChanged();
+		});
 
-		auto toggle = new QToolButton;
-		toggle->setCheckable(true);
-		toggle->setChecked(true);
-		toggle->setArrowType(Qt::DownArrow);
-		toggle->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Toggle"));
-
-		auto title = new QLabel(QString::fromStdString(dest.name));
+		/* Numbered like the mock numbers them: the position in the list is not cosmetic (the first enabled
+		 * destination is what the legacy streaming API reports), so the number belongs where the user can see
+		 * it while reordering. */
+		const QString titleText =
+			QString("%1 \xE2\x80\xA2 %2").arg(index + 1).arg(QString::fromStdString(dest.name));
+		auto title = new ElidedLabel;
+		/* Maximum with a hard cap: a long destination name must not push the rest of the header line out of
+		 * the dialog, so it gets this much at most and the label elides what does not fit. */
+		title->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
+		title->setMaximumWidth(320);
 		QFont titleFont = title->font();
 		titleFont.setBold(true);
 		title->setFont(titleFont);
+		title->setFullText(titleText);
 
-		auto idLabel =
-			new QLabel(QTStr("Basic.Settings.Stream.Destinations.Id").arg(QString::fromStdString(dest.id)));
+		auto summary = new ElidedLabel;
+		/* setTextInteractionFlags() replaces the size policy, so the policy has to come after it - otherwise
+		 * the label keeps its size hint as a minimum and the tab gets a horizontal scrollbar. */
+		summary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+		summary->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+		/* The line is "id • where it goes • what it costs"; the cost is the part worth comparing, so the
+		 * dots go in the middle of the address rather than over the number. */
+		summary->setElideMode(Qt::ElideMiddle);
 
 		/* Filled in by RefreshDestinationStates() while a session runs; stays blank otherwise. */
 		auto state = new QLabel;
 		state->setWordWrap(false);
 		destinationStateLabels[id] = state;
-
-		auto enable = new QCheckBox(QTStr("Basic.Settings.Stream.Destinations.Enable"));
-		enable->setChecked(dest.enabled);
-		connect(enable, &QCheckBox::toggled, this, [this, id](bool on) {
-			destinationEdits.setEnabled(id, on);
-			MarkDestinationsChanged();
-		});
 
 		auto renameButton = new QPushButton(QTStr("Basic.Settings.Stream.Destinations.Rename"));
 		connect(renameButton, &QPushButton::clicked, this, [this, id]() { RenameDestination(id); });
@@ -179,40 +331,68 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		auto removeButton = new QPushButton(QTStr("Basic.Settings.Stream.Destinations.Remove"));
 		connect(removeButton, &QPushButton::clicked, this, [this, id]() { RemoveDestination(id); });
 
-		header->addWidget(moveUp);
-		header->addWidget(moveDown);
-		header->addWidget(toggle);
-		header->addWidget(title);
-		header->addWidget(idLabel);
-		header->addWidget(state);
-		header->addStretch();
+		/* The house icon classes rather than drawn glyphs: the theme already ships a matching up/down pair,
+		 * so these buttons look like every other pair of them in OBS and follow the theme the user chose. */
+		auto moveUp = new QToolButton;
+		moveUp->setObjectName("destinationMoveUp");
+		moveUp->setAutoRaise(true);
+		setClasses(moveUp, "icon-up");
+		moveUp->setToolTip(QTStr("Basic.Settings.Stream.Destinations.MoveUp"));
+		moveUp->setEnabled(index > 0);
+		connect(moveUp, &QToolButton::clicked, this, [this, id]() { MoveDestination(id, -1); });
+
+		auto moveDown = new QToolButton;
+		moveDown->setAutoRaise(true);
+		setClasses(moveDown, "icon-down");
+		moveDown->setToolTip(QTStr("Basic.Settings.Stream.Destinations.MoveDown"));
+		moveDown->setEnabled(index + 1 < count);
+		connect(moveDown, &QToolButton::clicked, this, [this, id]() { MoveDestination(id, 1); });
+
+		header->addWidget(expander);
 		header->addWidget(enable);
+		header->addWidget(title);
+		header->addWidget(summary, 1);
+		header->addWidget(state);
 		header->addWidget(renameButton);
 		header->addWidget(removeButton);
-		groupLayout->addLayout(header);
+		header->addWidget(moveUp);
+		header->addWidget(moveDown);
+		blockLayout->addLayout(header);
 
-		auto body = new QWidget;
-		auto bodyLayout = new QGridLayout(body);
-		bodyLayout->setContentsMargins(0, 0, 0, 0);
+		/* Everything under the header in one widget, so the expander has a single thing to hide. */
+		auto details = new QWidget;
+		auto detailsLayout = new QVBoxLayout(details);
+		detailsLayout->setContentsMargins(0, 0, 0, 0);
+		detailsLayout->setSpacing(6);
+		blockLayout->addWidget(details);
+		details->setVisible(open);
+		expander->setArrowType(open ? Qt::DownArrow : Qt::RightArrow);
 
-		int row = 0;
-		auto addInfo = [&](const QString &label, const QString &value) {
-			bodyLayout->addWidget(new QLabel(label), row, 0);
-			auto *valueLabel = new QLabel(value);
-			valueLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-			bodyLayout->addWidget(valueLabel, row, 1);
-			row++;
-		};
+		connect(expander, &QToolButton::toggled, details, &QWidget::setVisible);
+		connect(expander, &QToolButton::toggled, this, [this, id](bool on) { destinationBlockOpen[id] = on; });
+		connect(expander, &QToolButton::toggled, block,
+			[expander](bool open) { expander->setArrowType(open ? Qt::DownArrow : Qt::RightArrow); });
+
+		/* Where the stream goes, what it costs, and what happens when the link drops: three sub-sections
+		 * with a header line of their own, so a destination that needs nothing is read without opening
+		 * anything, and the one that needs attention opens only the part that matters. They are added to the
+		 * layout in the order their content is built below. */
+		auto serviceSection =
+			new DestinationSection(QTStr("Basic.Settings.Stream.Destinations.Section.Service"));
+		detailsLayout->addWidget(serviceSection);
 
 		const std::string service = destinations.serviceDescription(dest.id);
-		addInfo(QTStr("Basic.Settings.Stream.Destinations.Service"),
-			service.empty() ? QTStr("Basic.Settings.Stream.Destinations.Service.NotConfigured")
-					: QString::fromStdString(service));
+		const QString serviceText = service.empty()
+						    ? QTStr("Basic.Settings.Stream.Destinations.Service.NotConfigured")
+						    : QString::fromStdString(service);
+		/* The endpoint gets a line of its own: the section is called Service already, so repeating the word in
+		 * front of the address only pushes the part worth reading further to the right. */
+		serviceSection->bodyLayout()->addWidget(SecondaryLabel(serviceText));
 
 		const size_t tracks = destinations.trackCount(dest.id);
-		addInfo(QTStr("Basic.Settings.Stream.Destinations.Tracks"),
+		const QString tracksText =
 			tracks == 0 ? QTStr("Basic.Settings.Stream.Destinations.Tracks.None")
-				    : QTStr("Basic.Settings.Stream.Destinations.Tracks.Count").arg(int(tracks)));
+				    : QTStr("Basic.Settings.Stream.Destinations.Tracks.Count").arg(int(tracks));
 
 		/* What this destination will upload on its own. There is no capacity comparison here on
 		 * purpose: the number is information, not a warning. */
@@ -228,18 +408,49 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 			if (bandwidth.shared_video)
 				bandwidthText += QTStr("Basic.Settings.Stream.Destinations.Bitrate.SharedVideo");
 		}
-		addInfo(QTStr("Basic.Settings.Stream.Destinations.Bitrate"), bandwidthText);
+		const QString totalText = bandwidth.videoKbps || bandwidth.audioKbps
+						  ? QString("%1 kbps").arg(bandwidth.videoKbps + bandwidth.audioKbps)
+						  : QString();
 
-		addInfo(QTStr("Basic.Settings.Stream.Destinations.Recording"),
-			QTStr("Basic.Settings.Stream.Destinations.Recording.Session"));
+		/* What it costs, in a section of its own: that number is the one worth comparing between
+		 * destinations, so it also sits in the section header line and stays visible when closed. */
+		auto uploadSection = new DestinationSection(QTStr("Basic.Settings.Stream.Destinations.Bitrate"));
+		detailsLayout->addWidget(uploadSection);
+		auto uploadForm = new QFormLayout;
+		uploadForm->setContentsMargins(0, 0, 0, 0);
+		uploadForm->setHorizontalSpacing(10);
+		uploadForm->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
+		uploadForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+		uploadSection->bodyLayout()->addLayout(uploadForm);
+		uploadForm->addRow(QTStr("Basic.Settings.Stream.Destinations.Tracks"), SecondaryLabel(tracksText));
+		uploadForm->addRow(SecondaryLabel(bandwidthText));
+		uploadForm->addRow(QTStr("Basic.Settings.Stream.Destinations.Recording"),
+				   SecondaryLabel(QTStr("Basic.Settings.Stream.Destinations.Recording.Session")));
 
 		/* Offered, not wired yet: the fetch needs the per-destination service object the engine step
-		 * creates. Keeping the button here makes the intended flow visible. */
+		 * creates. Keeping the button here makes the intended flow visible. It keeps its own width: a
+		 * button stretched across the whole page looks like a disabled text field, which is what it is. */
 		auto fetchButton = new QPushButton(QTStr("Basic.Settings.Stream.Destinations.Fetch"));
 		fetchButton->setEnabled(false);
 		fetchButton->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Fetch.Pending"));
-		bodyLayout->addWidget(fetchButton, row, 0, 1, 2, Qt::AlignLeft);
-		row++;
+		auto fetchRow = new QHBoxLayout;
+		fetchRow->setContentsMargins(0, 0, 0, 0);
+		fetchRow->addWidget(fetchButton);
+		fetchRow->addStretch();
+		serviceSection->bodyLayout()->addLayout(fetchRow);
+
+		/* The block's own line says which destination this is, where it goes and what it costs, so the
+		 * collapsed list can be scanned for the one the user means. */
+		QString headerText = QString::fromStdString(dest.id) + " \xE2\x80\xA2 " + serviceText;
+		if (!totalText.isEmpty())
+			headerText += " \xE2\x80\xA2 " + totalText;
+		summary->setFullText(headerText);
+		uploadSection->setSummary(totalText);
+
+		/* What happens when the link drops. */
+		auto connectionSection =
+			new DestinationSection(QTStr("Basic.Settings.Stream.Destinations.Section.Connection"));
+		detailsLayout->addWidget(connectionSection);
 
 		/* Q14: reconnect values per destination. Only the values can differ - the attempt counter, the
 		 * backoff timer and the thread waiting on it already belong to one output each in libobs, so an
@@ -249,11 +460,25 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		const auto profile_policy = destinations.profileReconnectPolicy();
 		const auto policy = destinations.reconnectPolicy(dest.id);
 
+		/* One sentence for the section header, built from whichever policy is actually in force: the point of
+		 * a header line is that the answer is there without opening the section. */
+		auto policyText = [](const StreamingDestinations::ReconnectPolicy &p) {
+			if (!p.enabled)
+				return p.overridden ? QTStr("Basic.Settings.Stream.Destinations.Reconnect.ValuesOff")
+						    : QTStr("Basic.Settings.Stream.Destinations.Reconnect.DefaultOff");
+			if (p.overridden)
+				return QTStr("Basic.Settings.Stream.Destinations.Reconnect.Values")
+					.arg(p.retryDelaySec)
+					.arg(p.maxRetries);
+			return QTStr("Basic.Settings.Stream.Destinations.Reconnect.Default")
+				.arg(p.retryDelaySec)
+				.arg(p.maxRetries);
+		};
+
 		auto reconnectOverride = new QCheckBox(QTStr("Basic.Settings.Stream.Destinations.Reconnect.Override"));
 		reconnectOverride->setChecked(policy.overridden);
 		reconnectOverride->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Reconnect.ToolTip"));
-		bodyLayout->addWidget(reconnectOverride, row, 0, 1, 2);
-		row++;
+		connectionSection->bodyLayout()->addWidget(reconnectOverride);
 
 		auto reconnectDetail = new QWidget;
 		auto detailLayout = new QHBoxLayout(reconnectDetail);
@@ -279,18 +504,17 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		detailLayout->addWidget(maxRetriesLabel);
 		detailLayout->addWidget(maxRetries);
 		detailLayout->addStretch();
-		bodyLayout->addWidget(reconnectDetail, row, 0, 1, 2);
-		row++;
+		connectionSection->bodyLayout()->addWidget(reconnectDetail);
 
 		/* What the destination uses when it is not overriding anything; hidden the moment the values
 		 * stop being the profile's. */
-		auto reconnectSummary = new QLabel(
+		auto reconnectSummary = SecondaryLabel(
 			profile_policy.enabled ? QTStr("Basic.Settings.Stream.Destinations.Reconnect.Default")
 							 .arg(profile_policy.retryDelaySec)
 							 .arg(profile_policy.maxRetries)
 					       : QTStr("Basic.Settings.Stream.Destinations.Reconnect.DefaultOff"));
-		bodyLayout->addWidget(reconnectSummary, row, 1);
-		row++;
+		connectionSection->bodyLayout()->addWidget(reconnectSummary);
+		connectionSection->setSummary(policyText(policy));
 
 		auto pushReconnect = [this, id, reconnectOverride, reconnectEnable, retryDelay, maxRetries]() {
 			StreamingDestinations::ReconnectPolicy updated;
@@ -306,12 +530,17 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		connect(reconnectOverride, &QCheckBox::toggled, reconnectSummary,
 			[reconnectSummary](bool overridden) { reconnectSummary->setVisible(!overridden); });
 		connect(reconnectOverride, &QCheckBox::toggled, this, pushReconnect);
-		/* The list item keeps a fixed size hint, so a sub-block that appears inside the block has to
-		 * resize its item too or the new rows are clipped. Deferred one event-loop turn so the layout
-		 * has settled by the time the hint is taken. */
-		connect(reconnectOverride, &QCheckBox::toggled, this, [this, item, group](bool) {
-			QTimer::singleShot(0, this, [item, group]() { item->setSizeHint(group->sizeHint()); });
-		});
+		/* Say in the section header what is in force. The blocks sit in a normal layout now, so showing or
+		 * hiding a sub-widget resizes the block by itself - nothing has to restate a size hint. */
+		connect(reconnectOverride, &QCheckBox::toggled, connectionSection,
+			[connectionSection, policyText, reconnectEnable, retryDelay, maxRetries](bool overridden) {
+				StreamingDestinations::ReconnectPolicy shown;
+				shown.overridden = overridden;
+				shown.enabled = reconnectEnable->isChecked();
+				shown.retryDelaySec = retryDelay->value();
+				shown.maxRetries = maxRetries->value();
+				connectionSection->setSummary(policyText(shown));
+			});
 		connect(reconnectEnable, &QCheckBox::toggled, this, pushReconnect);
 		connect(retryDelay, &QSpinBox::valueChanged, this, pushReconnect);
 		connect(maxRetries, &QSpinBox::valueChanged, this, pushReconnect);
@@ -319,16 +548,8 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		reconnectDetail->setVisible(policy.overridden);
 		reconnectSummary->setVisible(!policy.overridden);
 
-		groupLayout->addWidget(body);
-
-		connect(toggle, &QToolButton::toggled, body, &QWidget::setVisible);
-		connect(toggle, &QToolButton::toggled, group,
-			[toggle](bool on) { toggle->setArrowType(on ? Qt::DownArrow : Qt::RightArrow); });
-
-		DimBlockIfNeeded(group, !dest.enabled);
-
-		item->setSizeHint(group->sizeHint());
-		destinationsList->setItemWidget(item, group);
+		DimBlockIfNeeded(block, !dest.enabled);
+		destinationsBlocksLayout->addWidget(block);
 	}
 
 	if (destinationsEmptyLabel)
@@ -344,27 +565,10 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 	}
 }
 
-/* The order of the list is not cosmetic: the first enabled destination is what the legacy streaming API
- * reports (Q42), so both the drag and the buttons have to write it back to the model. */
-void OBSBasicSettings::ApplyDestinationOrder()
-{
-	if (!destinationsList)
-		return;
-
-	std::vector<std::string> order;
-	for (int i = 0; i < destinationsList->count(); i++) {
-		auto item = destinationsList->item(i);
-		if (item)
-			order.push_back(item->data(Qt::UserRole).toString().toStdString());
-	}
-
-	if (order.size() != static_cast<size_t>(destinationsList->count()))
-		return;
-
-	if (destinationEdits.reorder(order))
-		MarkDestinationsChanged();
-}
-
+/* The order of the blocks is not cosmetic: the first enabled destination is what the legacy streaming API
+ * reports (Q42) and the primary connection of a session is the one whose id the handler records, so the up and
+ * down buttons in the block headers have to write the new order back to the model. Drag-to-reorder used to do
+ * the same job through the item view; the buttons cover it without the view's nested scroll area. */
 void OBSBasicSettings::MoveDestination(const std::string &id, int delta)
 {
 	std::vector<std::string> order;
