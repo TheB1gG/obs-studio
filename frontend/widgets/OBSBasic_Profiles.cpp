@@ -762,10 +762,11 @@ void OBSBasic::LoadStreamingDestinations()
 
 	streamingDestinations.Load(activeConfiguration, profile.path);
 
-	/* Dark launch: the one-time import of the single-service layout only happens in a profile that
-	 * opted in with [General] StreamingDestinationsPage=true, so untouched profiles keep exactly the
-	 * files they have today and nothing new is read at startup. */
-	if (StreamingDestinations::pageEnabled(activeConfiguration) && streamingDestinations.importLegacyLayout())
+	/* The single-service layout is imported into a destination list whenever the profile has none: the
+	 * destination engine is the only streaming path now, so an old or fresh profile has to end up with its
+	 * one service represented as one destination instead of needing an opt-in. importLegacyLayout() only
+	 * acts when the list is empty and a legacy service.json exists, so this is a no-op on every later load. */
+	if (streamingDestinations.importLegacyLayout())
 		activeConfiguration.SaveSafe("tmp");
 
 	RefreshStreamRuntimes();

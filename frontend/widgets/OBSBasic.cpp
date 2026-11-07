@@ -776,6 +776,14 @@ bool OBSBasic::InitBasicConfigDefaults()
 		changed = true;
 	}
 
+	/* Streaming destinations are the default surface now, so the flag that shipped the page dark is dropped
+	 * from profiles that carried it. Nothing reads it any more; leaving it behind would only make the next
+	 * reader look for a switch that does not exist. */
+	if (config_has_user_value(activeConfiguration, "General", "StreamingDestinationsPage")) {
+		config_remove_value(activeConfiguration, "General", "StreamingDestinationsPage");
+		changed = true;
+	}
+
 	/* ----------------------------------------------------- */
 	/* Migrate output scale setting to GPU scaling options.  */
 

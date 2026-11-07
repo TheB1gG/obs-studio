@@ -304,14 +304,11 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 
 	ui->listWidget->setAttribute(Qt::WA_MacShowFocusRect, false);
 
-	/* Multi-destination streaming is dark-launched. The page and its list row always exist in the
-	 * .ui (that keeps the page indices and the themed row icons consistent for every profile), but
-	 * the row stays hidden and the page stays empty unless the profile opts in with
-	 * [General] StreamingDestinationsPage=true. */
-	if (StreamingDestinations::pageEnabled(main->Config()))
-		SetupDestinationsPage();
-	else
-		ui->listWidget->setRowHidden(Pages::DESTINATIONS, true);
+	/* Streaming destinations are the default surface: the page and its list row always exist and are always
+	 * populated. They used to be gated behind [General] StreamingDestinationsPage while the feature shipped
+	 * dark; the flag is gone (profile loads drop it), and a profile without a destination list gets one from
+	 * importLegacyLayout() on load, so this page always has something to show. */
+	SetupDestinationsPage();
 
 	/* clang-format off */
 	HookWidget(ui->language,             COMBO_CHANGED,  GENERAL_CHANGED);
