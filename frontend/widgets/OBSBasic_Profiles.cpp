@@ -546,6 +546,38 @@ void OBSBasic::on_actionRemoveProfile_triggered(bool skipConfirmation)
 	blog(LOG_INFO, "------------------------------------------------");
 }
 
+/* Profiles with more than one streaming destination keep one service file and one video-track file per
+ * destination (service_<id>.json / stream_<id>.json). The ids come from user-chosen names, so profile
+ * import and export have to enumerate the profile directory instead of copying a fixed file list. */
+static std::vector<std::string> destinationFileNames(const std::filesystem::path &profileDir)
+{
+	std::vector<std::string> names;
+
+	std::error_code ec;
+	if (!std::filesystem::is_directory(profileDir, ec))
+		return names;
+
+	try {
+		for (const auto &entry : std::filesystem::directory_iterator(profileDir)) {
+			if (!entry.is_regular_file())
+				continue;
+
+			const std::string fileName = entry.path().filename().u8string();
+			const std::string_view name{fileName};
+			if (name.size() < 5)
+				continue;
+			const std::string_view suffix = name.substr(name.size() - 5);
+			if ((name.substr(0, 8) == "service_" || name.substr(0, 7) == "stream_") && suffix == ".json")
+				names.push_back(fileName);
+		}
+	} catch (const std::filesystem::filesystem_error &error) {
+		blog(LOG_WARNING, "Failed to enumerate the profile directory '%s':\n%s", profileDir.u8string().c_str(),
+		     error.what());
+	}
+
+	return names;
+}
+
 void OBSBasic::on_actionImportProfile_triggered()
 {
 	const QString home = QDir::homePath();
@@ -579,12 +611,14 @@ void OBSBasic::on_actionImportProfile_triggered()
 			return;
 		}
 
-		const std::array<std::pair<std::string, bool>, 4> profileFiles{{
+		std::vector<std::pair<std::string, bool>> profileFiles{
 			{"basic.ini", true},
 			{"service.json", false},
 			{"streamEncoder.json", false},
 			{"recordEncoder.json", false},
-		}};
+		};
+		for (const auto &destinationFile : destinationFileNames(sourcePath))
+			profileFiles.emplace_back(destinationFile, false);
 
 		for (auto &[file, isMandatory] : profileFiles) {
 			const std::filesystem::path sourceFile = sourcePath / std::filesystem::u8path(file);
@@ -622,8 +656,10 @@ void OBSBasic::on_actionExportProfile_triggered()
 
 	const QString destinationDirectory = SelectDirectory(this, QTStr("Basic.MainMenu.Profile.Export"), home);
 
-	const std::array<std::string, 4> profileFiles{"basic.ini", "service.json", "streamEncoder.json",
+	std::vector<std::string> profileFiles{"basic.ini", "service.json", "streamEncoder.json",
 						      "recordEncoder.json"};
+	for (const auto &destinationFile : destinationFileNames(currentProfile.path))
+		profileFiles.push_back(destinationFile);
 
 	if (!destinationDirectory.isEmpty() && !destinationDirectory.isNull()) {
 		const std::filesystem::path sourcePath = currentProfile.path;
@@ -698,6 +734,8 @@ void OBSBasic::ActivateProfile(const OBSProfile &profile, bool reset)
 
 	InitBasicConfigDefaults();
 
+	LoadStreamingDestinations();
+
 	if (reset) {
 		UpdateProfileEncoders();
 		ResetProfileData();
@@ -729,6 +767,19 @@ void OBSBasic::ActivateProfile(const OBSProfile &profile, bool reset)
 			close();
 		}
 	}
+}
+
+void OBSBasic::LoadStreamingDestinations()
+{
+	const OBSProfile &profile = GetCurrentProfile();
+
+	streamingDestinations.Load(activeConfiguration, profile.path);
+
+	/* Dark launch: the one-time import of the single-service layout only happens in a profile that
+	 * opted in with [General] StreamingDestinationsPage=true, so untouched profiles keep exactly the
+	 * files they have today and nothing new is read at startup. */
+	if (StreamingDestinations::pageEnabled(activeConfiguration) && streamingDestinations.importLegacyLayout())
+		activeConfiguration.SaveSafe("tmp");
 }
 
 void OBSBasic::UpdateProfileEncoders()

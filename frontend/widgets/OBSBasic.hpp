@@ -24,6 +24,7 @@
 #include <oauth/Auth.hpp>
 #include <utility/BasicOutputHandler.hpp>
 #include <utility/OBSCanvas.hpp>
+#include <utility/StreamingDestinations.hpp>
 #include <utility/VCamConfig.hpp>
 #include <utility/platform.hpp>
 #include <utility/undo_stack.hpp>
@@ -278,6 +279,10 @@ private:
 	QScopedPointer<QThread> logUploadThread;
 
 	ConfigFile activeConfiguration;
+
+	/* The streaming destinations of the active profile (service + video tracks per destination).
+	 * Reloaded whenever a profile is activated; see LoadStreamingDestinations(). */
+	StreamingDestinations streamingDestinations;
 
 	QScopedPointer<QThread> patronJsonThread;
 	std::string patronJson;
@@ -901,6 +906,8 @@ public:
 	inline const OBSProfileCache &GetProfileCache() const noexcept { return profiles; };
 
 	const OBSProfile &GetCurrentProfile() const;
+	void LoadStreamingDestinations();
+	StreamingDestinations &Destinations() { return streamingDestinations; }
 
 	std::optional<OBSProfile> GetProfileByName(const std::string &profileName) const;
 	std::optional<OBSProfile> GetProfileByDirectoryName(const std::string &directoryName) const;
