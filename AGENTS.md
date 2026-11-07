@@ -61,28 +61,37 @@ Rules:
   has permanent value), no commented-out code, no unrelated formatting changes.
 - Revert cosmetic-only edits to files that are not part of the fix.
 
-## 3. CI gate via test tags (mandatory before pushing program code)
+## 3. CI gate via test tags (start it early, never idle on it)
 
-Before pushing program-code changes to this repository, verify that they build
-on all supported platforms by running CI on a test tag:
+Program-code changes must pass a test-tag build before they go to the branch, but the runners are slow
+(Windows x64 ~20 min, arm64 longer, Ubuntu 30-45 min). Waiting for a runner while doing nothing is wasted
+time - that is explicitly forbidden. The workflow:
 
-1. Commit the changes locally.
-2. Create and push a test tag pointing at that commit:
-   - Tag schema: `test-<problem-or-feature>` - the name of the problem being
-     fixed or the feature being added, **no whitespace** (use hyphens), e.g.
-     `test-qsv-hevc-444-colors`.
+1. Commit locally and verify with the local build plus the local harnesses (`scratch/tmp/*.ps1`).
+2. Push the test tag for that commit immediately - the tag run is what gates the code:
+   - Tag schema: `test-<problem-or-feature>` - the name of the problem being fixed or the feature being
+     added, **no whitespace** (use hyphens), e.g. `test-qsv-hevc-444-colors`.
    - `git tag test-... <commit> && git push origin test-...`
-3. Wait for the "Test Tag" workflow (`.github/workflows/test-tag.yaml`) to
-   finish green. It builds Windows (x64/arm64), macOS (arm64/x86_64) and
-   Ubuntu 26.04 - no Flatpak. The built artifacts are available on the
-   workflow run page (Actions → run → Artifacts) for verification.
-4. Only after the build succeeds, push the branch/commit to the repository.
-5. After the changes have been pushed, delete the test tag again (mandatory -
-   test tags are a temporary CI gate, not part of the release history):
-   `git tag -d test-... && git push origin --delete test-...`
+3. Keep working on the next increment right away. Do not wait for the run.
+4. The gated commit stays **local** until its gate is green. Poll the run between other steps
+   (`scratch/tmp/gate-check.ps1`, `scratch/tmp/gate-wait.ps1`; token comes from the credential manager,
+   see `scratch/plan/CI-NOTES.md`).
+5. When the gate is green: push the branch, delete the tag (mandatory - test tags are a temporary CI gate,
+   not part of the release history), and remove the covered commits from `scratch/plan/CI-PENDING.md`:
+   `git push origin <branch> && git tag -d test-... && git push origin --delete test-...`
+6. Batching: when several commits are queued locally, tag the **newest** one - that build contains all
+   earlier commits, so a single run gates the whole batch, which is then pushed together.
+7. Read the individual jobs of the "Test Tag" workflow (`.github/workflows/test-tag.yaml`), not the run
+   conclusion: Windows x64 and arm64 must be green. macOS runners are offline (cancelled jobs are the
+   expected state - do not edit the workflow). Ubuntu is slow; skipping it needs the user's go-ahead and the
+   CI-PENDING entry must say so. A red Ubuntu job whose **Build** step passed but whose **Package** step died
+   on a network error is an infrastructure flake, not a code failure (see scratch/plan/CI-NOTES.md).
 
-Exception: changes that only touch `.github/workflows` (CI configuration) do not
-change program code and do **not** require the test-tag build gate.
+`scratch/plan/CI-PENDING.md` lists the commits that are committed but not on the branch yet because their
+gate is still running (or went red). Never leave a commit out of it.
+
+Exception: changes that only touch `.github/workflows` (CI configuration) or documentation (`AGENTS.md`) do
+not change program code and do **not** require the test-tag build gate.
 
 ## 4. Launching the local rundir build (Windows, mandatory)
 
@@ -113,7 +122,17 @@ Related facts:
   built/instrumented DLLs only exist in `build_x64/rundir/`.
 - Logs of this fork are written to `%APPDATA%\obs-studio\logs` and named
   `<YYYY-MM-DD HH-MM-SS>.txt` (no `obs` prefix). Crash reports from the OBS
-  crash handler land in the same directory as `crash-<timestamp>.txt`.
+  crash handler do **not** land there: they go to a sibling `crashes` folder as
+  `Crash <YYYY-MM-DD HH-MM-SS>.txt` (portable mode:
+  `build_x64/rundir/RelWithDebInfo/config/obs-studio/crashes/`, see section 6).
+- That report is the fastest way to a Windows crash here: it names the exception
+  code, the faulting module and the **symbolised stack of the crashed thread**,
+  so it beats both the Event Viewer (which often blames a module that was merely
+  loaded last) and reproducing by hand. Read it before guessing.
+- One exception: `0xc0000409` (`__fastfail`, e.g. a CEF/obs-browser abort or a
+  MSVC stack-buffer-overrun check) never reaches the OBS handler, so no report
+  file appears and only Windows Error Reporting knows about it. A genuine
+  access violation (`0xc0000005`) does get a report written.
 
 ## 5. Temporary / scratch files (mandatory)
 
@@ -169,13 +188,16 @@ Portable layout (relative to the repository root, CWD = `bin/64bit`):
 | Profiles | `build_x64/rundir/RelWithDebInfo/config/obs-studio/basic/profiles/<profile>/basic.ini` |
 | Scene collections | `build_x64/rundir/RelWithDebInfo/config/obs-studio/basic/scenes/<collection>.json` |
 | Logs | `build_x64/rundir/RelWithDebInfo/config/obs-studio/logs/<YYYY-MM-DD HH-MM-SS>.txt` |
+| Crash reports | `build_x64/rundir/RelWithDebInfo/config/obs-studio/crashes/Crash <YYYY-MM-DD HH-MM-SS>.txt` |
 
 Gotchas (all hit during the QSV HEVC ABR tests):
 - **CWD must be `bin/64bit`.** From any other CWD, `BASE_PATH` (`../..`) resolves to a
   different folder - portable config lands somewhere unexpected and/or data files are not
   found (see section 4).
-- Advanced output mode is selected with `[Output] Mode=Advanced` in the profile's
-  `basic.ini` (not `Service=Advanced`).
+- There is no simple/advanced output-mode split any more: the advanced handler is
+  always built, `[Output] Mode` is not read and is removed from the profile on
+  load (the `[SimpleOutput]` section is swept at the same time). Older
+  documents/harnesses that set `Mode=Advanced` are harmless but pointless.
 - A media source in a scene JSON uses the key `local_file` (not `input`); use forward
   slashes. Point it at a file that actually exists - a missing file encodes to near-black
   at ~177 kbps and invalidates any bitrate measurement.
