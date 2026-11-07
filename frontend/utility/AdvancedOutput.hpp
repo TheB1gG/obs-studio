@@ -74,6 +74,10 @@ struct AdvancedOutput : BasicOutputHandler {
 	};
 
 	std::vector<std::unique_ptr<ExtraDestinationStream>> extraStreams;
+	/* The service of the first connection of the session, resolved through the destination engine and kept
+	 * here while the session runs: the runtime entry of that destination holds a borrowed pointer to it, just
+	 * like the extra destinations' own wrappers do. */
+	OBSService primaryConnectionService;
 
 	void StartExtraDestinations();
 	void StopExtraDestinations(bool force) override;
@@ -87,4 +91,8 @@ private:
 	/* Build one destination's output on the shared encoders and start it: the fan-out and the restart of a
 	 * single destination need exactly the same thing. */
 	bool StartDestinationOutput(const StreamingDestination &dest);
+	/* The two halves of "what every connection of the session gets", shared with the handler's own primary
+	 * output so the first connection cannot be configured differently from the ones behind it. */
+	void AttachStreamEncoders(obs_output_t *output);
+	void ApplyConnectionSettings(obs_output_t *output, bool dynBitrate);
 };
