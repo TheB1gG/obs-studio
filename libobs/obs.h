@@ -2320,6 +2320,32 @@ EXPORT uint32_t obs_encoder_get_fps_den(const obs_encoder_t *encoder);
 /** For video encoders, returns the number of frames encoded */
 EXPORT uint32_t obs_encoder_get_encoded_frames(const obs_encoder_t *encoder);
 
+/**
+ * Frame and byte counters of one video encoder and of the delivery mix that feeds it
+ * (see obs_encoder_get_frame_counters()).
+ *
+ * mix_frames/mix_lag_skipped are properties of the mix, so they are shared by every encoder
+ * bound to the same mix (encoder-mix reuse). mix_lag_skipped counts only frames a consumer
+ * did not keep up with; deliberate frame-rate-divisor (decimation) skips are per encoder in
+ * frames_decimated.
+ */
+struct obs_encoder_frame_counters {
+	uint64_t mix_frames;
+	uint64_t mix_lag_skipped;
+	uint64_t frames_offered;
+	uint64_t frames_decimated;
+	uint64_t frames_encoded;
+	uint64_t encoded_bytes;
+};
+
+/**
+ * Fills in the counters of a video encoder and the mix feeding it; leaves the struct zeroed
+ * for an invalid handle or an audio encoder. The counters restart when an encoder attaches
+ * to a delivery mix (first consumer there) or is re-bound to a different one (live re-scale,
+ * encoder re-init), so a caller displaying deltas must re-baseline whenever a value drops.
+ */
+EXPORT void obs_encoder_get_frame_counters(const obs_encoder_t *encoder, struct obs_encoder_frame_counters *out);
+
 /** For audio encoders, returns the sample rate of the audio */
 EXPORT uint32_t obs_encoder_get_sample_rate(const obs_encoder_t *encoder);
 

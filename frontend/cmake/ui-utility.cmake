@@ -9,6 +9,7 @@ target_sources(
     utility/BasicOutputHandler.cpp
     utility/BasicOutputHandler.hpp
     utility/display-helpers.hpp
+    utility/EncoderStats.hpp
     utility/FFmpegCodec.cpp
     utility/FFmpegCodec.hpp
     utility/FFmpegFormat.cpp

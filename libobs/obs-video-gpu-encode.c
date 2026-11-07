@@ -84,6 +84,13 @@ static void *gpu_encode_thread(void *data)
 			obs_weak_encoder_t **paired = encoder->paired_encoders.array;
 			size_t num_paired = encoder->paired_encoders.num;
 
+			// The mix drew this texture frame for every encoder bound to it, so count it as offered to
+			// this encoder here - before the gates that hold frames back (group start, paired-audio sync,
+			// pause), which is what the raw path does too: there the connection callback always runs and
+			// the encoder itself decides to drop the frame. The frame-rate-divisor skip below is counted
+			// separately (decimated_frames), never as lag.
+			os_atomic_inc_long(&encoder->offered_frames);
+
 			pkt.timebase_num = encoder->timebase_num * encoder->frame_rate_divisor;
 			pkt.timebase_den = encoder->timebase_den;
 			pkt.encoder = encoder;
@@ -131,8 +138,12 @@ static void *gpu_encode_thread(void *data)
 			skip = encoder->frame_rate_divisor_counter++;
 			if (encoder->frame_rate_divisor_counter == encoder->frame_rate_divisor)
 				encoder->frame_rate_divisor_counter = 0;
-			if (skip)
+			if (skip) {
+				// Deliberate rate reduction, not a stall: kept apart from the mix-level lag
+				// counters (video_output_inc_texture_skipped_frames()).
+				os_atomic_inc_long(&encoder->decimated_frames);
 				continue;
+			}
 
 			if (!encoder->start_ts)
 				encoder->start_ts = timestamp;

@@ -62,6 +62,15 @@ struct video_input {
 	// callback; read here under input_mutex.
 	uint32_t pending_frame_rate_divisor;
 
+	// Per-connection frame counters, read by video_output_get_connection_frames() for the per-rendition stats UI:
+	//  offered_frames   - frames actually handed to this connection's callback
+	//  decimated_frames - frames this connection skipped because of frame_rate_divisor (deliberate, not lag)
+	// Delivery-lag skips are deliberately not counted here: they belong to the mix (skipped_frames in struct
+	// video_output) because this thread serves every connection of a mix in one synchronous pass, so a frame that
+	// never made it into the cache was lost by all consumers of that mix at once.
+	volatile long offered_frames;
+	volatile long decimated_frames;
+
 	void (*callback)(void *param, struct video_data *frame);
 	void *param;
 };
@@ -168,11 +177,15 @@ static inline bool video_output_cur_frame(struct video_output *video)
 		if (input->frame_rate_divisor_counter == input->frame_rate_divisor)
 			input->frame_rate_divisor_counter = 0;
 
-		if (skip)
+		if (skip) {
+			os_atomic_inc_long(&input->decimated_frames);
 			continue;
+		}
 
-		if (scale_video_output(input, &frame))
+		if (scale_video_output(input, &frame)) {
 			input->callback(input->param, &frame);
+			os_atomic_inc_long(&input->offered_frames);
+		}
 	}
 
 	pthread_mutex_unlock(&video->input_mutex);
@@ -681,6 +694,31 @@ uint32_t video_output_get_skipped_frames(const video_t *video)
 uint32_t video_output_get_total_frames(const video_t *video)
 {
 	return (uint32_t)os_atomic_load_long(&get_const_root(video)->total_frames);
+}
+
+bool video_output_get_connection_frames(video_t *video, void (*callback)(void *param, struct video_data *frame),
+					void *param, uint64_t *offered_frames, uint64_t *decimated_frames)
+{
+	if (!video || !callback)
+		return false;
+
+	video = get_root(video);
+
+	pthread_mutex_lock(&video->input_mutex);
+
+	size_t idx = video_get_input_idx(video, callback, param);
+	if (idx != DARRAY_INVALID) {
+		struct video_input *input = video->inputs.array + idx;
+
+		if (offered_frames)
+			*offered_frames = (uint64_t)os_atomic_load_long(&input->offered_frames);
+		if (decimated_frames)
+			*decimated_frames = (uint64_t)os_atomic_load_long(&input->decimated_frames);
+	}
+
+	pthread_mutex_unlock(&video->input_mutex);
+
+	return idx != DARRAY_INVALID;
 }
 
 /* Note: These four functions below are a very slight bit of a hack.  If the

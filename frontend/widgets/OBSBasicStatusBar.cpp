@@ -1,6 +1,8 @@
 #include "OBSBasicStatusBar.hpp"
 #include "ui_StatusBarWidget.h"
 
+#include <utility/EncoderStats.hpp>
+
 #include <widgets/OBSBasic.hpp>
 
 #include "moc_OBSBasicStatusBar.cpp"
@@ -49,20 +51,30 @@ OBSBasicStatusBar::OBSBasicStatusBar(QWidget *parent)
 	clearMessage();
 }
 
+/* The base canvas mix has no consumers of its own in this fork (every encoder
+ * consumes an encoder-only delivery mix), so the "due to encoding lag" counters
+ * have to be summed over the encoders of the running outputs. */
+OBS::EncoderFrameCounters OBSBasicStatusBar::activeEncoderFrameCounters()
+{
+	OBSOutput stream = streamOutput ? OBSGetStrongRef(streamOutput) : OBSOutput();
+	OBSOutput record = recordOutput ? OBSGetStrongRef(recordOutput) : OBSOutput();
+
+	return OBS::outputFrameCounters({stream, record});
+}
+
 void OBSBasicStatusBar::Activate()
 {
 	if (!active) {
 		refreshTimer = new QTimer(this);
 		connect(refreshTimer, &QTimer::timeout, this, &OBSBasicStatusBar::UpdateStatusBar);
 
-		int skipped = video_output_get_skipped_frames(obs_get_video());
-		int total = video_output_get_total_frames(obs_get_video());
+		OBS::EncoderFrameCounters counters = activeEncoderFrameCounters();
 
 		totalStreamSeconds = 0;
 		totalRecordSeconds = 0;
 		lastSkippedFrameCount = 0;
-		startSkippedFrameCount = skipped;
-		startTotalFrameCount = total;
+		startSkippedFrameCount = counters.lagSkipped;
+		startTotalFrameCount = counters.delivered;
 
 		refreshTimer->start(1000);
 		active = true;
@@ -445,20 +457,31 @@ void OBSBasicStatusBar::UpdateStatusBar()
 
 	UpdateDroppedFrames();
 
-	int skipped = video_output_get_skipped_frames(obs_get_video());
-	int total = video_output_get_total_frames(obs_get_video());
+	OBS::EncoderFrameCounters counters = activeEncoderFrameCounters();
+	uint64_t skipped = counters.lagSkipped;
+	uint64_t total = counters.delivered;
+
+	/* An encoder re-init or a delivery-mix rebind resets these counters, so a
+	 * value below the activation baseline means a new window started. */
+	if (skipped < startSkippedFrameCount || total < startTotalFrameCount) {
+		startSkippedFrameCount = skipped;
+		startTotalFrameCount = total;
+		lastSkippedFrameCount = 0;
+	}
 
 	skipped -= startSkippedFrameCount;
 	total -= startTotalFrameCount;
 
-	int diff = skipped - lastSkippedFrameCount;
-	double percentage = double(skipped) / double(total) * 100.0;
+	if (total > 0) {
+		int diff = (int) (skipped - lastSkippedFrameCount);
+		double percentage = double(skipped) / double(total) * 100.0;
 
-	if (diff > 10 && percentage >= 0.1f) {
-		showMessage(QTStr("HighResourceUsage"), 4000);
-		if (!main->isVisible() && overloadedNotify) {
-			main->SysTrayNotify(QTStr("HighResourceUsage"), QSystemTrayIcon::Warning);
-			overloadedNotify = false;
+		if (diff > 10 && percentage >= 0.1f) {
+			showMessage(QTStr("HighResourceUsage"), 4000);
+			if (!main->isVisible() && overloadedNotify) {
+				main->SysTrayNotify(QTStr("HighResourceUsage"), QSystemTrayIcon::Warning);
+				overloadedNotify = false;
+			}
 		}
 	}
 
