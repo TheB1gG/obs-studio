@@ -51,6 +51,30 @@ Rules:
   apply (e.g. no workaround exists).
 - Never omit VERIFICATION - an unverified fix is not done.
 
+### What the PROBLEM section is for - and what it must not record
+
+Judge every change that came out of a red leg or a rework with these four questions, in order:
+
+1. **Is the code, as it now stands, explicable without this history?** -> *level 0*: fold the change into the
+   commit that contained the mistake and keep nothing. A signed/unsigned comparison gcc rejects and MSVC does
+   not, a missing include, a comment worded wrong, a source file without a final newline.
+2. **Does the fact change how the next change must be written?** -> *level 1*: it belongs in AGENTS.md
+   (section 3a), not in the commit. The `-Wnewline-eof` + `CMAKE_COMPILE_WARNING_AS_ERROR` mechanism is this
+   level: MSVC is silent, both macOS legs fail.
+3. **Does the fact explain why the code looks wrong but is not?** -> *level 2*: fold it into the owning commit
+   but keep the ROOT CAUSE, because the receiving commit's message grows to cover what it absorbs. The density
+   control ids are this level: `QButtonGroup` auto-ids start at -2, so Classic is `-2` and a stored `-1`
+   resolves to no button at all - an unexplained `-2` invites someone to "fix" it back.
+4. **Is it OBS's own behaviour - pre-existing, or reachable at runtime by a user or a harness?** -> *level 3*:
+   it is content, not a fixup. Its own commit (the P010 query answering the opposite of its name, the
+   unbound-canvas null dereference because encoder create runs before the mix exists), or a full
+   PROBLEM/ROOT CAUSE inside the feature commit that needed it.
+
+Tie-breaker: if nobody writes it down, does someone later "clean up" the code and break it?
+
+One home per fact: the commit says why the code is the way it is, AGENTS.md says what to do differently next
+time, `scratch/plan/*.md` keeps the narrative and the harness commands. Never the same sentence twice.
+
 ## 2. Working tree hygiene (mandatory)
 
 - **Before trying a different fix or workaround, remove the code of the test
@@ -61,31 +85,65 @@ Rules:
   has permanent value), no commented-out code, no unrelated formatting changes.
 - Revert cosmetic-only edits to files that are not part of the fix.
 
-## 3. CI gate via test tags (start it early, never idle on it)
+## 3. One gate per finished feature: finish, verify locally, shape the commits, tag once
 
-Program-code changes must pass a test-tag build before they go to the branch, but the runners are slow
-(Windows x64 ~20 min, arm64 longer, Ubuntu 30-45 min). Waiting for a runner while doing nothing is wasted
-time - that is explicitly forbidden. The workflow:
+The **feature**, not the commit, is what CI sees and what gets pushed. Tag runs cost ~20 min (Windows x64),
+longer on arm64, 30-45 min on Ubuntu, so letting a runner discover what a local check would have caught costs a
+whole cycle. Waiting for a run while doing nothing is still forbidden - start the next slice right after
+tagging.
 
-1. Commit locally and verify with the local build plus the local harnesses (`scratch/tmp/*.ps1`).
-2. Push the test tag for that commit immediately - the tag run is what gates the code:
-   - Tag schema: `test-<problem-or-feature>` - the name of the problem being fixed or the feature being
-     added, **no whitespace** (use hyphens), e.g. `test-qsv-hevc-444-colors`.
-   - `git tag test-... <commit> && git push origin test-...`
-3. Keep working on the next increment right away. Do not wait for the run.
-4. The gated commit stays **local** until its gate is green. Poll the run between other steps
+1. Finish the whole feature locally, working as if it were one commit.
+2. Pre-tag checklist - all of it, before any tag exists:
+   - `cmake --build build_x64 --config RelWithDebInfo --target obs-studio`
+   - `scratch/tmp/scan-newline.ps1` against the sources the batch touched (Apple clang `-Wnewline-eof`; MSVC
+     never reports it - section 3a)
+   - the gcc-strictness read of the new code: signed/unsigned comparisons, unused members and functions, and
+     STL includes Apple libc++ does not provide transitively
+   - `scratch/tmp/cformat.ps1` on the changed C/C++ files
+   - one portable smoke launch (section 6) with no crash report written
+   - `git grep -e TEMP-SHOT -e OBS_TEST_ -- frontend` empty: no probe survives into a gated batch
+3. Shape the history to its final form **before** the gate (section 7): squash the batch and correct a build
+   slip by amending the commit that contains it, so a mistake never becomes a commit of its own.
+4. Tag the tip once: schema `test-<problem-or-feature>` - the name of the problem being fixed or the feature
+   being added, **no whitespace** (use hyphens), e.g. `test-qsv-hevc-444-colors` - then
+   `git tag test-... <commit> && git push origin test-...`
+5. Keep working on the next slice immediately; poll the run between other steps
    (`scratch/tmp/gate-check.ps1`, `scratch/tmp/gate-wait.ps1`; token comes from the credential manager,
    see `scratch/plan/CI-NOTES.md`).
-5. When the gate is green: push the branch, delete the tag (mandatory - test tags are a temporary CI gate,
-   not part of the release history), and remove the covered commits from `scratch/plan/CI-PENDING.md`:
+6. When every required job is green: push the branch - that push is then a fast-forward, because green work
+   reaches origin exactly once and in final form - delete the tag (mandatory: test tags are a temporary CI
+   gate, not release history), and remove the covered rows from `scratch/plan/CI-PENDING.md`:
    `git push origin <branch> && git tag -d test-... && git push origin --delete test-...`
-6. Batching: when several commits are queued locally, tag the **newest** one - that build contains all
-   earlier commits, so a single run gates the whole batch, which is then pushed together.
-7. Read the individual jobs of the "Test Tag" workflow (`.github/workflows/test-tag.yaml`), not the run
-   conclusion: Windows x64 and arm64 must be green. macOS runners are offline (cancelled jobs are the
-   expected state - do not edit the workflow). Ubuntu is slow; skipping it needs the user's go-ahead and the
-   CI-PENDING entry must say so. A red Ubuntu job whose **Build** step passed but whose **Package** step died
-   on a network error is an infrastructure flake, not a code failure (see scratch/plan/CI-NOTES.md).
+7. A red leg means the feature was **not finished**: fix it by correcting the commit that was wrong (amend, or
+   a fixup folded into it), never a new fixup commit on top. Delete the old tag locally and on origin, tag the
+   new tip, and the branch still never saw the broken state.
+8. Batching: several finished slices may share one tag at the newest tip - that build contains all earlier
+   commits, so a single run gates the whole batch, which is then pushed together. The batch must be final
+   **before** it is tagged: correcting it afterwards means re-tagging, not adding a commit.
+9. Read the individual jobs of the "Test Tag" workflow (`.github/workflows/test-tag.yaml`), not the run
+   conclusion: Windows x64, Windows arm64 **and both macOS targets** must be green. The macOS runners are
+   online again (they built on 2026-11-06), so a macOS failure is a real build failure - never write it off
+   as an offline-runner artefact. Ubuntu is slow; skipping it needs the user's go-ahead and the CI-PENDING
+   entry must say so. A red Ubuntu job whose **Build** step passed but whose **Package** step died on a
+   network error is an infrastructure flake, not a code failure (see scratch/plan/CI-NOTES.md).
+
+## 3a. What the macOS job catches and the Windows jobs do not (check before tagging)
+
+The frontend is compiled with Apple clang on both macOS targets and the build turns warnings into errors:
+`cmake/common/compiler_common.cmake` enables `-Wnewline-eof` (line 50) and sets
+`CMAKE_COMPILE_WARNING_AS_ERROR ON` unless the caller decided otherwise (lines 85-86) - which the CI presets
+force on anyway (`CMAKE_COMPILE_WARNING_AS_ERROR: true` in `CMakePresets.json`). MSVC never reports a missing
+final newline, so a source file written without one passes every Windows job and kills both macOS jobs - that
+is exactly what failed run 42284720040. Before pushing a tag, run `scratch/tmp/scan-newline.ps1` and compare
+its list against the sources the batch touched; `scratch/tmp/fix-newline.ps1` appends what is missing.
+
+A branch push also runs `.github/workflows/check-format.yaml`, which pipes the changed C/C++ files through
+clang-format 22 (Homebrew `clang-format@22`). The local VS LLVM clang-format is the same major (22.1.3) and
+`scratch/tmp/cformat.ps1` runs it as a probe or with `-InPlace`; `scratch/tmp/same-tokens.ps1` then proves
+such a pass moved nothing but whitespace (it hashes the file with all spaces, tabs, CR and LF removed).
+`scratch/tmp/format-scan.ps1 -Base 31.1.2` counts the offenders: 75 of the 174 sources changed since 31.1.2
+would be reformatted, so that job is expected to be red for reasons older than any single batch - a repo-wide
+format pass is the user's call, not an agent's.
 
 `scratch/plan/CI-PENDING.md` lists the commits that are committed but not on the branch yet because their
 gate is still running (or went red). Never leave a commit out of it.
@@ -205,4 +263,54 @@ Gotchas (all hit during the QSV HEVC ABR tests):
   empty sentinel at `build_x64/rundir/RelWithDebInfo/disable_updater`
   (`BASE_PATH/disable_updater`). The `--disable-updater` flag covers a single launch; the
   sentinel covers all launches without the flag.
+
+## 7. History is written once: shape the commits at feature completion, before the gate
+
+Squashing happens when a feature is finished and **before** it is tagged (section 3 step 3), so the runners
+build exactly the history that will be published and a mistake never reaches origin as a commit of its own.
+Rewriting history that is already published is a separate, deliberate act: only with the user's explicit
+go-ahead, and only with the proof chain at the end of this section.
+
+### Shaping a finished feature
+
+- One commit per change that could be shipped on its own, described by one
+  PROBLEM/ROOT CAUSE/FIX/VERIFICATION block (section 1). The default boundary is the slice/stage the plan
+  documents already use.
+- Build slips are corrected inside the commit that contained them (level 0/1 of section 1) - never as a fixup
+  commit, and not mentioned in the message.
+- When a folded change is **above level 1**, the receiving commit's message grows to cover its reasoning: a
+  squash that drops a level-2 ROOT CAUSE has lost information, not just commits.
+- A genuine OBS/libobs defect found along the way stays content of its own (level 3), not a fixup: its
+  PROBLEM section describes behaviour that exists without the feature.
+- Docs/CI-only commits stay separate from program code: the gate exception in section 3 depends on telling
+  them apart, and a squash that mixes them forces a build for a comment.
+- `SUPERSEDED COMMITS` is listed only when a **published** commit is re-shaped and its SHA is quoted
+  somewhere (`scratch/plan/CI-PENDING.md`, crash reports, older plan notes). Folded mistakes are not listed
+  at all.
+
+### Before rewriting published history
+
+- Name the anchor and check whether it is public: `git tag --contains <anchor>` plus
+  `git merge-base --is-ancestor <anchor> origin/31.1.2-features`. If the anchor is a **release tag**
+  (`31.1.2-betaN`) then everything after it is already published, and publishing the result is a
+  `--force-with-lease` push that replaces public SHAs.
+- `git log --reverse --oneline <anchor>..HEAD` into `scratch/plan/SQUASH-PLAN.md`, together with the proposed
+  grouping, **before** any rewrite. Ask the user to approve the grouping.
+- Create both a backup branch and a backup tag at HEAD (`backup/pre-squash-<date>`), and record
+  `git rev-parse HEAD^{tree}`. A rewrite with no backup ref is unrecoverable.
+- Working tree must be clean (section 2): a rewrite may not smuggle working-tree changes in.
+
+### Proof, in this order (a squash that changes content is not a squash)
+
+1. `git rev-parse HEAD^{tree}` after the rewrite **equals** the recorded baseline.
+2. `git range-diff <anchor>..backup/pre-squash-<date> <anchor>..HEAD` read in full - the only allowed
+   differences are reshaping and message text.
+3. A local build of the affected target; cheap, and it catches what a tree comparison cannot (a lost file in a
+   changed set the tree does not notice).
+4. Then re-attach the tags and re-gate: the gate belongs to a commit that no longer exists, so delete the old
+   `test-*` tag locally and on origin, create a fresh one at the new tip, and treat the rewritten tip as
+   **unverified until that run is green** (section 3) - the `--force-with-lease` branch push happens only
+   then. Release tags are never moved; scratch tags whose commits were folded away are deleted.
+5. Fix every SHA quoted in `scratch/plan/*.md` - those files are untracked, cite commits by SHA, and silently
+   rot after a rewrite (`scratch/tmp/sub-text.ps1`).
 
