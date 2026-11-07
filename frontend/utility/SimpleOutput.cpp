@@ -737,6 +737,8 @@ bool SimpleOutput::StartStreaming(obs_service_t *service)
 	bool reconnect = config_get_bool(main->Config(), "Output", "Reconnect");
 	int retryDelay = config_get_uint(main->Config(), "Output", "RetryDelay");
 	int maxRetries = config_get_uint(main->Config(), "Output", "MaxRetries");
+	/* Q14: the destination being streamed may carry its own reconnect values; a no-op when it does not. */
+	main->ApplyDestinationReconnect(reconnect, retryDelay, maxRetries);
 	bool useDelay = config_get_bool(main->Config(), "Output", "DelayEnable");
 	int delaySec = config_get_int(main->Config(), "Output", "DelaySec");
 	bool preserveDelay = config_get_bool(main->Config(), "Output", "DelayPreserve");

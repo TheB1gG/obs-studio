@@ -38,7 +38,9 @@ std::vector<std::string> splitList(const char *value)
 			comma = text.size();
 
 		std::string item = text.substr(pos, comma - pos);
-		const auto not_space = [](unsigned char c) { return std::isspace(c) == 0; };
+		const auto not_space = [](unsigned char c) {
+			return std::isspace(c) == 0;
+		};
 		item.erase(item.begin(), std::find_if(item.begin(), item.end(), not_space));
 		item.erase(std::find_if(item.rbegin(), item.rend(), not_space).base(), item.end());
 		if (!item.empty())
@@ -80,22 +82,22 @@ bool ieq(std::string_view a, std::string_view b)
 	return true;
 }
 
-	/* The bitrate of one video track, from the encoder settings block - the same key the output handler
+/* The bitrate of one video track, from the encoder settings block - the same key the output handler
 	 * reads ("bitrate", see AdvancedOutput.cpp). */
-	long long trackBitrate(obs_data_t *track)
-	{
-		if (!track)
-			return 0;
+long long trackBitrate(obs_data_t *track)
+{
+	if (!track)
+		return 0;
 
-		OBSDataAutoRelease settings = obs_data_get_obj(track, "settings");
-		if (!settings)
-			return 0;
+	OBSDataAutoRelease settings = obs_data_get_obj(track, "settings");
+	if (!settings)
+		return 0;
 
-		const long long value = obs_data_get_int(settings, "bitrate");
-		return value > 0 ? value : 0;
-	}
+	const long long value = obs_data_get_int(settings, "bitrate");
+	return value > 0 ? value : 0;
+}
 
-}  // namespace
+} // namespace
 
 std::string StreamingDestination::serviceFileName() const
 {
@@ -116,7 +118,15 @@ bool StreamingDestinations::pageEnabled(config_t *profile_config)
 {
 	if (!profile_config)
 		return false;
-	return config_get_bool(profile_config, page_flag_section, page_flag_key);
+	if (config_get_bool(profile_config, page_flag_section, page_flag_key))
+		return true;
+
+	/* A profile that already lists destinations has the feature in everything but name - the list only
+	 * exists because the page (or a hand edit) wrote it, and copying a profile carries the list without the
+	 * flag. Hiding the page in that case leaves a profile streaming to several places with no way to see or
+	 * change them, so the stored list counts as opting in. Flip the flag off in the profile to hide it again. */
+	const char *list = config_get_string(profile_config, list_section, list_key);
+	return list && *list;
 }
 
 void StreamingDestinations::Load(config_t *profile_config, const std::filesystem::path &profile_dir)
@@ -148,8 +158,8 @@ void StreamingDestinations::Load(config_t *profile_config, const std::filesystem
 		const char *name = config_get_string(config_, section.c_str(), name_key);
 		dest.name = (name && *name) ? name : id;
 		dest.enabled = config_has_user_value(config_, section.c_str(), enabled_key)
-				   ? config_get_bool(config_, section.c_str(), enabled_key)
-				   : true;
+				       ? config_get_bool(config_, section.c_str(), enabled_key)
+				       : true;
 		dest.inherits_legacy_section = config_has_user_value(config_, section.c_str(), inherits_key);
 
 		destinations_.push_back(std::move(dest));
@@ -189,14 +199,14 @@ bool StreamingDestinations::Save()
 StreamingDestination *StreamingDestinations::find(std::string_view id)
 {
 	auto it = std::find_if(destinations_.begin(), destinations_.end(),
-			     [&](const StreamingDestination &d) { return d.id == id; });
+			       [&](const StreamingDestination &d) { return d.id == id; });
 	return it == destinations_.end() ? nullptr : &*it;
 }
 
 const StreamingDestination *StreamingDestinations::find(std::string_view id) const
 {
 	auto it = std::find_if(destinations_.begin(), destinations_.end(),
-			     [&](const StreamingDestination &d) { return d.id == id; });
+			       [&](const StreamingDestination &d) { return d.id == id; });
 	return it == destinations_.end() ? nullptr : &*it;
 }
 
@@ -243,7 +253,7 @@ std::string StreamingDestinations::makeId(std::string_view base) const
 }
 
 StreamingDestination *StreamingDestinations::create(std::string_view base, const std::string &display_name,
-						   QString *error)
+						    QString *error)
 {
 	StreamingDestination dest;
 	dest.id = makeId(base);
@@ -268,7 +278,7 @@ bool StreamingDestinations::idUsable(std::string_view id) const
 }
 
 StreamingDestination *StreamingDestinations::createWithId(std::string_view requested_id,
-							 const std::string &display_name, QString *error)
+							  const std::string &display_name, QString *error)
 {
 	if (!idUsable(requested_id)) {
 		if (error)
@@ -318,43 +328,166 @@ bool StreamingDestinations::reorder(const std::vector<std::string> &ids)
 	return true;
 }
 
-long long StreamingDestinations::totalVideoBitrateKbps() const
+StreamingDestinations::BitrateBreakdown StreamingDestinations::bitrateFor(std::string_view id) const
 {
-	long long total = 0;
+	BitrateBreakdown info;
+	const StreamingDestination *dest = find(id);
+	if (!dest)
+		return info;
 
-	for (const auto &dest : destinations_) {
-		bool counted = false;
-
-		OBSDataAutoRelease data =
-			obs_data_create_from_json_file_safe(pathOf(dest.tracksFileName()).u8string().c_str(), "bak");
-		if (data) {
-			OBSDataArrayAutoRelease tracks = obs_data_get_array(data, video_tracks_key);
-			if (tracks) {
-				for (size_t i = 0; i < obs_data_array_count(tracks); i++) {
-					OBSDataAutoRelease track = obs_data_array_item(tracks, i);
-					const long long bitrate = trackBitrate(track);
-					if (bitrate > 0) {
-						total += bitrate;
-						counted = true;
-					}
-				}
-			}
-		}
-
-		/* The destination imported from the single-stream layout still gets its video settings from
-		 * the shared advanced-mode encoder file, so its bitrate has to be read there. */
-		if (!counted && dest.inherits_legacy_section) {
-			OBSDataAutoRelease legacy =
-				obs_data_create_from_json_file_safe(pathOf(legacy_encoder_file).u8string().c_str(), "bak");
-			if (legacy) {
-				const long long bitrate = obs_data_get_int(legacy, "bitrate");
+	OBSDataAutoRelease data =
+		obs_data_create_from_json_file_safe(pathOf(dest->tracksFileName()).u8string().c_str(), "bak");
+	if (data) {
+		OBSDataArrayAutoRelease tracks = obs_data_get_array(data, video_tracks_key);
+		if (tracks) {
+			for (size_t i = 0; i < obs_data_array_count(tracks); i++) {
+				OBSDataAutoRelease track = obs_data_array_item(tracks, i);
+				const long long bitrate = trackBitrate(track);
 				if (bitrate > 0)
-					total += bitrate;
+					info.videoKbps += bitrate;
 			}
 		}
 	}
 
+	/* No video tracks of its own: the destination is fed by the shared stream encoder, so its video
+	 * bitrate is the one in the advanced-mode encoder file - whether it came from the single-stream
+	 * import or was added later. A profile still in simple mode keeps the bitrate in [SimpleOutput].
+	 * Both are marked, so the page does not present them as per-destination values. */
+	if (info.videoKbps == 0) {
+		OBSDataAutoRelease legacy =
+			obs_data_create_from_json_file_safe(pathOf(legacy_encoder_file).u8string().c_str(), "bak");
+		if (legacy) {
+			const long long bitrate = obs_data_get_int(legacy, "bitrate");
+			if (bitrate > 0) {
+				info.videoKbps = bitrate;
+				info.shared_video = true;
+			}
+		}
+	}
+	if (info.videoKbps == 0 && !advancedMode()) {
+		info.videoKbps = config_get_int(config_, "SimpleOutput", "VBitrate");
+		info.shared_video = info.videoKbps > 0;
+	}
+
+	info.audioKbps = streamingAudioKbps(id);
+	return info;
+}
+
+long long StreamingDestinations::streamingAudioKbps(std::string_view id) const
+{
+	if (!config_)
+		return 0;
+
+	auto mixBitrate = [this](int mix) -> long long {
+		static const char *names[] = {"Track1Bitrate", "Track2Bitrate", "Track3Bitrate",
+					      "Track4Bitrate", "Track5Bitrate", "Track6Bitrate"};
+		if (mix < 1 || mix > 6)
+			return 0;
+		return config_get_int(config_, "AdvOut", names[mix - 1]);
+	};
+
+	/* Mirrors how the streaming output is wired up in AdvancedOutput::SetupStreaming()
+	 * (AdvancedOutput.cpp:334,347-356,733-743): simple mode streams one stereo mix, advanced mode the
+	 * mixes marked in the [AdvOut] StreamMultiTrackAudioMixes bitmask. A service that cannot take
+	 * multitrack audio gets a single mix instead, which is why this number is what a multitrack-capable
+	 * destination uploads - said out loud in the page's tooltip. */
+	if (!advancedMode())
+		return config_get_int(config_, "SimpleOutput", "ABitrate");
+
+	const unsigned mixes = static_cast<unsigned>(config_get_int(config_, "AdvOut", "StreamMultiTrackAudioMixes"));
+	long long total = 0;
+	if (mixes != 0) {
+		for (int mix = 1; mix <= 6; mix++) {
+			if ((mixes & (1u << (mix - 1))) != 0)
+				total += mixBitrate(mix);
+		}
+	} else {
+		total = mixBitrate(static_cast<int>(config_get_int(config_, "AdvOut", "TrackIndex")));
+	}
+
+	/* A VOD track is a second copy of one mix on the same connection, and only the services that support
+	 * it get one. */
+	if (usesVodTrack(id))
+		total += mixBitrate(static_cast<int>(config_get_int(config_, "AdvOut", "VodTrackIndex")));
+
 	return total;
+}
+
+long long StreamingDestinations::totalUploadKbps() const
+{
+	long long total = 0;
+	for (const auto &dest : destinations_) {
+		if (!dest.enabled)
+			continue;
+		const BitrateBreakdown info = bitrateFor(dest.id);
+		total += info.videoKbps + info.audioKbps;
+	}
+	return total;
+}
+
+std::string StreamingDestinations::serviceType(std::string_view id) const
+{
+	const StreamingDestination *dest = find(id);
+	if (!dest)
+		return std::string();
+
+	OBSDataAutoRelease data =
+		obs_data_create_from_json_file_safe(pathOf(dest->serviceFileName()).u8string().c_str(), "bak");
+	if (!data)
+		return std::string();
+
+	/* Same key and default as OBSBasic::LoadService() uses for the profile's own service file. */
+	obs_data_set_default_string(data, "type", "rtmp_common");
+	return obs_data_get_string(data, "type");
+}
+
+OBSService StreamingDestinations::createService(std::string_view id) const
+{
+	const StreamingDestination *dest = find(id);
+	if (!dest)
+		return OBSService();
+
+	OBSDataAutoRelease data =
+		obs_data_create_from_json_file_safe(pathOf(dest->serviceFileName()).u8string().c_str(), "bak");
+	if (!data) {
+		blog(LOG_WARNING, "streaming destination '%.*s' has no readable service file",
+		     static_cast<int>(id.size()), id.data());
+		return OBSService();
+	}
+
+	obs_data_set_default_string(data, "type", "rtmp_common");
+	const char *type = obs_data_get_string(data, "type");
+
+	OBSDataAutoRelease settings = obs_data_get_obj(data, "settings");
+	OBSDataAutoRelease hotkeys = obs_data_get_obj(data, "hotkeys");
+
+	OBSService service(obs_service_create(type, "stream_destination", settings, hotkeys));
+	if (!service)
+		blog(LOG_WARNING, "streaming destination '%.*s': service type '%s' is not available",
+		     static_cast<int>(id.size()), id.data(), type ? type : "");
+	return service;
+}
+
+bool StreamingDestinations::advancedMode() const
+{
+	const char *mode = config_ ? config_get_string(config_, profile_section, "Mode") : nullptr;
+	return mode && strcmp(mode, "Advanced") == 0;
+}
+
+bool StreamingDestinations::usesVodTrack(std::string_view id) const
+{
+	if (!config_ || !config_get_bool(config_, "AdvOut", "VodTrackEnabled"))
+		return false;
+
+	/* The same service list the output handler checks (ServiceSupportsVodTrack, BasicOutputHandler.hpp);
+	 * duplicated on purpose, because the storage layer must not depend on the output handler. */
+	static const char *vodTrackServices[] = {"Twitch"};
+	const std::string type = serviceType(id);
+	for (const char *service : vodTrackServices) {
+		if (ieq(service, type))
+			return true;
+	}
+	return false;
 }
 
 bool StreamingDestinations::setDisplayName(std::string_view id, const std::string &display_name)
@@ -387,10 +520,11 @@ bool StreamingDestinations::destroy(std::string_view id, QString *error)
 			continue;
 		if (references(other.id, dest->id)) {
 			if (error)
-				*error = QString("Destination '%1' still sends a track shared from '%2'. Give it its own "
-						 "track before removing '%2'.")
-						 .arg(QString::fromStdString(other.name))
-						 .arg(QString::fromStdString(dest->name));
+				*error =
+					QString("Destination '%1' still sends a track shared from '%2'. Give it its own "
+						"track before removing '%2'.")
+						.arg(QString::fromStdString(other.name))
+						.arg(QString::fromStdString(dest->name));
 			return false;
 		}
 	}
@@ -401,7 +535,7 @@ bool StreamingDestinations::destroy(std::string_view id, QString *error)
 	retired_.push_back(dest->id);
 	pending_removals_.push_back(dest->id);
 	destinations_.erase(std::find_if(destinations_.begin(), destinations_.end(),
-					[&](const StreamingDestination &d) { return d.id == dest->id; }));
+					 [&](const StreamingDestination &d) { return d.id == dest->id; }));
 	return true;
 }
 
@@ -413,7 +547,7 @@ bool StreamingDestinations::sameServiceAndKey(const char *service_type, obs_data
 
 	const std::string key = getString(settings, "key");
 	if (key.empty())
-		return false;  /* nothing configured yet, so nothing can collide */
+		return false; /* nothing configured yet, so nothing can collide */
 
 	const std::string provider = getString(settings, "service");
 	const std::string server = getString(settings, "server");
@@ -484,7 +618,7 @@ std::string StreamingDestinations::serviceDescription(std::string_view id) const
 		out += " / " + server;
 
 	if (!getString(settings, "key").empty())
-		out += " (*)";  /* (*) = a stream key is set */
+		out += " (*)"; /* (*) = a stream key is set */
 
 	return out;
 }
@@ -572,6 +706,43 @@ void StreamingDestinations::setConfigInt(std::string_view id, const char *key, l
 	const std::string section = dest->iniSection();
 	config_set_int(config_, section.c_str(), key, value);
 }
+
+StreamingDestinations::ReconnectPolicy StreamingDestinations::reconnectPolicy(std::string_view id) const
+{
+	ReconnectPolicy policy = profileReconnectPolicy();
+
+	policy.overridden = configBool(id, reconnect_override_key, false);
+	if (policy.overridden) {
+		policy.enabled = configBool(id, reconnect_key, policy.enabled);
+		policy.retryDelaySec = configInt(id, retry_delay_key, policy.retryDelaySec);
+		policy.maxRetries = configInt(id, max_retries_key, policy.maxRetries);
+	}
+	return policy;
+}
+
+StreamingDestinations::ReconnectPolicy StreamingDestinations::profileReconnectPolicy() const
+{
+	ReconnectPolicy policy;
+	if (!config_)
+		return policy;
+
+	policy.enabled = config_get_bool(config_, profile_section, reconnect_key);
+	policy.retryDelaySec = config_get_int(config_, profile_section, retry_delay_key);
+	policy.maxRetries = config_get_int(config_, profile_section, max_retries_key);
+	return policy;
+}
+
+void StreamingDestinations::setReconnectPolicy(std::string_view id, const ReconnectPolicy &policy)
+{
+	setConfigBool(id, reconnect_override_key, policy.overridden);
+	if (!policy.overridden)
+		return;
+
+	setConfigBool(id, reconnect_key, policy.enabled);
+	setConfigInt(id, retry_delay_key, policy.retryDelaySec);
+	setConfigInt(id, max_retries_key, policy.maxRetries);
+}
+
 bool StreamingDestinations::importLegacyLayout()
 {
 	if (!config_ || dir_.empty() || !destinations_.empty())
@@ -673,7 +844,8 @@ void StreamingDestinations::writeTracksFile(const StreamingDestination &dest) co
 	obs_data_set_array(data, video_tracks_key, tracks);
 
 	if (!obs_data_save_json_safe(data, path.u8string().c_str(), "tmp", "bak"))
-		blog(LOG_WARNING, "Failed to create the video-track file of streaming destination '%s'", dest.id.c_str());
+		blog(LOG_WARNING, "Failed to create the video-track file of streaming destination '%s'",
+		     dest.id.c_str());
 }
 
 void StreamingDestinations::removeDestinationFiles(const StreamingDestination &dest) const

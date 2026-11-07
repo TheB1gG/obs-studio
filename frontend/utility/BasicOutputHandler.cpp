@@ -62,10 +62,15 @@ void OBSStopStreaming(void *data, calldata_t *params)
 
 	QString arg_last_error = QString::fromUtf8(last_error);
 
-	output->streamingActive = false;
+	/* Q13: this flag is what the frontend API, the websocket and the status bar ask when they want to know
+	 * whether a stream is running, and a stream is the whole session - so it goes down with the last
+	 * connection of the session, not with the first one. */
+	const bool othersUp = output->ActiveExtraDestinations() > 0;
+	output->streamingActive = othersUp;
 	output->delayActive = false;
 	output->multitrackVideoActive = false;
-	os_atomic_set_bool(&streaming_active, false);
+	if (!othersUp)
+		os_atomic_set_bool(&streaming_active, false);
 	QMetaObject::invokeMethod(output->main, "StreamingStop", Q_ARG(int, code), Q_ARG(QString, arg_last_error));
 }
 

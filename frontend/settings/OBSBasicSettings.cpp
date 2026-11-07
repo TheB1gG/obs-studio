@@ -875,10 +875,6 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 
 	PopulateOutputFpsDropdowns(GetBaseFpsFromConfig());
 
-
-
-
-
 	ui->advOutTrack1->setAccessibleName(QTStr("Basic.Settings.Output.Adv.Audio.Track1"));
 	ui->advOutTrack2->setAccessibleName(QTStr("Basic.Settings.Output.Adv.Audio.Track2"));
 	ui->advOutTrack3->setAccessibleName(QTStr("Basic.Settings.Output.Adv.Audio.Track3"));

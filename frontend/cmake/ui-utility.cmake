@@ -64,6 +64,8 @@ target_sources(
     utility/StartMultiTrackVideoStreamingGuard.hpp
     utility/StreamingDestinations.cpp
     utility/StreamingDestinations.hpp
+    utility/StreamDestinationRuntime.cpp
+    utility/StreamDestinationRuntime.hpp
     utility/SurfaceEventFilter.hpp
     utility/system-info.hpp
     utility/undo_stack.cpp

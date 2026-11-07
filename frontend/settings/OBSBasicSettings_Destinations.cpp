@@ -58,7 +58,7 @@ void DimBlockIfNeeded(QWidget *block, bool dim)
 	block->setGraphicsEffect(effect);
 }
 
-}  // namespace
+} // namespace
 
 void OBSBasicSettings::SetupDestinationsPage()
 {
@@ -147,8 +147,8 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		titleFont.setBold(true);
 		title->setFont(titleFont);
 
-		auto idLabel = new QLabel(
-			QTStr("Basic.Settings.Stream.Destinations.Id").arg(QString::fromStdString(dest.id)));
+		auto idLabel =
+			new QLabel(QTStr("Basic.Settings.Stream.Destinations.Id").arg(QString::fromStdString(dest.id)));
 
 		auto enable = new QCheckBox(QTStr("Basic.Settings.Stream.Destinations.Enable"));
 		enable->setChecked(dest.enabled);
@@ -197,6 +197,22 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 			tracks == 0 ? QTStr("Basic.Settings.Stream.Destinations.Tracks.None")
 				    : QTStr("Basic.Settings.Stream.Destinations.Tracks.Count").arg(int(tracks)));
 
+		/* What this destination will upload on its own. There is no capacity comparison here on
+		 * purpose: the number is information, not a warning. */
+		const auto bandwidth = destinations.bitrateFor(dest.id);
+		QString bandwidthText;
+		if (bandwidth.videoKbps == 0 && bandwidth.audioKbps == 0) {
+			bandwidthText = QTStr("Basic.Settings.Stream.Destinations.Bitrate.None");
+		} else {
+			bandwidthText = QTStr("Basic.Settings.Stream.Destinations.Bitrate.Value")
+						.arg(bandwidth.videoKbps)
+						.arg(bandwidth.audioKbps)
+						.arg(bandwidth.videoKbps + bandwidth.audioKbps);
+			if (bandwidth.shared_video)
+				bandwidthText += QTStr("Basic.Settings.Stream.Destinations.Bitrate.SharedVideo");
+		}
+		addInfo(QTStr("Basic.Settings.Stream.Destinations.Bitrate"), bandwidthText);
+
 		addInfo(QTStr("Basic.Settings.Stream.Destinations.Recording"),
 			QTStr("Basic.Settings.Stream.Destinations.Recording.Session"));
 
@@ -206,6 +222,85 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		fetchButton->setEnabled(false);
 		fetchButton->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Fetch.Pending"));
 		bodyLayout->addWidget(fetchButton, row, 0, 1, 2, Qt::AlignLeft);
+		row++;
+
+		/* Q14: reconnect values per destination. Only the values can differ - the attempt counter, the
+		 * backoff timer and the thread waiting on it already belong to one output each in libobs, so an
+		 * override here can never spend another destination's retries. With the override off the
+		 * destination follows the profile-wide values from the hidden Advanced settings, which is what
+		 * every destination does today. */
+		const auto profile_policy = destinations.profileReconnectPolicy();
+		const auto policy = destinations.reconnectPolicy(dest.id);
+
+		auto reconnectOverride = new QCheckBox(QTStr("Basic.Settings.Stream.Destinations.Reconnect.Override"));
+		reconnectOverride->setChecked(policy.overridden);
+		reconnectOverride->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Reconnect.ToolTip"));
+		bodyLayout->addWidget(reconnectOverride, row, 0, 1, 2);
+		row++;
+
+		auto reconnectDetail = new QWidget;
+		auto detailLayout = new QHBoxLayout(reconnectDetail);
+		detailLayout->setContentsMargins(0, 0, 0, 0);
+
+		auto reconnectEnable = new QCheckBox(QTStr("Basic.Settings.Stream.Destinations.Reconnect.Enable"));
+		reconnectEnable->setChecked(policy.enabled);
+
+		auto retryDelayLabel = new QLabel(QTStr("Basic.Settings.Output.RetryDelay"));
+		auto retryDelay = new QSpinBox;
+		retryDelay->setRange(1, 30);
+		retryDelay->setSuffix(" s");
+		retryDelay->setValue(static_cast<int>(policy.retryDelaySec));
+
+		auto maxRetriesLabel = new QLabel(QTStr("Basic.Settings.Output.MaxRetries"));
+		auto maxRetries = new QSpinBox;
+		maxRetries->setRange(1, 10000);
+		maxRetries->setValue(static_cast<int>(policy.maxRetries));
+
+		detailLayout->addWidget(reconnectEnable);
+		detailLayout->addWidget(retryDelayLabel);
+		detailLayout->addWidget(retryDelay);
+		detailLayout->addWidget(maxRetriesLabel);
+		detailLayout->addWidget(maxRetries);
+		detailLayout->addStretch();
+		bodyLayout->addWidget(reconnectDetail, row, 0, 1, 2);
+		row++;
+
+		/* What the destination uses when it is not overriding anything; hidden the moment the values
+		 * stop being the profile's. */
+		auto reconnectSummary = new QLabel(
+			profile_policy.enabled ? QTStr("Basic.Settings.Stream.Destinations.Reconnect.Default")
+							 .arg(profile_policy.retryDelaySec)
+							 .arg(profile_policy.maxRetries)
+					       : QTStr("Basic.Settings.Stream.Destinations.Reconnect.DefaultOff"));
+		bodyLayout->addWidget(reconnectSummary, row, 1);
+		row++;
+
+		auto pushReconnect = [this, id, reconnectOverride, reconnectEnable, retryDelay, maxRetries]() {
+			StreamingDestinations::ReconnectPolicy updated;
+			updated.overridden = reconnectOverride->isChecked();
+			updated.enabled = reconnectEnable->isChecked();
+			updated.retryDelaySec = retryDelay->value();
+			updated.maxRetries = maxRetries->value();
+			destinationEdits.setReconnectPolicy(id, updated);
+			MarkDestinationsChanged();
+		};
+
+		connect(reconnectOverride, &QCheckBox::toggled, reconnectDetail, &QWidget::setVisible);
+		connect(reconnectOverride, &QCheckBox::toggled, reconnectSummary,
+			[reconnectSummary](bool overridden) { reconnectSummary->setVisible(!overridden); });
+		connect(reconnectOverride, &QCheckBox::toggled, this, pushReconnect);
+		/* The list item keeps a fixed size hint, so a sub-block that appears inside the block has to
+		 * resize its item too or the new rows are clipped. Deferred one event-loop turn so the layout
+		 * has settled by the time the hint is taken. */
+		connect(reconnectOverride, &QCheckBox::toggled, this, [this, item, group](bool) {
+			QTimer::singleShot(0, this, [item, group]() { item->setSizeHint(group->sizeHint()); });
+		});
+		connect(reconnectEnable, &QCheckBox::toggled, this, pushReconnect);
+		connect(retryDelay, &QSpinBox::valueChanged, this, pushReconnect);
+		connect(maxRetries, &QSpinBox::valueChanged, this, pushReconnect);
+
+		reconnectDetail->setVisible(policy.overridden);
+		reconnectSummary->setVisible(!policy.overridden);
 
 		groupLayout->addWidget(body);
 
@@ -223,10 +318,12 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		destinationsEmptyLabel->setVisible(list.empty());
 
 	if (destinationsTotalBitrateLabel) {
-		const long long total = destinations.totalVideoBitrateKbps();
+		const long long total = destinations.totalUploadKbps();
 		destinationsTotalBitrateLabel->setText(
-			total > 0 ? QTStr("Basic.Settings.Stream.Destinations.TotalBitrate").arg(total)
-				: QTStr("Basic.Settings.Stream.Destinations.TotalBitrate.None"));
+			total > 0 ? QTStr("Basic.Settings.Stream.Destinations.TotalUpload").arg(total)
+				  : QTStr("Basic.Settings.Stream.Destinations.TotalUpload.None"));
+		destinationsTotalBitrateLabel->setToolTip(
+			QTStr("Basic.Settings.Stream.Destinations.TotalUpload.ToolTip"));
 	}
 }
 
@@ -302,6 +399,9 @@ void OBSBasicSettings::SaveDestinationsSettings()
 	 * the rest of the application looking at the previous list. The changed flag itself is cleared by
 	 * ClearChanged() in the caller, like every other page. */
 	main->Destinations() = destinationEdits;
+
+	/* Keep the runtime mirror (slice 2a) in step with the list that was just committed. */
+	main->RefreshStreamRuntimes();
 }
 
 /* Name plus id in one dialog. The id is editable when adding (it is what the user will see in file names
@@ -321,7 +421,7 @@ bool OBSBasicSettings::AskDestinationNameAndId(QString &name, QString &id, bool 
 	idEdit->setValidator(new QRegularExpressionValidator(QRegularExpression("[a-z0-9_-]*"), &dialog));
 
 	auto hint = new QLabel(QTStr(idEditable ? "Basic.Settings.Stream.Destinations.Id.Help"
-					       : "Basic.Settings.Stream.Destinations.Id.Fixed"),
+						: "Basic.Settings.Stream.Destinations.Id.Fixed"),
 			       &dialog);
 	hint->setWordWrap(true);
 
@@ -423,4 +523,3 @@ void OBSBasicSettings::RemoveDestination(const std::string &id)
 	blog(LOG_INFO, "Removed streaming destination '%s'", QT_TO_UTF8(name));
 	MarkDestinationsChanged();
 }
-

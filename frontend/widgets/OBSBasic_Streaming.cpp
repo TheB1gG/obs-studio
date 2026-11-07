@@ -46,6 +46,78 @@ void OBSBasic::DisplayStreamStartError()
 	QMessageBox::critical(this, QTStr("Output.StartStreamFailed"), message);
 }
 
+/* Q14: a destination may use its own reconnect values instead of the profile-wide ones. The session runs a
+ * single stream today, and that stream belongs to the first enabled destination (Q42), so this is the entry
+ * consulted here; the multi-destination loop will call the same resolver once per destination. Without an
+ * override the values are left exactly as they were read from [Output], which is what keeps the behaviour of
+ * a profile with the flag off identical. */
+void OBSBasic::ApplyDestinationReconnect(bool &enabled, int &retryDelaySec, int &maxRetries)
+{
+	StreamDestinationRuntime *runtime = CurrentRuntime();
+	if (!runtime || runtime->id.empty())
+		return;
+
+	const StreamingDestinations::ReconnectPolicy policy = streamingDestinations.reconnectPolicy(runtime->id);
+	if (!policy.overridden)
+		return;
+
+	enabled = policy.enabled;
+	retryDelaySec = static_cast<int>(policy.retryDelaySec);
+	maxRetries = static_cast<int>(policy.maxRetries);
+	blog(LOG_INFO, "streaming destination '%s' overrides reconnect: %s, retry every %d s, %d attempts",
+	     runtime->name.c_str(), enabled ? "enabled" : "disabled", retryDelaySec, maxRetries);
+}
+
+/* Slice 2b: the outputs of the extra destinations report through these. They keep the runtime model and the
+ * log right about how many connections are up; the session-level decision is made by StreamingStop, which the
+ * stop report routes into so that the session comes down with its last connection instead of its first (Q13). */
+void OBSBasic::NoteDestinationStarted(const std::string &id)
+{
+	StreamDestinationRuntime *runtime = RuntimeForId(id);
+	if (!runtime)
+		return;
+
+	runtime->state = StreamDestinationRuntime::State::Live;
+	runtime->reconnectAttempt = 0;
+	blog(LOG_INFO, "streaming destination '%s' is live (%zu of %zu enabled destinations up)", runtime->name.c_str(),
+	     LiveDestinationCount(), EnabledDestinationCount());
+}
+
+void OBSBasic::NoteDestinationStopped(const std::string &id, long long code)
+{
+	StreamDestinationRuntime *runtime = RuntimeForId(id);
+	if (!runtime)
+		return;
+
+	const char *previousState = runtime->stateName();
+	/* A connection the user killed through the skull button is not a failure, and its marker belongs to
+	 * this destination alone: it must not turn another destination's real drop into a silent stop. */
+	const bool killed = runtime->killRequested;
+	runtime->killRequested = false;
+	runtime->state = StreamDestinationRuntime::State::Stopped;
+	runtime->output = nullptr;
+	runtime->service = nullptr;
+	runtime->encoderGroupId.clear();
+	runtime->reconnectAttempt = 0;
+	blog(LOG_INFO, "streaming destination '%s' stopped after %s, code %lld%s (%zu of %zu enabled destinations up)",
+	     runtime->name.c_str(), previousState, code, killed ? " - killed ungracefully" : "", LiveDestinationCount(),
+	     EnabledDestinationCount());
+
+	/* Only a stop that leaves nothing of the session up has to bring the session down. While another
+	 * destination is still attempting or uploading this was a per-destination failure, and StreamingStop
+	 * must not run: it reports the destination of its own signal through CurrentRuntime(), which would
+	 * otherwise pick up that other destination's entry. When this is the last connection every entry is
+	 * already stopped, which is exactly the case its own report skips. */
+	if (outputHandler && (outputHandler->StreamingActive() || RunningDestinationCount() > 0)) {
+		blog(LOG_INFO,
+		     "streaming session continues after destination '%s' went down: %zu of %zu enabled destinations still attempting or uploading",
+		     runtime->name.c_str(), RunningDestinationCount(), EnabledDestinationCount());
+		return;
+	}
+
+	StreamingStop(killed ? OBS_OUTPUT_SUCCESS : static_cast<int>(code), QString());
+}
+
 void OBSBasic::StartStreaming()
 {
 	if (outputHandler->StreamingActive())
@@ -78,6 +150,11 @@ void OBSBasic::StartStreaming()
 		sysTrayStream->setText("Basic.Main.PreparingStream");
 	}
 
+	if (StreamDestinationRuntime *runtime = CurrentRuntime()) {
+		runtime->state = StreamDestinationRuntime::State::Preparing;
+		runtime->reconnectAttempt = 0;
+	}
+
 	auto finish_stream_setup = [&](bool setupStreamingResult) {
 		if (!setupStreamingResult) {
 			DisplayStreamStartError();
@@ -96,6 +173,15 @@ void OBSBasic::StartStreaming()
 		if (!outputHandler->StartStreaming(service)) {
 			DisplayStreamStartError();
 			return;
+		}
+
+		if (StreamDestinationRuntime *runtime = CurrentRuntime()) {
+			runtime->state = StreamDestinationRuntime::State::Connecting;
+			/* The first destination is served by the handler's own output (Q42); its runtime entry keeps
+			 * a reference to it so that the per-destination widgets - and the per-destination stop,
+			 * restart and kill - can reach the connection instead of only the extra ones. */
+			runtime->output = outputHandler->StreamingOutput();
+			runtime->service = service;
 		}
 
 		if (autoStartBroadcast) {
@@ -118,6 +204,18 @@ void OBSBasic::StartStreaming()
 			OBSBasic::ShowYouTubeAutoStartWarning();
 #endif
 	};
+
+	/* The first number to look at when a stream is congested. Logged per destination because where the
+	 * value comes from depends on the profile mode and on whether the destination has its own video
+	 * tracks, and that is not visible from the number alone. */
+	for (const auto &destination : streamingDestinations.destinations()) {
+		if (!destination.enabled)
+			continue;
+		const auto bandwidth = streamingDestinations.bitrateFor(destination.id);
+		blog(LOG_INFO, "streaming destination '%s' will upload %lld kbps (video %lld, audio %lld)",
+		     destination.name.c_str(), bandwidth.videoKbps + bandwidth.audioKbps, bandwidth.videoKbps,
+		     bandwidth.audioKbps);
+	}
 
 	setupStreamingGuard = outputHandler->SetupStreaming(service, finish_stream_setup);
 }
@@ -200,49 +298,156 @@ void OBSBasic::ForceStopStreaming()
 		StopReplayBuffer();
 }
 
+void OBSBasic::KillDestinationUngracefully(std::string id)
+{
+	StreamDestinationRuntime *primary = PrimaryRuntime();
+	StreamDestinationRuntime *runtime = id.empty() ? primary : RuntimeForId(id);
+	if (!runtime) {
+		blog(LOG_WARNING, "KillDestinationUngracefully: no runtime entry for destination '%s'", id.c_str());
+		return;
+	}
+
+	/* An extra destination holds its own output through its runtime entry (slice 2b); the first destination
+	 * is served by the output handler's stream output (Q42). A destination that has no connection of its own
+	 * has no socket to reset. */
+	const bool primaryRuntime = (runtime == primary);
+	if (!runtime->output && !primaryRuntime) {
+		blog(LOG_INFO, "streaming destination '%s' has no connection of its own to kill",
+		     runtime->name.c_str());
+		return;
+	}
+
+	OBSOutputAutoRelease output = runtime->output ? OBSOutputAutoRelease(obs_output_get_ref(runtime->output))
+						      : outputHandler->StreamingOutput();
+	if (!output) {
+		blog(LOG_WARNING, "KillDestinationUngracefully: nothing to abort for destination '%s'",
+		     runtime->name.c_str());
+		return;
+	}
+
+	runtime->killRequested = true;
+	blog(LOG_WARNING, "Killing streaming destination '%s' ungracefully (simulated crash)", runtime->name.c_str());
+
+	// Abruptly kill the RTMP session of this one destination (RST close, no end-of-stream data). Its own
+	// "stop" signal settles the destination, and the session goes down with the last of its connections
+	// (Q13) - nothing session-level happens here.
+	const bool abortable = obs_output_active(output);
+	obs_output_abort_stream(output);
+
+	/* obs_output_abort_stream only reaches an output that is already uploading or mid-reconnect (its
+	 * active() test covers both). A destination stuck in a handshake - the case a kill is most often asked
+	 * for - is neither, so it has to be pulled down the way a stop during connect does it. */
+	if (!abortable) {
+		blog(LOG_INFO, "streaming destination '%s' was still connecting, force-stopping it instead",
+		     runtime->name.c_str());
+		obs_output_force_stop(output);
+	}
+}
+
+/* Per-destination actions for the widgets that show the session (the stats window rows, and later the
+ * hotkeys): one connection stopped on its own, one brought back, and the snapshot both of them render. */
+void OBSBasic::StopDestination(std::string id, bool force)
+{
+	if (!outputHandler)
+		return;
+
+	StreamDestinationRuntime *runtime = id.empty() ? PrimaryRuntime() : RuntimeForId(id);
+	if (!runtime) {
+		blog(LOG_WARNING, "StopDestination: no runtime entry for destination '%s'", id.c_str());
+		return;
+	}
+
+	blog(LOG_INFO, "stopping the connection of streaming destination '%s'%s", runtime->name.c_str(),
+	     force ? " (forced)" : "");
+
+	/* Counting as still running until its own stop signal arrives is what keeps the session alive while the
+	 * other connections are up (Q13) - the transition is reported by the signal, not here. */
+	runtime->state = StreamDestinationRuntime::State::Stopping;
+	outputHandler->StopDestination(runtime->id, force);
+}
+
+bool OBSBasic::RestartDestination(const std::string &id)
+{
+	StreamDestinationRuntime *runtime = id.empty() ? PrimaryRuntime() : RuntimeForId(id);
+	if (!runtime) {
+		blog(LOG_WARNING, "RestartDestination: no runtime entry for destination '%s'", id.c_str());
+		return false;
+	}
+	if (!runtime->enabled) {
+		blog(LOG_INFO, "streaming destination '%s' is disabled, so it does not get a connection back",
+		     runtime->name.c_str());
+		return false;
+	}
+	if (!outputHandler || !outputHandler->StreamingActive()) {
+		/* Nothing of the session is left to attach to: starting again means starting a session, which is
+		 * the normal StartStreaming path with all of its encoder setup. */
+		blog(LOG_INFO, "streaming destination '%s' cannot be restarted on its own: the session has ended",
+		     runtime->name.c_str());
+		return false;
+	}
+
+	return outputHandler->StartDestination(runtime->id);
+}
+
+std::vector<OBSBasic::StreamSessionEntry> OBSBasic::StreamSessionSnapshot() const
+{
+	std::vector<StreamSessionEntry> entries;
+
+	for (const auto &runtime : streamRuntimes) {
+		if (!runtime.enabled || !runtime.isRunning())
+			continue;
+
+		StreamSessionEntry entry;
+		entry.id = runtime.id;
+		entry.name = runtime.name;
+		entry.output = runtime.output;
+		entry.state = runtime.state;
+		entry.reconnectAttempt = runtime.reconnectAttempt;
+		entry.reconnecting = runtime.output ? obs_output_reconnecting(runtime.output) : false;
+		entries.push_back(std::move(entry));
+	}
+
+	return entries;
+}
+
 void OBSBasic::KillStreamingUngracefully()
 {
 	if (!outputHandler->StreamingActive())
 		return;
 
-	blog(LOG_INFO, "Force-killing active stream ungracefully (simulated crash)");
+	blog(LOG_INFO,
+	     "Force-killing the streaming session ungracefully (simulated crash): %zu connection(s) of %zu enabled destinations",
+	     RunningDestinationCount(), EnabledDestinationCount());
 
 	// Make sure automatic restart does not bring the stream back up
 	if (outputHandler->multitrackVideo)
 		outputHandler->multitrackVideo->SetRestartOnError(false);
 
-	OBSOutputAutoRelease output = outputHandler->StreamingOutput();
-	if (!output) {
-		blog(LOG_WARNING, "KillStreamingUngracefully: no active streaming output found");
-		return;
+	/* Killing the session means killing each of its connections separately: every one of them gets its own
+	 * abort and its own OBS_OUTPUT_KILLED marker, so a killed connection is never mistaken for a dropped
+	 * one. The ids are collected first because aborting an output can report its stop right away, which
+	 * moves runtime entries to "stopped" while this loop is still running. */
+	std::vector<std::string> ids;
+	ids.reserve(streamRuntimes.size());
+	for (const auto &runtime : streamRuntimes) {
+		if (runtime.isRunning())
+			ids.push_back(runtime.id);
 	}
 
-	// Abruptly kill the RTMP session (RST close, no end-of-stream data). The UI is
-	// returned to idle by the normal "stop" signal path once teardown completes.
-	streamingKillActive = true;
-	obs_output_abort_stream(output);
+	for (const auto &id : ids)
+		KillDestinationUngracefully(id);
 
-	// Reset broadcast state the same way as a hard stop
-	if (!autoStartBroadcast && !broadcastActive) {
-		broadcastActive = false;
-		autoStartBroadcast = true;
-		autoStopBroadcast = true;
-		broadcastReady = false;
-	}
-
-	if (autoStopBroadcast) {
-		broadcastActive = false;
-		broadcastReady = false;
-	}
-
-	emit BroadcastStreamReady(broadcastReady);
-
-	OnDeactivate();
+	/* Outputs that cannot abort themselves (an output type without an abort implementation) still have to
+	 * go down with the session; a second stop of an output that is already down does nothing. */
+	outputHandler->StopExtraDestinations(true);
 }
 
 void OBSBasic::StreamDelayStarting(int sec)
 {
 	emit StreamingStarted(true);
+
+	if (StreamDestinationRuntime *runtime = CurrentRuntime())
+		runtime->state = StreamDestinationRuntime::State::DelayStarting;
 
 	if (sysTrayStream) {
 		sysTrayStream->setText(QTStr("Basic.Main.StopStreaming"));
@@ -258,6 +463,9 @@ void OBSBasic::StreamDelayStopping(int sec)
 {
 	emit StreamingStopped(true);
 
+	if (StreamDestinationRuntime *runtime = CurrentRuntime())
+		runtime->state = StreamDestinationRuntime::State::DelayStopping;
+
 	if (sysTrayStream) {
 		sysTrayStream->setText(QTStr("Basic.Main.StartStreaming"));
 		sysTrayStream->setEnabled(true);
@@ -271,6 +479,13 @@ void OBSBasic::StreamDelayStopping(int sec)
 void OBSBasic::StreamingStart()
 {
 	emit StreamingStarted();
+
+	if (StreamDestinationRuntime *runtime = CurrentRuntime()) {
+		runtime->state = StreamDestinationRuntime::State::Live;
+		runtime->output = outputHandler->StreamingOutput();
+		blog(LOG_INFO, "Streaming destination '%s' is live (%zu of %zu enabled destinations up)",
+		     runtime->name.c_str(), LiveDestinationCount(), EnabledDestinationCount());
+	}
 	OBSOutputAutoRelease output = obs_frontend_get_streaming_output();
 	ui->statusbar->StreamStarted(output);
 
@@ -309,6 +524,9 @@ void OBSBasic::StreamStopping()
 {
 	emit StreamingStopping();
 
+	if (StreamDestinationRuntime *runtime = CurrentRuntime())
+		runtime->state = StreamDestinationRuntime::State::Stopping;
+
 	if (sysTrayStream)
 		sysTrayStream->setText(QTStr("Basic.Main.StoppingStreaming"));
 
@@ -318,6 +536,14 @@ void OBSBasic::StreamStopping()
 
 void OBSBasic::StreamingStop(int code, QString last_error)
 {
+	/* Q13: the session is the set of connections of the session, not its first one. A connection going
+	 * down while another is still up is a per-destination failure and must not touch anything that
+	 * describes the session; the session comes down with the last connection, which is decided below by
+	 * asking the output handler what it still has running. Remembering whether the user asked for the stop
+	 * keeps a stop of the whole session from producing failure dialogs for the connections that were
+	 * already dropping when it was pressed. */
+	const bool userRequestedStop = streamingStopping;
+
 	const char *errorDescription = "";
 	DStr errorMessage;
 	bool use_last_error = false;
@@ -326,11 +552,15 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 
 	// An ungraceful kill requested via the skull button must behave exactly like clicking "Stop Streaming":
 	// no error dialog, no reconnect handling -- just a clean stop.
-	// The marker string is written by plugins/obs-outputs' abort path (see rtmp_stream_abort), so any
-	// stop event carrying it is ours even if the streamingKillActive flag was consumed by an earlier stop.
-	const bool ungracefulKill = last_error.contains(QStringLiteral("Stream killed ungracefully"));
-	if (streamingKillActive || ungracefulKill) {
-		streamingKillActive = false;
+	// The marker string is written by plugins/obs-outputs' abort path (see rtmp_stream_abort), so a stop
+	// event carrying it is one of ours even if this destination's request flag was consumed elsewhere. The
+	// flag is per destination: a killed connection never silences the failure report of another one.
+	StreamDestinationRuntime *killedRuntime = CurrentRuntime();
+	const bool ungracefulKill = last_error.contains(QStringLiteral("Stream killed ungracefully")) ||
+				    (killedRuntime && killedRuntime->killRequested);
+	if (ungracefulKill) {
+		if (killedRuntime)
+			killedRuntime->killRequested = false;
 		code = OBS_OUTPUT_SUCCESS;
 	}
 
@@ -381,6 +611,37 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 	else
 		dstr_copy(errorMessage, errorDescription);
 
+	/* The destination this signal belongs to. An entry that is already stopped is skipped, which is what
+	 * keeps the last extra destination - routed through this same function - from re-logging the first one. */
+	if (StreamDestinationRuntime *runtime = CurrentRuntime();
+	    runtime && runtime->state != StreamDestinationRuntime::State::Stopped) {
+		const char *previousState = runtime->stateName();
+		runtime->state = StreamDestinationRuntime::State::Stopped;
+		runtime->output = nullptr;
+		runtime->service = nullptr;
+		runtime->encoderGroupId.clear();
+		if (should_reconnect)
+			runtime->reconnectAttempt++;
+		else
+			runtime->reconnectAttempt = 0;
+		blog(LOG_INFO, "Streaming destination '%s' stopped after %s (%zu of %zu enabled destinations up)",
+		     runtime->name.c_str(), previousState, LiveDestinationCount(), EnabledDestinationCount());
+	}
+
+	/* Q13 (b): one connection going down does not end the session while other destinations of the session
+	 * are still up. Nothing that describes the session as a whole may change here - not the status bar,
+	 * not the tray entry, not the frontend/websocket event, and not the recording or replay-buffer
+	 * coupling. They all follow the session, which ends with the last connection. A destination that is
+	 * still working on its handshake counts as a connection of the session even though libobs does not
+	 * call its output active yet, which is what the runtime count is for. */
+	const size_t stillRunning = RunningDestinationCount();
+	if (outputHandler->StreamingActive() || stillRunning > 0) {
+		blog(LOG_INFO,
+		     "streaming session continues after a destination went down: %zu of %zu enabled destinations still attempting or uploading",
+		     stillRunning, EnabledDestinationCount());
+		return;
+	}
+
 	ui->statusbar->StreamStopped();
 
 	emit StreamingStopped();
@@ -388,6 +649,15 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 	if (sysTrayStream) {
 		sysTrayStream->setText(QTStr("Basic.Main.StartStreaming"));
 		sysTrayStream->setEnabled(true);
+	}
+
+	/* An output that never got as far as starting emits no stop signal, so its runtime entry would be
+	 * left saying "connecting" after the session is over. Everything that is not live and not already
+	 * going down is simply stopped with the session. */
+	for (auto &runtime : streamRuntimes) {
+		if (runtime.state == StreamDestinationRuntime::State::Preparing ||
+		    runtime.state == StreamDestinationRuntime::State::Connecting)
+			runtime.state = StreamDestinationRuntime::State::Stopped;
 	}
 
 	streamingStopping = false;
@@ -407,10 +677,13 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 						   : QTStr("Output.StreamEncodeError.Msg.LastError").arg(last_error);
 		OBSMessageBox::information(this, QTStr("Output.StreamEncodeError.Title"), msg);
 
-	} else if (code != OBS_OUTPUT_SUCCESS && isVisible()) {
+	} else if (code != OBS_OUTPUT_SUCCESS && !userRequestedStop && isVisible()) {
+		/* Q13 (ii): only a stop that nobody asked for is worth a modal. When the user stopped the
+		 * session themselves, connections that were already dropping on the way down must not pop an
+		 * error window on top of a stream they just ended. */
 		OBSMessageBox::information(this, QTStr("Output.ConnectFail.Title"), QT_UTF8(errorMessage));
 
-	} else if (code != OBS_OUTPUT_SUCCESS && !isVisible()) {
+	} else if (code != OBS_OUTPUT_SUCCESS && !userRequestedStop && !isVisible()) {
 		SysTrayNotify(QT_UTF8(errorDescription), QSystemTrayIcon::Warning);
 	}
 

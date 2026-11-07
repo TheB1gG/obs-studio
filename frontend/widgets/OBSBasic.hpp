@@ -25,6 +25,7 @@
 #include <utility/BasicOutputHandler.hpp>
 #include <utility/OBSCanvas.hpp>
 #include <utility/StreamingDestinations.hpp>
+#include <utility/StreamDestinationRuntime.hpp>
 #include <utility/VCamConfig.hpp>
 #include <utility/platform.hpp>
 #include <utility/undo_stack.hpp>
@@ -283,6 +284,10 @@ private:
 	/* The streaming destinations of the active profile (service + video tracks per destination).
 	 * Reloaded whenever a profile is activated; see LoadStreamingDestinations(). */
 	StreamingDestinations streamingDestinations;
+
+	/* Runtime mirror of that list - one entry per destination, or one unnamed entry while the profile
+	 * still uses the single-stream layout. See frontend/utility/StreamDestinationRuntime.hpp. */
+	std::vector<StreamDestinationRuntime> streamRuntimes;
 
 	QScopedPointer<QThread> patronJsonThread;
 	std::string patronJson;
@@ -908,6 +913,42 @@ public:
 	const OBSProfile &GetCurrentProfile() const;
 	void LoadStreamingDestinations();
 	StreamingDestinations &Destinations() { return streamingDestinations; }
+	void RefreshStreamRuntimes();
+	StreamDestinationRuntime *CurrentRuntime();
+	/* The destination served by the output handler's own stream output: the first enabled one of the profile
+	 * (Q42). Its session-level side effects - broadcast state, the "preparing" messages - are the ones the
+	 * single-stream code paths were written for. */
+	StreamDestinationRuntime *PrimaryRuntime();
+	/* The runtime entry of one destination id, used by the per-destination outputs. */
+	StreamDestinationRuntime *RuntimeForId(std::string_view id);
+	void NoteDestinationStarted(const std::string &id);
+	void NoteDestinationStopped(const std::string &id, long long code);
+	size_t LiveDestinationCount() const;
+	size_t EnabledDestinationCount() const;
+	/* Destinations that belong to the running session: live, or still working their way through setup and
+	 * the handshake. Q13: the session exists as long as this count is above zero, which is what keeps one
+	 * failed connection from ending a session whose other connections are still going. */
+	size_t RunningDestinationCount() const;
+	/* End one connection of the session the way the skull button does it: a reset of the RTMP socket without
+	 * any end-of-stream data, so the ingest sees a hard drop. An empty id means the first destination. The
+	 * session itself comes down through the normal stop path once nothing is left (Q13). */
+	void KillDestinationUngracefully(std::string id = {});
+	/* Stop one connection of the session by destination id, leaving the others uploading (Q13), and bring
+	 * one back while the rest of the session runs (the restart action of a failure notice). */
+	void StopDestination(std::string id, bool force = false);
+	bool RestartDestination(const std::string &id);
+	/* What the widgets that show the session need: one entry per destination that is live or still
+	 * attempting, with its output, its state and its reconnect counter. Copies on purpose - a widget ticks
+	 * on its own and must not hold on to the runtime vector. */
+	struct StreamSessionEntry {
+		std::string id;
+		std::string name;
+		OBSOutput output;
+		StreamDestinationRuntime::State state = StreamDestinationRuntime::State::Stopped;
+		int reconnectAttempt = 0;
+		bool reconnecting = false;
+	};
+	std::vector<StreamSessionEntry> StreamSessionSnapshot() const;
 
 	std::optional<OBSProfile> GetProfileByName(const std::string &profileName) const;
 	std::optional<OBSProfile> GetProfileByDirectoryName(const std::string &directoryName) const;
@@ -1373,8 +1414,9 @@ private:
 	std::shared_future<void> setupStreamingGuard;
 	bool streamingStopping = false;
 	bool streamingStarting = false;
-	// Set while an ungraceful kill (skull button) is in progress: the resulting "stop" signal must be treated like a normal stop (no error dialog).
-	bool streamingKillActive = false;
+	// The ungraceful-kill request is kept per destination (StreamDestinationRuntime::killRequested) rather
+	// than as one flag for the whole session: killing one connection must not silence the failure report of
+	// another connection that dies at the same moment.
 
 public slots:
 	void DisplayStreamStartError();
@@ -1382,6 +1424,7 @@ public slots:
 	void StopStreaming();
 	void ForceStopStreaming();
 	void KillStreamingUngracefully();
+	void ApplyDestinationReconnect(bool &enabled, int &retryDelaySec, int &maxRetries);
 
 	void StreamDelayStarting(int sec);
 	void StreamDelayStopping(int sec);

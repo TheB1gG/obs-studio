@@ -2,6 +2,13 @@
 
 #include "BasicOutputHandler.hpp"
 
+#include <utility/StreamingDestinations.hpp>
+
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
 struct AdvancedOutput : BasicOutputHandler {
 	OBSEncoder streamAudioEnc;
 	OBSEncoder streamArchiveEnc;
@@ -44,4 +51,38 @@ struct AdvancedOutput : BasicOutputHandler {
 	virtual bool RecordingActive() const override;
 	virtual bool ReplayBufferActive() const override;
 	bool allowsMultiTrack();
+
+	/* Slice 2b: the destinations after the first one. The first enabled destination keeps using the
+	 * existing streamOutput, which leaves the recording, delay and multitrack-video code untouched while
+	 * the loop is built; every other destination gets its own output object on top of the same encoders.
+	 * Sharing an encoder costs upload, not encoding, so this is about the connection, not the media. */
+	struct ExtraDestinationStream {
+		std::string id;
+		std::string name;
+		OBSBasic *owner = nullptr;
+		OBSService service;
+		OBSOutput output; /* released when the entry goes away */
+		OBSSignal stopSignal;
+		OBSSignal startSignal;
+		/* Set once the output has been started and cleared by its stop signal: an output that is still
+		 * connecting has to be stopped just as much as one that is already uploading. Written by the
+		 * output's own thread, read by the GUI thread - same arrangement as the handler flags in
+		 * BasicOutputHandler. */
+		bool stopPending = false;
+	};
+
+	std::vector<std::unique_ptr<ExtraDestinationStream>> extraStreams;
+
+	void StartExtraDestinations();
+	void StopExtraDestinations(bool force) override;
+	size_t ActiveExtraDestinations() const override;
+	/* One connection of the session by destination id: stop it alone, or bring it back while the rest of
+	 * the session keeps running. */
+	void StopDestination(std::string_view id, bool force) override;
+	bool StartDestination(std::string_view id) override;
+
+private:
+	/* Build one destination's output on the shared encoders and start it: the fan-out and the restart of a
+	 * single destination need exactly the same thing. */
+	bool StartDestinationOutput(const StreamingDestination &dest);
 };

@@ -780,6 +780,116 @@ void OBSBasic::LoadStreamingDestinations()
 	 * files they have today and nothing new is read at startup. */
 	if (StreamingDestinations::pageEnabled(activeConfiguration) && streamingDestinations.importLegacyLayout())
 		activeConfiguration.SaveSafe("tmp");
+
+	RefreshStreamRuntimes();
+}
+
+/* Build the runtime mirror of the destination list, keeping whatever is already running attached to the
+ * destination it belongs to: the settings dialog can rewrite the list while a destination is up, and the
+ * live state must not be lost by that. */
+void OBSBasic::RefreshStreamRuntimes()
+{
+	std::vector<StreamDestinationRuntime> next;
+
+	for (const auto &dest : streamingDestinations.destinations()) {
+		StreamDestinationRuntime runtime;
+		runtime.id = dest.id;
+		runtime.name = dest.name;
+		runtime.enabled = dest.enabled;
+
+		for (const auto &previous : streamRuntimes) {
+			if (previous.id != dest.id)
+				continue;
+			runtime.state = previous.state;
+			runtime.reconnectAttempt = previous.reconnectAttempt;
+			runtime.service = previous.service;
+			runtime.output = previous.output;
+			runtime.encoderGroupId = previous.encoderGroupId;
+			break;
+		}
+
+		next.push_back(std::move(runtime));
+	}
+
+	if (next.empty()) {
+		/* No destination list yet: represent the one stream the engine actually runs, so the
+		 * "n of N up" counters and the log lines stay truthful during the transition. */
+		StreamDestinationRuntime legacy;
+		legacy.name = "stream";
+		if (!streamRuntimes.empty()) {
+			legacy.state = streamRuntimes.front().state;
+			legacy.reconnectAttempt = streamRuntimes.front().reconnectAttempt;
+			legacy.service = streamRuntimes.front().service;
+			legacy.output = streamRuntimes.front().output;
+		}
+		next.push_back(std::move(legacy));
+	}
+
+	streamRuntimes.swap(next);
+}
+
+StreamDestinationRuntime *OBSBasic::CurrentRuntime()
+{
+	for (auto &runtime : streamRuntimes) {
+		if (runtime.isRunning())
+			return &runtime;
+	}
+
+	for (auto &runtime : streamRuntimes) {
+		if (runtime.enabled)
+			return &runtime;
+	}
+
+	return streamRuntimes.empty() ? nullptr : &streamRuntimes.front();
+}
+
+StreamDestinationRuntime *OBSBasic::PrimaryRuntime()
+{
+	for (auto &runtime : streamRuntimes) {
+		if (runtime.enabled)
+			return &runtime;
+	}
+
+	return streamRuntimes.empty() ? nullptr : &streamRuntimes.front();
+}
+
+StreamDestinationRuntime *OBSBasic::RuntimeForId(std::string_view id)
+{
+	for (auto &runtime : streamRuntimes) {
+		if (runtime.id == id)
+			return &runtime;
+	}
+	return nullptr;
+}
+
+size_t OBSBasic::LiveDestinationCount() const
+{
+	size_t count = 0;
+	for (const auto &runtime : streamRuntimes) {
+		if (runtime.isLive())
+			count++;
+	}
+	return count;
+}
+
+size_t OBSBasic::EnabledDestinationCount() const
+{
+	size_t count = 0;
+	for (const auto &runtime : streamRuntimes) {
+		if (runtime.enabled)
+			count++;
+	}
+	return count;
+}
+
+size_t OBSBasic::RunningDestinationCount() const
+{
+	size_t count = 0;
+	for (const auto &runtime : streamRuntimes) {
+		if (runtime.isRunning())
+			count++;
+	}
+	return count;
 }
 
 void OBSBasic::UpdateProfileEncoders()
