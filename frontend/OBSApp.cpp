@@ -265,6 +265,13 @@ void OBSApp::InitUserConfigDefaults()
 {
 	config_set_default_bool(userConfig, "General", "ConfirmOnExit", true);
 
+	/* A fresh install - a user config with no [General] Language, which is what portable mode starts
+	 * from - stays on English instead of following the operating system. This fork is built, tested and
+	 * driven headlessly in English, and the language is afterwards whatever the user picks in
+	 * Settings -> General. Set [General] UseSystemLocale=true in global.ini to get the previous
+	 * system-locale behaviour back (see OBSApp::InitLocale). */
+	config_set_default_bool(userConfig, "General", "UseSystemLocale", false);
+
 	config_set_default_string(userConfig, "General", "HotkeyFocusType", "NeverDisableHotkeys");
 
 	config_set_default_bool(userConfig, "BasicWindow", "PreviewEnabled", true);
@@ -299,8 +306,19 @@ void OBSApp::InitUserConfigDefaults()
 
 	config_set_default_bool(userConfig, "BasicWindow", "MediaControlsCountdownTimer", true);
 
-	config_set_default_int(userConfig, "Appearance", "FontScale", 10);
-	config_set_default_int(userConfig, "Appearance", "Density", 1);
+	/* Appearance defaults for this fork. Font scale 8 is the bottom of the slider (the form range is
+	 * 8..12, OBSBasicSettings.ui), i.e. the compact text size the harnesses assert against. Density picks
+	 * the "Classic" choice; its id is documented at the call below. The first attempt here used -1, which
+	 * belongs to no button at all: LoadAppearanceSettings() then finds nothing and the dialog shows the
+	 * form's own checked widget (Normal) - the same failure mode as upstream's default of 1. */
+	config_set_default_int(userConfig, "Appearance", "FontScale", 8);
+	/* Classic, verified: the four density buttons carry the auto-ids -2 (Classic), -3 (Compact),
+	 * -4 (Normal), -5 (Comfortable) - the same four values getPaddingForDensityId() maps to
+	 * 0.25/2/4/6 padding. Confirmed by clicking Classic in the dialog and reading [Appearance] Density
+	 * back: -2. The value -1 belongs to no button, so LoadAppearanceSettings() finds nothing and the form
+	 * falls back to its .ui-checked widget, which is Normal - that is how upstream's default of 1 behaved,
+	 * and it is the mistake this line used to make. */
+	config_set_default_int(userConfig, "Appearance", "Density", -2);
 }
 
 static bool do_mkdir(const char *path)
@@ -621,6 +639,14 @@ bool OBSApp::InitLocale()
 		return true;
 
 	if (!userLocale && defaultLang) {
+		/* Probing the operating system's preferred locales is opt-in in this fork: a fresh install
+		 * (portable mode, or a user config without [General] Language) stays on English, which is the
+		 * language the UI strings and the headless harnesses are written against. Setting
+		 * [General] UseSystemLocale=true in global.ini restores the upstream behaviour; a user who
+		 * picks a language in Settings has a user value and never reaches this branch. */
+		if (!config_get_bool(userConfig, "General", "UseSystemLocale"))
+			return true;
+
 		for (auto &locale_ : GetPreferredLocales()) {
 			if (locale_ == lang)
 				return true;
@@ -946,7 +972,6 @@ void OBSApp::AppInit()
 	config_set_default_string(userConfig, "Basic", "ProfileDir", Str("Untitled"));
 	config_set_default_string(userConfig, "Basic", "SceneCollection", Str("Untitled"));
 	config_set_default_string(userConfig, "Basic", "SceneCollectionFile", Str("Untitled"));
-	config_set_default_bool(userConfig, "Basic", "ConfigOnNewProfile", true);
 
 	const std::string_view profileName{config_get_string(userConfig, "Basic", "Profile")};
 
@@ -1111,6 +1136,21 @@ bool OBSApp::OBSInit()
 
 	blog(LOG_INFO, "Qt Version: %s (runtime), %s (compiled)", qVersion(), QT_VERSION_STR);
 	blog(LOG_INFO, "Portable mode: %s", portable_mode ? "true" : "false");
+
+	/* The appearance this session actually runs with, reported where a support log can see it: a
+	 * "the text is tiny / the theme looks wrong" report is answerable from these two lines alone. They
+	 * carry the effective values, i.e. the fork defaults (InitUserConfigDefaults for the language and the
+	 * font scale/density, InitTheme for the style) or whatever Settings -> General/Appearance wrote on top.
+	 * Everything logged before StartupOBS() opens the log file is invisible here, which is why this sits
+	 * after it rather than inside InitLocale()/InitTheme(). */
+	blog(LOG_INFO, "Language: %s%s", locale.c_str(),
+	     config_has_user_value(userConfig, "General", "Language") ? "" : " (default, no user setting)");
+	if (const OBSTheme *sessionTheme = GetTheme()) {
+		blog(LOG_INFO, "Appearance: theme '%s'%s, font scale %d, density %d", QT_TO_UTF8(sessionTheme->id),
+		     config_has_user_value(userConfig, "Appearance", "Theme") ? "" : " (default style)",
+		     (int) config_get_int(userConfig, "Appearance", "FontScale"),
+		     (int) config_get_int(userConfig, "Appearance", "Density"));
+	}
 
 	if (safe_mode) {
 		blog(LOG_WARNING, "Safe Mode enabled.");

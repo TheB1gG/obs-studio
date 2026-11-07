@@ -1008,10 +1008,29 @@ bool OBSApp::InitTheme()
 		}
 	}
 
+	/* A fresh install - no [Appearance] Theme in the user config, which is what portable mode starts
+	 * from - comes up in the "Classic" variant of the shipped base theme, the look this fork's screenshots,
+	 * harnesses and muscle memory use. The id is the one declared by frontend/data/themes/Yami_Classic.ovt
+	 * (meta name 'Classic', id 'com.obsproject.Yami.Classic'). It is only a default: choosing a style in
+	 * Settings -> Appearance writes the key and that wins from then on.
+	 * DEFAULT_THEME (the Yami "Default" variant, defined in frontend/cmake/templates/ui-config.h.in) stays
+	 * the last-resort fallback when a configured theme cannot be loaded, and high-contrast Windows sessions
+	 * still get the system theme. */
+	static constexpr const char *DEFAULT_STYLE = "com.obsproject.Yami.Classic";
+
+	const bool userChoseTheme = config_has_user_value(userConfig, "Appearance", "Theme");
 	QString themeName = config_get_string(userConfig, "Appearance", "Theme");
 
-	if (themeName.isEmpty() || !GetTheme(themeName)) {
-		if (!themeName.isEmpty()) {
+	if (!userChoseTheme || themeName.isEmpty()) {
+#ifdef _WIN32
+		themeName = HighContrastEnabled() ? "com.obsproject.System" : DEFAULT_STYLE;
+#else
+		themeName = DEFAULT_STYLE;
+#endif
+	}
+
+	if (!GetTheme(themeName)) {
+		if (userChoseTheme && !themeName.isEmpty()) {
 			blog(LOG_WARNING,
 			     "Loading theme \"%s\" failed, falling back to "
 			     "default theme (\"%s\").",
