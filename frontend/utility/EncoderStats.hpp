@@ -73,7 +73,7 @@ inline EncoderFrameCounters encoderFrameCounters(const obs_encoder_t *encoder)
  * delivery mix (mix reuse), so encoders and mixes are each counted once to keep
  * the sum honest.
  */
-inline EncoderFrameCounters outputFrameCounters(std::initializer_list<const obs_output_t *> outputs)
+template<typename OutputRange> inline EncoderFrameCounters outputFrameCountersOf(const OutputRange &outputs)
 {
 	EncoderFrameCounters counters;
 	std::vector<const obs_encoder_t *> seenEncoders;
@@ -105,6 +105,18 @@ inline EncoderFrameCounters outputFrameCounters(std::initializer_list<const obs_
 	}
 
 	return counters;
+}
+
+inline EncoderFrameCounters outputFrameCounters(std::initializer_list<const obs_output_t *> outputs)
+{
+	return outputFrameCountersOf(outputs);
+}
+
+/* The same sum over a set that is only known at run time - a streaming session with one output per
+ * destination (slice 2b) has a variable number of connections, and its encoders are shared by all of them. */
+inline EncoderFrameCounters outputFrameCounters(const std::vector<const obs_output_t *> &outputs)
+{
+	return outputFrameCountersOf(outputs);
 }
 
 /** A video encoder of an output and the encoder slot it sits in. */
