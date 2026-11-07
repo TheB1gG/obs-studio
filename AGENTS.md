@@ -299,6 +299,9 @@ go-ahead, and only with the proof chain at the end of this section.
 - Create both a backup branch and a backup tag at HEAD (`backup/pre-squash-<date>`), and record
   `git rev-parse HEAD^{tree}`. A rewrite with no backup ref is unrecoverable.
 - Working tree must be clean (section 2): a rewrite may not smuggle working-tree changes in.
+- Check that nothing is already in flight before starting: `Test-Path .git/rebase-merge`, `.git/rebase-apply`,
+  `.git/MERGE_HEAD`, `.git/CHERRY_PICK_HEAD`. Starting a rewrite on top of a stale sequencer state leaves that
+  state's todo list queued behind the new history, and the next `--continue` replays it.
 
 ### Proof, in this order (a squash that changes content is not a squash)
 
@@ -313,4 +316,10 @@ go-ahead, and only with the proof chain at the end of this section.
    then. Release tags are never moved; scratch tags whose commits were folded away are deleted.
 5. Fix every SHA quoted in `scratch/plan/*.md` - those files are untracked, cite commits by SHA, and silently
    rot after a rewrite (`scratch/tmp/sub-text.ps1`).
+6. Close the rewrite by checking the sequencer state is gone: `Test-Path .git/rebase-merge` must be false. A
+   rebase that was given up on is cleared with `git rebase --quit`, which moves no ref and touches no file.
+   Never `--abort` - it resets the branch to the rebase's `orig-head`, i.e. the pre-rewrite history you have
+   already published over - and never `--continue` onto a tip that already contains those commits. This happened
+   on 2026-11-07: the squash was rebuilt with reset + re-commit, the abandoned interactive rebase stayed at
+   `msgnum 15/48` for hours, and the editor kept showing a rebase that did not exist (scratch/plan/CI-PENDING.md).
 
