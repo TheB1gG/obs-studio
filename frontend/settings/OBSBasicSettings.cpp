@@ -3583,6 +3583,15 @@ bool OBSBasicSettings::QueryAllowedToClose()
 		return false;
 	}
 
+	/* A destination whose endpoint the Output page cannot make sense of: half-typed, or the same stream key
+	 * another destination already uploads with. Saving that would lose the edit or hand the profile a
+	 * connection the ingest turns down, so the save is refused with the destination named. */
+	if (const QString destinationProblem = DestinationServiceProblems(); !destinationProblem.isEmpty()) {
+		OBSMessageBox::warning(this, QTStr("Basic.Settings.Stream.Destinations.Service.Error.Title"),
+				       destinationProblem);
+		return false;
+	}
+
 	return true;
 }
 

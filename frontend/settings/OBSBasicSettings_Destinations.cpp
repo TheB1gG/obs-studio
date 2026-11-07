@@ -3,6 +3,7 @@
 #include <widgets/OBSBasic.hpp>
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -14,6 +15,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
+#include <QSignalBlocker>
 #include <QSharedPointer>
 #include <QTimer>
 #include <QToolButton>
@@ -179,6 +181,86 @@ void DimBlockIfNeeded(QWidget *block, bool dim)
 	block->setGraphicsEffect(effect);
 }
 
+/* The providers libobs ships, complete and sorted. The Stream settings page offers a curated short list with
+ * a "show all" entry, but a second destination is by nature an endpoint that list was not picked for, so the
+ * card goes straight to everything the rtmp-services plugin knows about. */
+QStringList CommonServiceProviders()
+{
+	QStringList names;
+
+	obs_properties_t *props = obs_get_service_properties("rtmp_common");
+	if (!props)
+		return names;
+
+	OBSDataAutoRelease settings = obs_data_create();
+	obs_data_set_bool(settings, "show_all", true);
+	if (obs_property_t *show_all = obs_properties_get(props, "show_all"))
+		obs_property_modified(show_all, settings);
+
+	if (obs_property_t *services = obs_properties_get(props, "service")) {
+		const size_t count = obs_property_list_item_count(services);
+		for (size_t i = 0; i < count; i++) {
+			const char *name = obs_property_list_item_string(services, i);
+			if (name && *name)
+				names << QString::fromUtf8(name);
+		}
+	}
+
+	obs_properties_destroy(props);
+	names.sort(Qt::CaseInsensitive);
+	return names;
+}
+
+/* The ingest address and protocol a provider uploads to. libobs answers in two places: the settings object
+ * gets the protocol, and the provider's list of ingests is a *list property* whose first entry is the default
+ * - which is what the Stream settings page preselects in its server combo (UpdateServerList). A provider with
+ * no fixed ingest comes back empty, and then the key alone says where the stream goes. */
+struct ProviderIngest {
+	QString server;
+	QString protocol;
+};
+
+ProviderIngest ResolveProviderIngest(const QString &provider)
+{
+	ProviderIngest out;
+	if (provider.isEmpty())
+		return out;
+
+	obs_properties_t *props = obs_get_service_properties("rtmp_common");
+	if (!props)
+		return out;
+
+	OBSDataAutoRelease settings = obs_data_create();
+	obs_data_set_string(settings, "service", QT_TO_UTF8(provider));
+	if (obs_property_t *services = obs_properties_get(props, "service"))
+		obs_property_modified(services, settings);
+
+	if (const char *protocol = obs_data_get_string(settings, "protocol"))
+		out.protocol = QString::fromUtf8(protocol);
+	if (const char *server = obs_data_get_string(settings, "server"))
+		out.server = QString::fromUtf8(server);
+
+	if (out.server.isEmpty()) {
+		if (obs_property_t *servers = obs_properties_get(props, "server")) {
+			const char *first = obs_property_list_item_string(servers, 0);
+			if (first && *first)
+				out.server = QString::fromUtf8(first);
+		}
+	}
+
+	obs_properties_destroy(props);
+	return out;
+}
+
+/* The four ways a card says where its stream goes. The first two are the states a destination is in without
+ * typing anything; the other two write a service_<id>.json of its own. */
+enum class EndpointChoice : int {
+	NotConfigured = 0,
+	ProfileDefault,
+	CustomServer,
+	KnownProvider,
+};
+
 } // namespace
 
 void OBSBasicSettings::SetupDestinationsPage()
@@ -229,7 +311,6 @@ void OBSBasicSettings::SetupDestinationsPage()
 	RebuildDestinationBlocks();
 	RefreshDestinationStates();
 }
-
 void OBSBasicSettings::RebuildDestinationBlocks()
 {
 	if (!destinationsBlocksLayout)
@@ -243,6 +324,9 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		delete previous;
 	}
 	destinationStateLabels.clear();
+	/* The endpoint checks of the cards that are going away, dropped before the widgets they point at:
+	 * a stale closure would stage an edit for a card that no longer exists. */
+	destinationServiceChecks.clear();
 
 	StreamingDestinations &destinations = destinationEdits;
 	const auto list = destinations.destinations();
@@ -375,20 +459,10 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 
 		/* Where the stream goes, what it costs, and what happens when the link drops: three sub-sections
 		 * with a header line of their own, so a destination that needs nothing is read without opening
-		 * anything, and the one that needs attention opens only the part that matters. They are added to the
-		 * layout in the order their content is built below. */
-		auto serviceSection =
-			new DestinationSection(QTStr("Basic.Settings.Stream.Destinations.Section.Service"));
-		detailsLayout->addWidget(serviceSection);
-
-		const std::string service = destinations.serviceDescription(dest.id);
-		const QString serviceText = service.empty()
-						    ? QTStr("Basic.Settings.Stream.Destinations.Service.NotConfigured")
-						    : QString::fromStdString(service);
-		/* The endpoint gets a line of its own: the section is called Service already, so repeating the word in
-		 * front of the address only pushes the part worth reading further to the right. */
-		serviceSection->bodyLayout()->addWidget(SecondaryLabel(serviceText));
-
+		 * anything, and the one that needs attention opens only the part that matters. The Service section
+		 * is built at the end of the block and inserted at the top: its endpoint editor holds on to this
+		 * block's header line and has to re-state it as the fields change, and that line only exists once
+		 * the destination's cost is known. */
 		const size_t tracks = destinations.trackCount(dest.id);
 		const QString tracksText =
 			tracks == 0 ? QTStr("Basic.Settings.Stream.Destinations.Tracks.None")
@@ -427,24 +501,18 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		uploadForm->addRow(QTStr("Basic.Settings.Stream.Destinations.Recording"),
 				   SecondaryLabel(QTStr("Basic.Settings.Stream.Destinations.Recording.Session")));
 
-		/* Offered, not wired yet: the fetch needs the per-destination service object the engine step
-		 * creates. Keeping the button here makes the intended flow visible. It keeps its own width: a
-		 * button stretched across the whole page looks like a disabled text field, which is what it is. */
-		auto fetchButton = new QPushButton(QTStr("Basic.Settings.Stream.Destinations.Fetch"));
-		fetchButton->setEnabled(false);
-		fetchButton->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Fetch.Pending"));
-		auto fetchRow = new QHBoxLayout;
-		fetchRow->setContentsMargins(0, 0, 0, 0);
-		fetchRow->addWidget(fetchButton);
-		fetchRow->addStretch();
-		serviceSection->bodyLayout()->addLayout(fetchRow);
-
 		/* The block's own line says which destination this is, where it goes and what it costs, so the
-		 * collapsed list can be scanned for the one the user means. */
-		QString headerText = QString::fromStdString(dest.id) + " \xE2\x80\xA2 " + serviceText;
-		if (!totalText.isEmpty())
-			headerText += " \xE2\x80\xA2 " + totalText;
-		summary->setFullText(headerText);
+		 * collapsed list can be scanned for the one the user means. The endpoint part of it comes from the
+		 * model and is re-stated by the Service section's editor as its fields change - which is why the
+		 * closure is built here and handed to that section when it is created below. */
+		auto restate_header = [this, summary, id = dest.id, totalText]() {
+			QString headerText =
+				QString::fromStdString(id) + " \xE2\x80\xA2 " + DestinationEndpointSummary(id);
+			if (!totalText.isEmpty())
+				headerText += " \xE2\x80\xA2 " + totalText;
+			summary->setFullText(headerText);
+		};
+		restate_header();
 		uploadSection->setSummary(totalText);
 
 		/* What happens when the link drops. */
@@ -548,6 +616,11 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		reconnectDetail->setVisible(policy.overridden);
 		reconnectSummary->setVisible(!policy.overridden);
 
+		/* The endpoint editor goes at the top of the details, above the cost and the connection: it is
+		 * built last because it needs the header-line closure just above, and it re-states that line each
+		 * time one of its fields changes. */
+		detailsLayout->insertWidget(0, BuildDestinationServiceSection(id, restate_header));
+
 		DimBlockIfNeeded(block, !dest.enabled);
 		destinationsBlocksLayout->addWidget(block);
 	}
@@ -563,6 +636,377 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		destinationsTotalBitrateLabel->setToolTip(
 			QTStr("Basic.Settings.Stream.Destinations.TotalUpload.ToolTip"));
 	}
+}
+
+/* The "where does this stream go" part of a destination card. Every card needs an answer, because each
+ * destination is a connection of its own: two destinations pointed at one stream key do not stream twice,
+ * they get refused by the ingest. So the section offers the four states the model can hold, and writes a
+ * service_<id>.json whenever the user picks a server or a provider of their own - which is what detaches a
+ * destination from the profile's default service.
+ *
+ * The fields never rebuild the card, because a rebuild would destroy the line edit halfway through a typed
+ * stream key: a choice change shows and hides whole groups instead. */
+QWidget *OBSBasicSettings::BuildDestinationServiceSection(const std::string &id,
+							  const std::function<void()> &restate_header)
+{
+	StreamingDestinations &destinations = destinationEdits;
+
+	auto section = new DestinationSection(QTStr("Basic.Settings.Stream.Destinations.Section.Service"));
+
+	auto form = new QFormLayout;
+	form->setContentsMargins(0, 0, 0, 0);
+	form->setHorizontalSpacing(10);
+	form->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
+	form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+	section->bodyLayout()->addLayout(form);
+
+	const auto endpoint = destinations.serviceEndpoint(id);
+	const bool owns = destinations.ownsService(id);
+	/* The two service kinds this page can write. A destination whose file says something else (a WHIP
+	 * endpoint, or one typed into the profile by hand) is described rather than edited: offering fields
+	 * for it would rewrite the file into something the user did not type. */
+	const bool writable = endpoint.type.empty() || endpoint.type == "rtmp_custom" || endpoint.type == "rtmp_common";
+
+	auto choice = new QComboBox;
+	/* Object names on the endpoint fields, as on the block's other controls: a stylesheet, or anything
+	 * outside the page that has to address one card's fields, can then find them by name rather than by
+	 * position in the layout. */
+	choice->setObjectName("destinationEndpointChoice");
+	choice->addItem(QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint.None"),
+			(int)EndpointChoice::NotConfigured);
+	/* Nothing to follow when the profile has no default service of its own, so there is no entry for it -
+	 * and the note below says why the destination has to have an endpoint here. */
+	const bool profile_available = destinations.profileServiceAvailable();
+	if (profile_available)
+		choice->addItem(QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint.Profile"),
+				(int)EndpointChoice::ProfileDefault);
+	choice->addItem(QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint.Custom"),
+			(int)EndpointChoice::CustomServer);
+	choice->addItem(QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint.Provider"),
+			(int)EndpointChoice::KnownProvider);
+	choice->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint.ToolTip"));
+
+	EndpointChoice current = EndpointChoice::NotConfigured;
+	if (owns && writable)
+		current = (endpoint.type == "rtmp_common") ? EndpointChoice::KnownProvider
+							   : EndpointChoice::CustomServer;
+	else if (!owns && destinations.followsProfileService(id))
+		current = EndpointChoice::ProfileDefault;
+
+	/* A destination marked as following a default service that is not there any more lands on "no
+	 * endpoint", which is what it really is. */
+	int choice_index = choice->findData((int)current);
+	if (choice_index == -1)
+		choice_index = choice->findData((int)EndpointChoice::NotConfigured);
+	choice->setCurrentIndex(choice_index);
+	form->addRow(QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint"), choice);
+
+	/* One container per kind, so switching the choice hides and shows a group instead of tearing down the
+	 * widgets of the one that was in use. */
+	auto customBody = new QWidget;
+	auto customForm = new QFormLayout(customBody);
+	customForm->setContentsMargins(0, 0, 0, 0);
+	customForm->setHorizontalSpacing(10);
+	customForm->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
+	customForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+
+	auto serverEdit = new QLineEdit;
+	serverEdit->setObjectName("destinationEndpointServer");
+	serverEdit->setPlaceholderText("rtmp://host/app   srt://host:port   rists://host:port/streamid=...");
+	serverEdit->setClearButtonEnabled(true);
+	if (owns && endpoint.type == "rtmp_custom")
+		serverEdit->setText(QString::fromStdString(endpoint.server));
+	customForm->addRow(QTStr("Basic.Settings.Stream.Destinations.Service.Server"), serverEdit);
+
+	auto providerBody = new QWidget;
+	auto providerForm = new QFormLayout(providerBody);
+	providerForm->setContentsMargins(0, 0, 0, 0);
+	providerForm->setHorizontalSpacing(10);
+	providerForm->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
+	providerForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+
+	auto providerList = new QComboBox;
+	providerList->setObjectName("destinationEndpointProvider");
+	providerList->addItems(CommonServiceProviders());
+	if (owns && endpoint.type == "rtmp_common") {
+		const int idx = providerList->findText(QString::fromStdString(endpoint.provider), Qt::MatchFixedString);
+		if (idx != -1)
+			providerList->setCurrentIndex(idx);
+	}
+	providerForm->addRow(QTStr("Basic.Settings.Stream.Destinations.Service.Provider"), providerList);
+	auto ingestNote = SecondaryLabel(QString());
+	providerForm->addRow(ingestNote);
+
+	/* The key belongs to both kinds - it is the same field of the same settings object - so it sits once,
+	 * below whichever group is showing. */
+	auto keyBody = new QWidget;
+	auto keyForm = new QFormLayout(keyBody);
+	keyForm->setContentsMargins(0, 0, 0, 0);
+	keyForm->setHorizontalSpacing(10);
+	keyForm->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
+	keyForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+
+	auto keyEdit = new QLineEdit;
+	keyEdit->setObjectName("destinationEndpointKey");
+	keyEdit->setClearButtonEnabled(true);
+	if (!endpoint.key.empty())
+		keyEdit->setText(QString::fromStdString(endpoint.key));
+	keyForm->addRow(QTStr("Basic.Settings.Stream.Destinations.Service.Key"), keyEdit);
+
+	form->addRow(customBody);
+	form->addRow(providerBody);
+	form->addRow(keyBody);
+
+	auto note = SecondaryLabel(QString());
+	section->bodyLayout()->addWidget(note);
+	auto problem = SecondaryLabel(QString());
+	section->bodyLayout()->addWidget(problem);
+
+	/* Offered, not wired yet: fetching the service's own recommendation needs the provider's config
+	 * download, which is the step after this one. The button keeps its own width: stretched across the
+	 * whole page it would read like a disabled text field, which is what it is. */
+	auto fetchButton = new QPushButton(QTStr("Basic.Settings.Stream.Destinations.Fetch"));
+	fetchButton->setEnabled(false);
+	fetchButton->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Fetch.Pending"));
+	auto fetchRow = new QHBoxLayout;
+	fetchRow->setContentsMargins(0, 0, 0, 0);
+	fetchRow->addWidget(fetchButton);
+	fetchRow->addStretch();
+	section->bodyLayout()->addLayout(fetchRow);
+
+	/* Which group of fields the choice shows. */
+	auto showFor = [choice, customBody, providerBody, keyBody]() {
+		const int which = choice->currentData().toInt();
+		const bool custom = (which == (int)EndpointChoice::CustomServer);
+		const bool provider = (which == (int)EndpointChoice::KnownProvider);
+		customBody->setVisible(custom);
+		providerBody->setVisible(provider);
+		keyBody->setVisible(custom || provider);
+	};
+
+	/* What the choice means, in words that can be read before Apply: the profile's service for one kind,
+	 * the ingest the chosen provider uploads to for the other, and the plain truth for a destination that
+	 * has nowhere to send anything. Read-only - nothing here touches the model. */
+	auto describe = [this, choice, providerList, ingestNote, note]() {
+		const int which = choice->currentData().toInt();
+
+		switch (which) {
+		case (int)EndpointChoice::CustomServer:
+			note->setText(QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint.Custom.Note"));
+			break;
+		case (int)EndpointChoice::KnownProvider: {
+			const ProviderIngest ingest = ResolveProviderIngest(providerList->currentText());
+			ingestNote->setText(
+				ingest.server.isEmpty()
+					? QTStr("Basic.Settings.Stream.Destinations.Service.Ingest.Unknown")
+					: QTStr("Basic.Settings.Stream.Destinations.Service.Ingest").arg(ingest.server));
+			note->setText(QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint.Provider.Note"));
+			break;
+		}
+		case (int)EndpointChoice::ProfileDefault: {
+			const auto profile = destinationEdits.profileServiceEndpoint();
+			QString where;
+			if (!profile.provider.empty())
+				where = QString::fromStdString(profile.provider);
+			else if (!profile.server.empty())
+				where = QString::fromStdString(profile.server);
+			else
+				where = QTStr("Basic.Settings.Stream.Destinations.Service.NotConfigured");
+			note->setText(
+				QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint.Profile.Note").arg(where));
+			break;
+		}
+		default:
+			note->setText(
+				destinationEdits.profileServiceAvailable()
+					? QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint.None.Note")
+					: QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint.None.NoProfile"));
+			break;
+		}
+	};
+
+	showFor();
+	describe();
+	if (!writable) {
+		note->setText(QTStr("Basic.Settings.Stream.Destinations.Service.Endpoint.Foreign")
+				      .arg(QString::fromStdString(destinationEdits.serviceDescription(id))));
+	}
+
+	/* A refused edit leaves the model holding the last endpoint that was usable, and the choice has to say
+	 * that: a card left showing "the profile's default service" while the destination really owns an
+	 * endpoint would describe a connection that is not going to happen. Signals are blocked while the combo
+	 * is put back, so this does not re-enter applyFields. */
+	auto restate_choice = [this, id, choice]() {
+		const auto ep = destinationEdits.serviceEndpoint(id);
+		EndpointChoice back = EndpointChoice::NotConfigured;
+		if (destinationEdits.ownsService(id))
+			back = (ep.type == "rtmp_common") ? EndpointChoice::KnownProvider
+							  : EndpointChoice::CustomServer;
+		else if (destinationEdits.followsProfileService(id))
+			back = EndpointChoice::ProfileDefault;
+
+		const int index = choice->findData((int)back);
+		if (index != -1 && index != choice->currentIndex()) {
+			const QSignalBlocker block(choice);
+			choice->setCurrentIndex(index);
+		}
+	};
+
+	/* One closure writes the endpoint from the fields as they stand, and nothing else stages the model. The
+	 * block's header line, this section's summary, the inline message and the Apply gate all come out of the
+	 * same call, so they cannot end up describing different states. `report` is non-null when Apply/OK
+	 * asked: the same text then also stops the save. */
+	auto applyFields = [this, id, choice, serverEdit, providerList, keyEdit, note, problem, section, restate_header,
+			    restate_choice, showFor, describe](QString *report) -> bool {
+		showFor();
+		describe();
+
+		const int which = choice->currentData().toInt();
+		QString error;
+		std::string conflicting;
+		bool ok = true;
+
+		if (which == (int)EndpointChoice::CustomServer) {
+			const QString server = serverEdit->text().trimmed();
+			if (server.isEmpty()) {
+				/* Half-typed. The destination goes to "no endpoint" rather than keeping a
+				 * staged value the fields no longer show, and Apply says so below. */
+				destinationEdits.clearService(id, false, nullptr, &error);
+				ok = false;
+				if (report)
+					*report = QTStr("Basic.Settings.Stream.Destinations.Service.Error.NeedServer");
+			} else {
+				OBSDataAutoRelease settings = obs_data_create();
+				obs_data_set_string(settings, "server", QT_TO_UTF8(server));
+				obs_data_set_string(settings, "key", QT_TO_UTF8(keyEdit->text().trimmed()));
+				const char *json = obs_data_get_json(settings);
+				ok = destinationEdits.setService(id, "rtmp_custom", json ? json : "", &conflicting,
+								 &error);
+			}
+		} else if (which == (int)EndpointChoice::KnownProvider) {
+			const QString provider = providerList->currentText();
+			const ProviderIngest ingest = ResolveProviderIngest(provider);
+
+			/* Written the way the Stream settings page writes its own service: the provider, its
+			 * protocol and the ingest it names, so the file says where the stream goes on its own. */
+			OBSDataAutoRelease settings = obs_data_create();
+			obs_data_set_string(settings, "service", QT_TO_UTF8(provider));
+			if (!ingest.protocol.isEmpty())
+				obs_data_set_string(settings, "protocol", QT_TO_UTF8(ingest.protocol));
+			obs_data_set_string(settings, "server", QT_TO_UTF8(ingest.server));
+			obs_data_set_string(settings, "key", QT_TO_UTF8(keyEdit->text().trimmed()));
+			const char *json = obs_data_get_json(settings);
+			ok = destinationEdits.setService(id, "rtmp_common", json ? json : "", &conflicting, &error);
+		} else {
+			ok = destinationEdits.clearService(id, which == (int)EndpointChoice::ProfileDefault,
+							   &conflicting, &error);
+		}
+
+		if (ok) {
+			problem->setText(QString());
+		} else if (!conflicting.empty()) {
+			const StreamingDestination *other = destinationEdits.find(conflicting);
+			const QString who = other ? QString::fromStdString(other->name)
+						  : QString::fromStdString(conflicting);
+			problem->setText(
+				QTStr("Basic.Settings.Stream.Destinations.Service.Error.DuplicateNamed").arg(who));
+			if (report)
+				*report = QTStr("Basic.Settings.Stream.Destinations.Service.Error.DuplicateNamed")
+						  .arg(who);
+
+			/* The card must not go on offering the state that was just refused. */
+			restate_choice();
+			showFor();
+			describe();
+		} else {
+			problem->setText(error);
+			if (report && !error.isEmpty())
+				*report = error;
+		}
+
+		/* The model holds whatever is usable - the last good endpoint when a field went bad - and that is
+		 * what a connection would use, so it is what the two summary lines say. */
+		section->setSummary(DestinationEndpointSummary(id));
+		restate_header();
+		TouchDestinations();
+		return ok;
+	};
+
+	connect(choice, &QComboBox::currentIndexChanged, this, [applyFields](int) { applyFields(nullptr); });
+	connect(serverEdit, &QLineEdit::textChanged, this, [applyFields](const QString &) { applyFields(nullptr); });
+	connect(keyEdit, &QLineEdit::textChanged, this, [applyFields](const QString &) { applyFields(nullptr); });
+	connect(providerList, &QComboBox::currentTextChanged, this,
+		[applyFields](const QString &) { applyFields(nullptr); });
+
+	/* The Apply/OK gate re-reads the fields, so a key that was typed but never left cannot be quietly
+	 * dropped by the save. The entry goes away with the block it belongs to. */
+	destinationServiceChecks[id] = [applyFields](QString *report) {
+		return applyFields(report);
+	};
+
+	section->setSummary(DestinationEndpointSummary(id));
+	return section;
+}
+
+void OBSBasicSettings::TouchDestinations()
+{
+	destinationsChanged = true;
+	EnableApplyButton(true);
+}
+
+/* One line saying where a destination uploads, built from the model rather than from the fields: the model is
+ * what a connection would use, a staged edit included, so the card's header line and the section's summary
+ * cannot drift from the endpoint the engine will pick up on Apply. */
+QString OBSBasicSettings::DestinationEndpointSummary(const std::string &id) const
+{
+	const auto text_of = [](const StreamingDestinations::ServiceEndpoint &ep) {
+		QString where;
+		if (!ep.provider.empty())
+			where = QString::fromStdString(ep.provider);
+		else if (!ep.server.empty())
+			where = QString::fromStdString(ep.server);
+		else
+			where = QString::fromStdString(ep.type);
+		if (!ep.key.empty())
+			where += QTStr("Basic.Settings.Stream.Destinations.Service.KeySet");
+		return where;
+	};
+
+	if (destinationEdits.ownsService(id)) {
+		const auto ep = destinationEdits.serviceEndpoint(id);
+		if (!ep.configured)
+			return QTStr("Basic.Settings.Stream.Destinations.Service.Own.NotConfigured");
+		return QTStr("Basic.Settings.Stream.Destinations.Service.Own").arg(text_of(ep));
+	}
+
+	if (destinationEdits.followsProfileService(id)) {
+		const auto profile = destinationEdits.profileServiceEndpoint();
+		if (!profile.configured)
+			return QTStr("Basic.Settings.Stream.Destinations.Service.Profile.Missing");
+		return QTStr("Basic.Settings.Stream.Destinations.Service.Profile").arg(text_of(profile));
+	}
+
+	return QTStr("Basic.Settings.Stream.Destinations.Service.NotConfigured");
+}
+
+/* The first endpoint a card leaves unusable, in a sentence that names the destination. Empty when every card
+ * can be saved as it stands - Apply/OK refuses to write the profile otherwise, because the alternative is a
+ * change that silently disappears. */
+QString OBSBasicSettings::DestinationServiceProblems()
+{
+	for (const auto &entry : destinationServiceChecks) {
+		QString problem;
+		if (entry.second(&problem))
+			continue;
+		if (problem.isEmpty())
+			problem = QTStr("Basic.Settings.Stream.Destinations.Service.Error.Incomplete");
+
+		const StreamingDestination *dest = destinationEdits.find(entry.first);
+		const QString who = dest ? QString::fromStdString(dest->name) : QString::fromStdString(entry.first);
+		return QTStr("Basic.Settings.Stream.Destinations.Service.Error.Named").arg(who).arg(problem);
+	}
+
+	return QString();
 }
 
 /* The order of the blocks is not cosmetic: the first enabled destination is what the legacy streaming API

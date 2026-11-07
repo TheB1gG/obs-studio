@@ -25,6 +25,7 @@
 
 #include <QPointer>
 
+#include <functional>
 #include <map>
 #include <string>
 
@@ -123,6 +124,11 @@ private:
 	QPointer<QTimer> destinationsStateTimer;
 	/* The dialog edits a copy: Apply/OK commits it into OBSBasic and to disk, Cancel drops it. */
 	StreamingDestinations destinationEdits;
+	/* The endpoint editor of each card, by destination id. Apply/OK runs these before saving: an endpoint
+	 * that is only half-typed, or that repeats another destination's stream key, stops the save with a
+	 * message instead of being quietly dropped. They live exactly as long as the blocks do - every rebuild
+	 * fills the map again. */
+	std::map<std::string, std::function<bool(QString *)>> destinationServiceChecks;
 
 	QPointer<QLabel> advOutRecWarning;
 
@@ -232,6 +238,19 @@ private:
 	void AddDestination();
 	void RenameDestination(const std::string &id);
 	void RemoveDestination(const std::string &id);
+	/* The "where does this stream go" part of a card: the endpoint editor, with its own summary line.
+	 * restate_header is how the block re-states its header line, which names the endpoint the card is
+	 * about to stream to - that line has to follow the fields as they are typed. */
+	QWidget *BuildDestinationServiceSection(const std::string &id, const std::function<void()> &restate_header);
+	/* One line naming where a destination uploads: its own server/provider, the profile's default service,
+	 * or nothing at all. Built from the model, which is what the connection will really use. */
+	QString DestinationEndpointSummary(const std::string &id) const;
+	/* An edit that changes no structure: the page is dirty and Apply is enabled, but the blocks keep their
+	 * widgets - a rebuild while somebody is typing a stream key would eat what they typed. */
+	void TouchDestinations();
+	/* The first endpoint the cards leave unusable, empty when all of them are fine. Apply/OK refuses to
+	 * save until that is fixed (QueryAllowedToClose). */
+	QString DestinationServiceProblems();
 
 	OBSPropertiesView *CreateEncoderPropertyView(const char *encoder, const char *path, bool changed = false);
 

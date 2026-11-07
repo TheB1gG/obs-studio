@@ -25,6 +25,34 @@ struct StreamingDestination {
 	 * still live in [Stream1] and are only written into [Stream-<id>] when the user changes one. */
 	bool inherits_legacy_section = false;
 
+	/* Where this destination gets its endpoint (the service it uploads to). Exactly one of the two
+	 * flags, or neither:
+	 *   owns_service            - service_<id>.json describes it; the user gave this destination a
+	 *                             server/key of its own on the Output page
+	 *   follows_profile_service - the profile's default service (service.json, the file the Stream
+	 *                             settings page writes) describes it
+	 *   neither                 - nothing configured: the destination cannot be started
+	 * The two flags are deliberately separate from inherits_legacy_section: that one also says whether
+	 * the other [Stream-<id>] keys fall back to [Stream1], and detaching an endpoint must not silently
+	 * change where the reconnect values come from. An imported destination carries
+	 * inherits_legacy_section, which implies following the profile's service, so a profile that used
+	 * the single-service layout keeps streaming where it always did until the card says otherwise. */
+	bool owns_service = false;
+	bool follows_profile_service = false;
+
+	/* A service edit that has not reached the disk yet. The settings dialog stages everything behind
+	 * Apply/OK and drops it on Cancel, so the flags above are already updated in memory while the file
+	 * write is still pending - which is what lets the page show the new endpoint in its header line
+	 * before anything has been written. */
+	enum class PendingService : unsigned char {
+		None,  /* nothing staged */
+		Write, /* write service_<id>.json from the two fields below */
+		Remove /* delete the file; the destination follows whatever is left */
+	};
+	PendingService pending_service = PendingService::None;
+	std::string service_type;     /* "rtmp_custom", "rtmp_common", ... */
+	std::string service_settings; /* the settings object as JSON */
+
 	std::string serviceFileName() const;
 	std::string tracksFileName() const;
 	std::string iniSection() const;
@@ -44,6 +72,12 @@ public:
 	static constexpr const char *name_key = "Name";
 	static constexpr const char *enabled_key = "Enabled";
 	static constexpr const char *inherits_key = "Inherits";
+	/* Which endpoint a destination uploads to, as described by the two flags of StreamingDestination:
+	 * OwnService names service_<id>.json, FollowsProfileService names the profile's service.json.
+	 * Written by Save() only once the user has chosen; a destination with neither key is not
+	 * configured and cannot be started. */
+	static constexpr const char *own_service_key = "OwnService";
+	static constexpr const char *follows_profile_key = "FollowsProfileService";
 	/* Q14: a destination may reconnect differently from the rest of the profile. ReconnectOverride is
 	 * the switch, so the three values below only mean anything when it is true; without it the
 	 * destination follows the profile-wide [Output] values that the hidden Advanced dialog edits.
@@ -93,9 +127,6 @@ public:
 	 * by a missing destination. The files are only deleted by the next Save(). */
 	bool destroy(std::string_view id, QString *error);
 
-	/* Q31: two destinations may use the same provider, but never the same stream key. */
-	bool sameServiceAndKey(const char *service_type, obs_data_t *settings, std::string *conflicting_id) const;
-
 	/* Files this profile needs for clone/export/import, beside the always-present ones. */
 	std::vector<std::string> profileFileNames() const;
 
@@ -123,9 +154,49 @@ public:
 	 * for a service that uses one. */
 	long long streamingAudioKbps(std::string_view id) const;
 	std::string serviceType(std::string_view id) const;
-	/* The service object of a destination, built from its own service_<id>.json. Every destination needs
-	 * one to start, and the settings page needs one before the engine exists. Null when the file is
-	 * missing or its service type is not registered. */
+
+	/* What one destination uploads to, however it is described: a staged edit while the settings dialog
+	 * holds one, otherwise the destination's own service_<id>.json, otherwise the profile's service.json
+	 * when the destination follows it. Everything is empty when nothing describes it - such a destination
+	 * cannot be started, which is the state a freshly added one is in until the user gives it an
+	 * endpoint. The provider/server split mirrors what the service settings of libobs hold: a provider
+	 * picked from the list of a known service fills in the ingest itself, a custom server is typed. */
+	struct ServiceEndpoint {
+		std::string type;     /* rtmp_custom, rtmp_common, whip_custom, ... */
+		std::string provider; /* settings.service */
+		std::string server;   /* settings.server */
+		std::string key;      /* settings.key */
+		bool configured = false;
+	};
+	ServiceEndpoint serviceEndpoint(std::string_view id) const;
+
+	/* Which of the two descriptions this destination uses, and what the profile's default service is
+	 * (the file the Stream settings page writes) for the page to name it. A destination with neither
+	 * flag is unconfigured; profileServiceAvailable() says whether there is a default to follow. */
+	bool ownsService(std::string_view id) const;
+	bool followsProfileService(std::string_view id) const;
+	bool profileServiceAvailable() const;
+	ServiceEndpoint profileServiceEndpoint() const;
+
+	/* Give a destination an endpoint of its own: settings_json is the service settings object as JSON
+	 * (the same shape the profile's service.json holds), so every field a service type needs survives -
+	 * the card editor only builds it, the model owns the file. Staged in memory until Save() writes
+	 * service_<id>.json, like every other change the settings dialog makes.
+	 * Refuses (and reports through conflicting_id) when another destination already uploads to the same
+	 * place with the same key - Q31: two destinations may serve the same provider, never the same
+	 * stream, and the second connection would only get an ingest's "already live" error. */
+	bool setService(std::string_view id, const std::string &type, const std::string &settings_json,
+			std::string *conflicting_id, QString *error);
+	/* Take the destination's own endpoint away again. follow_profile_service puts it back on the
+	 * profile's default service; with false it ends up with no endpoint at all. The file is deleted by
+	 * Save(), not here, so Cancel keeps the previous state. Following the profile's default service is
+	 * refused the same way setService() refuses, naming the destination that already uploads there. */
+	bool clearService(std::string_view id, bool follow_profile_service, std::string *conflicting_id,
+			  QString *error);
+
+	/* The service object of a destination, built from whatever describes it (a staged edit included, so
+	 * the settings page can preview a destination that has not been written yet). Every destination needs
+	 * one to start. Null when nothing describes it or its service type is not registered. */
 	OBSService createService(std::string_view id) const;
 
 	/* Resolved reconnect policy of one destination: the profile-wide [Output] values, replaced by the
@@ -165,11 +236,26 @@ private:
 	void writeTracksFile(const StreamingDestination &dest) const;
 	void removeDestinationFiles(const StreamingDestination &dest) const;
 	std::filesystem::path pathOf(const std::string &file_name) const;
-	/* Which service file describes one destination. A destination that still inherits the pre-multi-destination
-	 * layout *is* the profile's single service, so the Stream settings page's service.json describes it - the
-	 * service_<id>.json copy made at import only takes over once the destination is detached from [Stream1].
-	 * Same fallback idea as configString()/configBool()/configInt() reading the [Stream1] section. */
-	std::filesystem::path serviceFileOf(const StreamingDestination &dest) const;
+	/* What describes one destination's endpoint, and therefore where a connection uploads to: a staged
+	 * edit while the settings dialog holds one, its own service_<id>.json while owns_service is set, the
+	 * profile's service.json while the destination follows it (an imported destination does through
+	 * inherits_legacy_section, which is what keeps a single-service profile uploading where it always
+	 * did), or nothing at all - a destination with no endpoint cannot be started. Same fallback idea as
+	 * configString()/configBool()/configInt() reading the [Stream1] section. */
+	enum class ServiceSource : unsigned char { None, ProfileFile, OwnFile, Staged };
+	struct ServiceLookup {
+		ServiceSource source = ServiceSource::None;
+		std::filesystem::path file; /* the file the source names, empty otherwise */
+	};
+	ServiceLookup serviceLookup(const StreamingDestination &dest) const;
+	/* The endpoint of one destination as it stands right now: the staged fields or the file. */
+	ServiceEndpoint fileServiceEndpoint(const StreamingDestination &dest) const;
+	void writeServiceFile(const StreamingDestination &dest) const;
+	void removeServiceFile(const StreamingDestination &dest) const;
+	/* Q31: does any other destination upload to this same place with this same key? Names the one that
+	 * does. 'except_id' is the destination being changed, which is of course allowed to keep its own. */
+	bool sameServiceAndKey(const ServiceEndpoint &candidate, std::string_view except_id,
+			       std::string *conflicting_id) const;
 
 	config_t *config_ = nullptr;
 	std::filesystem::path dir_;

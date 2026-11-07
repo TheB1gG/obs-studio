@@ -3,11 +3,12 @@
 #include <util/base.h>
 #include <util/config-file.h>
 
+#include <OBSApp.hpp>
+
 #include <QString>
 
 #include <algorithm>
 #include <cctype>
-#include <cstring>
 
 namespace {
 
@@ -97,6 +98,29 @@ long long trackBitrate(obs_data_t *track)
 	return value > 0 ? value : 0;
 }
 
+/* The endpoint described by one service object, whichever file or staged edit it came from: the type
+ * plus the three settings fields the Output page edits. Everything else a service type carries
+ * (protocol, auth, bearer token, ...) stays inside the object - the page and the duplicate check only
+ * need to know where the stream goes, and createService() hands the whole object to libobs. */
+void endpointFromServiceData(obs_data_t *data, StreamingDestinations::ServiceEndpoint &out)
+{
+	if (!data)
+		return;
+
+	/* Same key and default as OBSBasic::LoadService() uses for the profile's own service file. */
+	obs_data_set_default_string(data, "type", "rtmp_common");
+	out.type = getString(data, "type");
+
+	OBSDataAutoRelease settings = obs_data_get_obj(data, "settings");
+	if (settings) {
+		out.provider = getString(settings, "service");
+		out.server = getString(settings, "server");
+		out.key = getString(settings, "key");
+	}
+
+	out.configured = !out.type.empty();
+}
+
 } // namespace
 
 std::string StreamingDestination::serviceFileName() const
@@ -146,6 +170,11 @@ void StreamingDestinations::Load(config_t *profile_config, const std::filesystem
 				       ? config_get_bool(config_, section.c_str(), enabled_key)
 				       : true;
 		dest.inherits_legacy_section = config_has_user_value(config_, section.c_str(), inherits_key);
+		/* Which file describes this destination's endpoint. Both keys default to false, so a
+		 * destination added through the page and never given a server of its own has neither and
+		 * simply is not configured yet. */
+		dest.owns_service = config_get_bool(config_, section.c_str(), own_service_key);
+		dest.follows_profile_service = config_get_bool(config_, section.c_str(), follows_profile_key);
 
 		destinations_.push_back(std::move(dest));
 	}
@@ -167,10 +196,44 @@ bool StreamingDestinations::Save()
 			config_set_string(config_, section.c_str(), inherits_key, legacy_stream_section);
 		else
 			config_remove_value(config_, section.c_str(), inherits_key);
+
+		/* The endpoint state is the presence of a key: no OwnService key means the destination does
+		 * not keep a service file of its own, no FollowsProfileService key means it does not follow
+		 * the profile's default service. Writing the absence rather than "false" keeps a hand-edited
+		 * basic.ini readable, and keeps the two states from ever being both true. */
+		if (dest.owns_service)
+			config_set_bool(config_, section.c_str(), own_service_key, true);
+		else
+			config_remove_value(config_, section.c_str(), own_service_key);
+
+		if (dest.follows_profile_service)
+			config_set_bool(config_, section.c_str(), follows_profile_key, true);
+		else
+			config_remove_value(config_, section.c_str(), follows_profile_key);
 	}
 
 	for (const auto &dest : destinations_)
 		writeTracksFile(dest);
+
+	/* The service edits the page staged. Written after the ini keys so the two always agree: the file
+	 * a destination owns exists at the moment OwnService is in the profile, and it is gone again when
+	 * the key is not. Reading a service file that the flags do not point at would put an old endpoint
+	 * back into use, which is why the removal is done here and not at edit time. */
+	for (auto &dest : destinations_) {
+		switch (dest.pending_service) {
+		case StreamingDestination::PendingService::Write:
+			writeServiceFile(dest);
+			break;
+		case StreamingDestination::PendingService::Remove:
+			removeServiceFile(dest);
+			break;
+		case StreamingDestination::PendingService::None:
+			break;
+		}
+		dest.pending_service = StreamingDestination::PendingService::None;
+		dest.service_type.clear();
+		dest.service_settings.clear();
+	}
 
 	for (const std::string &removed : pending_removals_) {
 		StreamingDestination gone;
@@ -267,9 +330,7 @@ StreamingDestination *StreamingDestinations::createWithId(std::string_view reque
 {
 	if (!idUsable(requested_id)) {
 		if (error)
-			*error = QString("The id '%1' cannot be used: 1-32 characters from a-z, 0-9, '_' or '-', "
-					 "starting with a letter or a digit, and never reused after a destination "
-					 "was removed.")
+			*error = QTStr("Basic.Settings.Stream.Destinations.Id.Invalid")
 					 .arg(QString::fromStdString(std::string(requested_id)));
 		return nullptr;
 	}
@@ -402,30 +463,123 @@ long long StreamingDestinations::totalUploadKbps() const
 	return total;
 }
 
-std::filesystem::path StreamingDestinations::serviceFileOf(const StreamingDestination &dest) const
+StreamingDestinations::ServiceLookup StreamingDestinations::serviceLookup(const StreamingDestination &dest) const
 {
-	if (dest.inherits_legacy_section) {
-		std::error_code ec;
-		const std::filesystem::path legacy = pathOf(legacy_service_file);
-		if (std::filesystem::exists(legacy, ec))
-			return legacy;
+	ServiceLookup out;
+
+	if (dest.pending_service == StreamingDestination::PendingService::Write) {
+		out.source = ServiceSource::Staged;
+		return out;
 	}
-	return pathOf(dest.serviceFileName());
+
+	/* A staged removal means the destination no longer uploads where its own file says even though
+	 * Save() has not deleted that file yet, so the own file is not an option from here on - only the
+	 * profile's default service is. */
+	if (dest.pending_service != StreamingDestination::PendingService::Remove && dest.owns_service) {
+		out.source = ServiceSource::OwnFile;
+		out.file = pathOf(dest.serviceFileName());
+		return out;
+	}
+
+	if (dest.follows_profile_service || dest.inherits_legacy_section) {
+		std::error_code ec;
+		const std::filesystem::path profile_service = pathOf(legacy_service_file);
+		if (std::filesystem::exists(profile_service, ec)) {
+			out.source = ServiceSource::ProfileFile;
+			out.file = profile_service;
+			return out;
+		}
+	}
+
+	/* Nothing describes it - a destination the page added and never gave an endpoint. The flags decide
+	 * this rather than whether a service_<id>.json happens to sit in the profile: a file no key points
+	 * at must not silently put an old stream key back into use. */
+	return out;
+}
+
+StreamingDestinations::ServiceEndpoint
+StreamingDestinations::fileServiceEndpoint(const StreamingDestination &dest) const
+{
+	ServiceEndpoint out;
+	const ServiceLookup lookup = serviceLookup(dest);
+
+	if (lookup.source == ServiceSource::Staged) {
+		out.type = dest.service_type;
+		OBSDataAutoRelease settings = obs_data_create_from_json(dest.service_settings.c_str());
+		if (settings) {
+			out.provider = getString(settings, "service");
+			out.server = getString(settings, "server");
+			out.key = getString(settings, "key");
+		}
+		out.configured = !out.type.empty();
+		return out;
+	}
+
+	if (lookup.source == ServiceSource::None)
+		return out;
+
+	OBSDataAutoRelease data = obs_data_create_from_json_file_safe(lookup.file.u8string().c_str(), "bak");
+	endpointFromServiceData(data, out);
+	return out;
+}
+
+StreamingDestinations::ServiceEndpoint StreamingDestinations::serviceEndpoint(std::string_view id) const
+{
+	const StreamingDestination *dest = find(id);
+	if (!dest)
+		return ServiceEndpoint();
+
+	return fileServiceEndpoint(*dest);
+}
+
+bool StreamingDestinations::ownsService(std::string_view id) const
+{
+	const StreamingDestination *dest = find(id);
+	if (!dest)
+		return false;
+	if (dest->pending_service == StreamingDestination::PendingService::Write)
+		return true;
+	if (dest->pending_service == StreamingDestination::PendingService::Remove)
+		return false;
+
+	return dest->owns_service;
+}
+
+bool StreamingDestinations::followsProfileService(std::string_view id) const
+{
+	const StreamingDestination *dest = find(id);
+	if (!dest)
+		return false;
+	if (dest->pending_service == StreamingDestination::PendingService::Write)
+		return false;
+
+	/* The destination imported from the single-service layout *is* the profile's one service, so it
+	 * follows service.json without a key of its own. */
+	return dest->follows_profile_service || dest->inherits_legacy_section;
+}
+
+bool StreamingDestinations::profileServiceAvailable() const
+{
+	std::error_code ec;
+	return std::filesystem::exists(pathOf(legacy_service_file), ec);
+}
+
+StreamingDestinations::ServiceEndpoint StreamingDestinations::profileServiceEndpoint() const
+{
+	ServiceEndpoint out;
+	std::error_code ec;
+	const std::filesystem::path file = pathOf(legacy_service_file);
+	if (!std::filesystem::exists(file, ec))
+		return out;
+
+	OBSDataAutoRelease data = obs_data_create_from_json_file_safe(file.u8string().c_str(), "bak");
+	endpointFromServiceData(data, out);
+	return out;
 }
 
 std::string StreamingDestinations::serviceType(std::string_view id) const
 {
-	const StreamingDestination *dest = find(id);
-	if (!dest)
-		return std::string();
-
-	OBSDataAutoRelease data = obs_data_create_from_json_file_safe(serviceFileOf(*dest).u8string().c_str(), "bak");
-	if (!data)
-		return std::string();
-
-	/* Same key and default as OBSBasic::LoadService() uses for the profile's own service file. */
-	obs_data_set_default_string(data, "type", "rtmp_common");
-	return obs_data_get_string(data, "type");
+	return serviceEndpoint(id).type;
 }
 
 OBSService StreamingDestinations::createService(std::string_view id) const
@@ -434,17 +588,36 @@ OBSService StreamingDestinations::createService(std::string_view id) const
 	if (!dest)
 		return OBSService();
 
-	/* Through serviceFileOf(): an inheriting destination is described by the profile's service.json, so a
-	 * service change made in the Stream settings page is what this connection actually uploads to. */
-	OBSDataAutoRelease data = obs_data_create_from_json_file_safe(serviceFileOf(*dest).u8string().c_str(), "bak");
-	if (!data) {
-		blog(LOG_WARNING, "streaming destination '%.*s' has no readable service file",
+	/* Whatever describes the endpoint: the page's staged edit first, then the destination's own file,
+	 * then the profile's default service for a destination that follows it. A destination with none of
+	 * those cannot be started, and says so. */
+	const ServiceLookup lookup = serviceLookup(*dest);
+	OBSDataAutoRelease data = nullptr;
+	const char *type = nullptr;
+
+	if (lookup.source == ServiceSource::Staged) {
+		data = obs_data_create();
+		obs_data_set_string(data, "type", dest->service_type.c_str());
+		OBSDataAutoRelease staged = obs_data_create_from_json(dest->service_settings.c_str());
+		if (staged)
+			obs_data_set_obj(data, "settings", staged);
+		type = dest->service_type.c_str();
+	} else if (lookup.source == ServiceSource::None) {
+		blog(LOG_WARNING,
+		     "streaming destination '%.*s' has no endpoint: no service of its own, and it follows no default",
 		     static_cast<int>(id.size()), id.data());
 		return OBSService();
-	}
+	} else {
+		data = obs_data_create_from_json_file_safe(lookup.file.u8string().c_str(), "bak");
+		if (!data) {
+			blog(LOG_WARNING, "streaming destination '%.*s' has no readable service file",
+			     static_cast<int>(id.size()), id.data());
+			return OBSService();
+		}
 
-	obs_data_set_default_string(data, "type", "rtmp_common");
-	const char *type = obs_data_get_string(data, "type");
+		obs_data_set_default_string(data, "type", "rtmp_common");
+		type = obs_data_get_string(data, "type");
+	}
 
 	OBSDataAutoRelease settings = obs_data_get_obj(data, "settings");
 	OBSDataAutoRelease hotkeys = obs_data_get_obj(data, "hotkeys");
@@ -454,6 +627,92 @@ OBSService StreamingDestinations::createService(std::string_view id) const
 		blog(LOG_WARNING, "streaming destination '%.*s': service type '%s' is not available",
 		     static_cast<int>(id.size()), id.data(), type ? type : "");
 	return service;
+}
+
+bool StreamingDestinations::setService(std::string_view id, const std::string &type, const std::string &settings_json,
+				       std::string *conflicting_id, QString *error)
+{
+	StreamingDestination *dest = find(id);
+	if (!dest) {
+		if (error)
+			*error = QTStr("Basic.Settings.Stream.Destinations.Service.Error.Gone");
+		return false;
+	}
+
+	if (type.empty() || settings_json.empty()) {
+		if (error)
+			*error = QTStr("Basic.Settings.Stream.Destinations.Service.Error.Incomplete");
+		return false;
+	}
+
+	OBSDataAutoRelease settings = obs_data_create_from_json(settings_json.c_str());
+	if (!settings) {
+		blog(LOG_WARNING, "streaming destination '%.*s': the service settings could not be read",
+		     static_cast<int>(id.size()), id.data());
+		if (error)
+			*error = QTStr("Basic.Settings.Stream.Destinations.Service.Error.Incomplete");
+		return false;
+	}
+
+	/* Q31 first: an endpoint is only usable when no other destination is already uploading there with
+	 * this key. Checked against what the others actually use, staged edits included, because two
+	 * destinations edited one after the other must not end up as one stream twice. */
+	ServiceEndpoint candidate;
+	candidate.type = type;
+	candidate.provider = getString(settings, "service");
+	candidate.server = getString(settings, "server");
+	candidate.key = getString(settings, "key");
+	candidate.configured = true;
+
+	if (sameServiceAndKey(candidate, dest->id, conflicting_id))
+		return false;
+
+	dest->owns_service = true;
+	dest->follows_profile_service = false;
+	dest->pending_service = StreamingDestination::PendingService::Write;
+	dest->service_type = type;
+	dest->service_settings = settings_json;
+
+	if (error)
+		error->clear();
+	return true;
+}
+
+bool StreamingDestinations::clearService(std::string_view id, bool follow_profile_service, std::string *conflicting_id,
+					 QString *error)
+{
+	StreamingDestination *dest = find(id);
+	if (!dest) {
+		if (error)
+			*error = QTStr("Basic.Settings.Stream.Destinations.Service.Error.Gone");
+		return false;
+	}
+
+	if (follow_profile_service) {
+		if (!profileServiceAvailable()) {
+			if (error)
+				*error = QTStr("Basic.Settings.Stream.Destinations.Service.Error.NoProfileService");
+			return false;
+		}
+
+		/* Same rule as setService(): a destination put back onto the profile's default service must
+		 * not become the second connection to a stream another destination already makes. */
+		if (sameServiceAndKey(profileServiceEndpoint(), dest->id, conflicting_id)) {
+			if (error && (conflicting_id == nullptr || conflicting_id->empty()))
+				*error = QTStr("Basic.Settings.Stream.Destinations.Service.Error.Duplicate");
+			return false;
+		}
+	}
+
+	dest->owns_service = false;
+	dest->follows_profile_service = follow_profile_service;
+	dest->pending_service = StreamingDestination::PendingService::Remove;
+	dest->service_type.clear();
+	dest->service_settings.clear();
+
+	if (error)
+		error->clear();
+	return true;
 }
 
 bool StreamingDestinations::usesVodTrack(std::string_view id) const
@@ -502,11 +761,9 @@ bool StreamingDestinations::destroy(std::string_view id, QString *error)
 			continue;
 		if (references(other.id, dest->id)) {
 			if (error)
-				*error =
-					QString("Destination '%1' still sends a track shared from '%2'. Give it its own "
-						"track before removing '%2'.")
-						.arg(QString::fromStdString(other.name))
-						.arg(QString::fromStdString(dest->name));
+				*error = QTStr("Basic.Settings.Stream.Destinations.Remove.Referenced")
+						 .arg(QString::fromStdString(other.name))
+						 .arg(QString::fromStdString(dest->name));
 			return false;
 		}
 	}
@@ -521,39 +778,33 @@ bool StreamingDestinations::destroy(std::string_view id, QString *error)
 	return true;
 }
 
-bool StreamingDestinations::sameServiceAndKey(const char *service_type, obs_data_t *settings,
+bool StreamingDestinations::sameServiceAndKey(const ServiceEndpoint &candidate, std::string_view except_id,
 					      std::string *conflicting_id) const
 {
-	if (!service_type || !settings)
-		return false;
-
-	const std::string key = getString(settings, "key");
-	if (key.empty())
+	if (!candidate.configured || candidate.key.empty())
 		return false; /* nothing configured yet, so nothing can collide */
 
-	const std::string provider = getString(settings, "service");
-	const std::string server = getString(settings, "server");
-
 	for (const auto &dest : destinations_) {
-		OBSDataAutoRelease data =
-			obs_data_create_from_json_file_safe(pathOf(dest.serviceFileName()).u8string().c_str(), "bak");
-		if (!data)
+		if (dest.id == except_id)
 			continue;
 
-		OBSDataAutoRelease other_settings = obs_data_get_obj(data, "settings");
-		if (!other_settings)
+		/* Through fileServiceEndpoint(): a destination that follows the profile's default service is
+		 * compared with that service, and one the page holds an edit for is compared with what it is
+		 * about to become - otherwise two cards could each pass this check against a state the other
+		 * one is about to leave. */
+		const ServiceEndpoint other = fileServiceEndpoint(dest);
+		if (other.key.empty() || other.key != candidate.key)
 			continue;
 
-		const std::string other_key = getString(other_settings, "key");
-		if (other_key.empty() || other_key != key)
-			continue;
-
-		const std::string other_type = getString(data, "type");
+		/* Same key at the same place. Two destinations may use one provider with different keys -
+		 * that is what streaming to several places is for - and one key at two ingests is nobody's
+		 * business, but one key twice at one ingest is a second connection the ingest refuses. For
+		 * rtmp_common the provider names its own ingest, so the provider is the place. */
 		bool same_target;
-		if (strcmp(service_type, "rtmp_common") == 0 && other_type == "rtmp_common")
-			same_target = ieq(getString(other_settings, "service"), provider);
+		if (candidate.type == "rtmp_common" && other.type == "rtmp_common")
+			same_target = ieq(other.provider, candidate.provider);
 		else
-			same_target = other_type == service_type && ieq(server, getString(other_settings, "server"));
+			same_target = other.type == candidate.type && ieq(other.server, candidate.server);
 
 		if (same_target) {
 			if (conflicting_id)
@@ -565,12 +816,48 @@ bool StreamingDestinations::sameServiceAndKey(const char *service_type, obs_data
 	return false;
 }
 
+/* The shape of a destination's own service file is the shape of the profile's service.json: a type plus a
+ * settings object, so libobs reads both the same way. Written by Save() from the staged edit, which is what
+ * keeps a Cancelled dialog from leaving an endpoint behind. Destination services carry no hotkeys of their
+ * own - the profile service's hotkeys stay where they are. */
+void StreamingDestinations::writeServiceFile(const StreamingDestination &dest) const
+{
+	OBSDataAutoRelease data = obs_data_create();
+	obs_data_set_string(data, "type", dest.service_type.c_str());
+
+	OBSDataAutoRelease settings = obs_data_create_from_json(dest.service_settings.c_str());
+	if (settings)
+		obs_data_set_obj(data, "settings", settings);
+
+	const std::filesystem::path path = pathOf(dest.serviceFileName());
+	if (!obs_data_save_json_safe(data, path.u8string().c_str(), "tmp", "bak"))
+		blog(LOG_WARNING, "Failed to write the service file of streaming destination '%s'", dest.id.c_str());
+}
+
+void StreamingDestinations::removeServiceFile(const StreamingDestination &dest) const
+{
+	std::error_code ec;
+	const std::filesystem::path path = pathOf(dest.serviceFileName());
+	std::filesystem::remove(path, ec);
+	if (ec)
+		blog(LOG_WARNING, "Failed to remove the service file of streaming destination '%s': %s",
+		     dest.id.c_str(), ec.message().c_str());
+
+	/* obs_data_save_json_safe() keeps a backup and may leave a temp file behind. */
+	std::filesystem::remove(std::filesystem::path(path.u8string() + ".bak"), ec);
+	std::filesystem::remove(std::filesystem::path(path.u8string() + ".tmp"), ec);
+}
+
 std::vector<std::string> StreamingDestinations::profileFileNames() const
 {
 	std::vector<std::string> out;
 	out.reserve(destinations_.size() * 2);
 	for (const auto &dest : destinations_) {
-		out.push_back(dest.serviceFileName());
+		/* Only the service files a destination actually owns: a profile that copies its files must not
+		 * carry a service_<id>.json that its own ini says is unused - that file would then win again
+		 * after an import, once the flags are read on the other side. */
+		if (dest.owns_service)
+			out.push_back(dest.serviceFileName());
 		out.push_back(dest.tracksFileName());
 	}
 	return out;
@@ -578,28 +865,20 @@ std::vector<std::string> StreamingDestinations::profileFileNames() const
 
 std::string StreamingDestinations::serviceDescription(std::string_view id) const
 {
-	const StreamingDestination *dest = find(id);
-	if (!dest)
+	/* Through serviceEndpoint(): whatever describes this destination right now, so the summary line of a
+	 * card says where the connection would actually go - its own endpoint, the profile's default, or a
+	 * change the page has staged but not written yet. */
+	const ServiceEndpoint endpoint = serviceEndpoint(id);
+	if (!endpoint.configured)
 		return {};
 
-	OBSDataAutoRelease data =
-		obs_data_create_from_json_file_safe(pathOf(dest->serviceFileName()).u8string().c_str(), "bak");
-	if (!data)
-		return {};
+	std::string out = endpoint.type;
+	if (!endpoint.provider.empty())
+		out += " / " + endpoint.provider;
+	else if (!endpoint.server.empty())
+		out += " / " + endpoint.server;
 
-	std::string out = getString(data, "type");
-	OBSDataAutoRelease settings = obs_data_get_obj(data, "settings");
-	if (!settings)
-		return out;
-
-	const std::string provider = getString(settings, "service");
-	const std::string server = getString(settings, "server");
-	if (!provider.empty())
-		out += " / " + provider;
-	else if (!server.empty())
-		out += " / " + server;
-
-	if (!getString(settings, "key").empty())
+	if (!endpoint.key.empty())
 		out += " (*)"; /* (*) = a stream key is set */
 
 	return out;
@@ -754,15 +1033,14 @@ bool StreamingDestinations::importLegacyLayout()
 	dest.name = dest.id;
 	dest.enabled = true;
 	dest.inherits_legacy_section = true;
+	/* The destination this import creates *is* the profile's single service, so it says so through the
+	 * endpoint state instead of through a copy of the file: what it uploads to stays whatever the Stream
+	 * settings page writes into service.json until the Output page gives it an endpoint of its own.
+	 * A service_<id>.json left over in a profile by an earlier build of this fork is deliberately
+	 * ignored - no OwnService key points at it, and a file the flags do not name must not silently put
+	 * an old stream key back into use. */
+	dest.follows_profile_service = true;
 	destinations_.push_back(dest);
-
-	/* service.json is left in place: the engine still loads its single service from there until the
-	 * output handler starts using the per-destination copies, and the original stays as the fallback
-	 * if this feature is switched off again. */
-	std::filesystem::copy(legacy, pathOf(dest.serviceFileName()), std::filesystem::copy_options::skip_existing, ec);
-	if (ec)
-		blog(LOG_WARNING, "Streaming destination import: failed to copy '%s' to '%s': %s", legacy_service_file,
-		     dest.serviceFileName().c_str(), ec.message().c_str());
 
 	Save();
 	blog(LOG_INFO, "Imported the single-service configuration as streaming destination '%s'", dest.id.c_str());
