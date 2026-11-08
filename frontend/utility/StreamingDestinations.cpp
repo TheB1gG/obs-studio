@@ -626,6 +626,10 @@ OBSService StreamingDestinations::createService(std::string_view id) const
 	if (!service)
 		blog(LOG_WARNING, "streaming destination '%.*s': service type '%s' is not available",
 		     static_cast<int>(id.size()), id.data(), type ? type : "");
+	/* The create reference belongs to nobody: OBSService's constructor took a reference of its own, so
+	 * keeping the create one means the service outlives every owner and is still registered when
+	 * obs_shutdown() has unloaded the plugins. */
+	obs_service_release(service);
 	return service;
 }
 

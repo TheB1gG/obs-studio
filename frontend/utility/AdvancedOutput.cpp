@@ -1046,11 +1046,19 @@ bool AdvancedOutput::StartDestinationOutput(const StreamingDestination &dest)
 	stream->name = dest.name;
 	stream->owner = main;
 	stream->service = service;
-	stream->output = obs_output_create(type, dest.id.c_str(), nullptr, nullptr);
-	if (!stream->output) {
+	/* The create reference belongs to this entry, and OBSSafeRef's assignment takes a reference of its own:
+	 * assigning the create result straight into the wrapper leaves the object with one owner more than
+	 * anybody holds. That extra reference is what kept a destination output alive after its session ended,
+	 * until obs_free_data() destroyed it - after obs_shutdown() had already unloaded the encoder plugins, so
+	 * the destroy pointer of the audio encoder it still carried read back as zero and libobs called it.
+	 * Handing the create reference back through the auto-release wrapper makes the entry the only owner, so
+	 * the output goes away with the entry. */
+	OBSOutputAutoRelease created = obs_output_create(type, dest.id.c_str(), nullptr, nullptr);
+	if (!created) {
 		markNotStarted("no output object could be created");
 		return false;
 	}
+	stream->output = created;
 
 	/* Same encoder attachment and connection settings as the primary output: both helpers are shared with
 	 * it on purpose, so the first connection of a session and the destinations behind it cannot be
