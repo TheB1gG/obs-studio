@@ -55,13 +55,20 @@ struct AdvancedOutput : BasicOutputHandler {
 	/* Slice 2b: the destinations after the first one. The first enabled destination keeps using the
 	 * existing streamOutput, which leaves the recording, delay and multitrack-video code untouched while
 	 * the loop is built; every other destination gets its own output object on top of the same encoders.
-	 * Sharing an encoder costs upload, not encoding, so this is about the connection, not the media. */
+	 * Sharing an encoder costs upload, not encoding, so this is about the connection, not the media -
+	 * unless a destination asked for a picture rate of its own, in which case it gets an encoder of its
+	 * own too and the destinations without an override keep sharing the profile's one. */
 	struct ExtraDestinationStream {
 		std::string id;
 		std::string name;
 		OBSBasic *owner = nullptr;
 		OBSService service;
 		OBSOutput output; /* released when the entry goes away */
+		/* The video encoder this connection uploads, when the destination asked for a picture rate of its
+		 * own (Q25's other half: one encoder per configuration, not one per connection). Empty while the
+		 * destination is fed by the profile's shared stream encoder, which is the default. It lives as
+		 * long as the entry: releasing it is what stops the encoder being fed frames. */
+		OBSEncoder videoEncoder;
 		OBSSignal stopSignal;
 		OBSSignal startSignal;
 		OBSSignal reconnectSignal;
@@ -78,6 +85,11 @@ struct AdvancedOutput : BasicOutputHandler {
 	 * here while the session runs: the runtime entry of that destination holds a borrowed pointer to it, just
 	 * like the extra destinations' own wrappers do. */
 	OBSService primaryConnectionService;
+	/* The video encoder of that first connection when its destination overrides the profile's bitrate. The
+	 * shared encoder is deliberately left at the profile's number, because every destination without an
+	 * override is fed by it; so the primary connection needs an encoder of its own instead of a retuned
+	 * shared one. Recreated with the session, like the output it is attached to. */
+	OBSEncoder primaryVideoEncoder;
 
 	void StartExtraDestinations();
 	void StopExtraDestinations(bool force) override;
@@ -88,11 +100,18 @@ struct AdvancedOutput : BasicOutputHandler {
 	bool StartDestination(std::string_view id) override;
 
 private:
-	/* Build one destination's output on the shared encoders and start it: the fan-out and the restart of a
-	 * single destination need exactly the same thing. */
+	/* Build one destination's output and start it: the fan-out and the restart of a single destination need
+	 * exactly the same thing. */
 	bool StartDestinationOutput(const StreamingDestination &dest);
 	/* The two halves of "what every connection of the session gets", shared with the handler's own primary
-	 * output so the first connection cannot be configured differently from the ones behind it. */
-	void AttachStreamEncoders(obs_output_t *output);
+	 * output so the first connection cannot be configured differently from the ones behind it. The video
+	 * encoder is the one this connection uploads: the shared stream encoder when the caller passes none. */
+	void AttachStreamEncoders(obs_output_t *output, obs_encoder_t *videoEncoder = nullptr);
 	void ApplyConnectionSettings(obs_output_t *output, bool dynBitrate);
+	/* A destination that asked for a picture rate of its own pays for an encoder of its own: the profile's
+	 * stream-encoder settings (same codec, defaults, scaling and frame-rate divisor), the destination's
+	 * bitrate, and the limits of the service *that destination* uploads to. Returns empty when the encoder
+	 * could not be built, after saying why. */
+	OBSEncoder CreateDestinationVideoEncoder(const std::string &id, const std::string &display_name, long long kbps,
+						 obs_service_t *service);
 };

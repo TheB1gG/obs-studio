@@ -395,18 +395,24 @@ StreamingDestinations::BitrateBreakdown StreamingDestinations::bitrateFor(std::s
 		}
 	}
 
-	/* No video tracks of its own: the destination is fed by the shared stream encoder, so its video bitrate
-	 * is the one in the encoder file the advanced settings write - whether it came from the single-stream
-	 * import or was added later. It is marked as shared so the page does not present it as a per-destination
-	 * value. */
+	/* No video tracks of its own, so what the destination uploads comes from an encoder: either one of its
+	 * own (the card asked for a picture rate, and the engine will build an encoder for this connection
+	 * alone), or the shared stream encoder the profile's advanced settings write. Only the second is marked
+	 * as shared, so the page never presents a per-destination value as somebody else's. */
 	if (info.videoKbps == 0) {
-		OBSDataAutoRelease legacy =
-			obs_data_create_from_json_file_safe(pathOf(legacy_encoder_file).u8string().c_str(), "bak");
-		if (legacy) {
-			const long long bitrate = obs_data_get_int(legacy, "bitrate");
-			if (bitrate > 0) {
-				info.videoKbps = bitrate;
-				info.shared_video = true;
+		const auto policy = videoBitratePolicy(id);
+		if (policy.overridden && policy.kbps > 0) {
+			info.videoKbps = policy.kbps;
+			info.own_encoder = true;
+		} else {
+			OBSDataAutoRelease legacy = obs_data_create_from_json_file_safe(
+				pathOf(legacy_encoder_file).u8string().c_str(), "bak");
+			if (legacy) {
+				const long long bitrate = obs_data_get_int(legacy, "bitrate");
+				if (bitrate > 0) {
+					info.videoKbps = bitrate;
+					info.shared_video = true;
+				}
 			}
 		}
 	}
@@ -1006,6 +1012,49 @@ void StreamingDestinations::setReconnectPolicy(std::string_view id, const Reconn
 	setConfigBool(id, reconnect_key, policy.enabled);
 	setConfigInt(id, retry_delay_key, policy.retryDelaySec);
 	setConfigInt(id, max_retries_key, policy.maxRetries);
+}
+
+/* The video bitrate of one destination, stored as the switch plus the number. Reading the number goes through
+ * the same [Stream1] fallback as every other [Stream-<id>] key, and defaults to what the shared encoder uploads
+ * so that turning the switch on in a half-edited file still means a real bitrate. */
+StreamingDestinations::VideoBitratePolicy StreamingDestinations::videoBitratePolicy(std::string_view id) const
+{
+	VideoBitratePolicy policy;
+
+	policy.overridden = configBool(id, video_bitrate_override_key, false);
+	if (policy.overridden)
+		policy.kbps = configInt(id, video_bitrate_key, profileVideoBitrateKbps());
+
+	return policy;
+}
+
+long long StreamingDestinations::profileVideoBitrateKbps() const
+{
+	if (dir_.empty())
+		return 0;
+
+	OBSDataAutoRelease data =
+		obs_data_create_from_json_file_safe(pathOf(legacy_encoder_file).u8string().c_str(), "bak");
+	if (!data)
+		return 0;
+
+	return obs_data_get_int(data, "bitrate");
+}
+
+/* Writing the switch off removes the number as well: a destination that does not own an encoder has no bitrate
+ * of its own, and a leftover value would be read again the moment the switch goes back on - which is what the
+ * card wants (it fills the field with the profile's number instead). */
+void StreamingDestinations::setVideoBitratePolicy(std::string_view id, const VideoBitratePolicy &policy)
+{
+	setConfigBool(id, video_bitrate_override_key, policy.overridden);
+	if (!policy.overridden) {
+		const StreamingDestination *dest = find(id);
+		if (config_ && dest)
+			config_remove_value(config_, dest->iniSection().c_str(), video_bitrate_key);
+		return;
+	}
+
+	setConfigInt(id, video_bitrate_key, policy.kbps);
 }
 
 bool StreamingDestinations::importLegacyLayout()

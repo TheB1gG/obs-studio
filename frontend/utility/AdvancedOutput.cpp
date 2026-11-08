@@ -723,7 +723,25 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 			outputType = type;
 		}
 
-		AttachStreamEncoders(streamOutput);
+		/* The first connection of a session is a destination like the ones behind it, so its card can ask
+		 * for a picture rate of its own too. It gets a second encoder rather than a retuned shared one,
+		 * because every destination without an override is fed by the shared encoder and must keep
+		 * uploading what the profile says.
+		 *
+		 * This runs only on the plain-output path: a multitrack-video session returns from its own
+		 * result handler above and never reaches here, so no encoder is created for a connection the
+		 * ingest negotiated by itself. If building one fails the session still starts on the shared
+		 * encoder with the reason in the log - failing a whole session over an optional override of the
+		 * first connection is worse than a session that says what it actually uploaded. */
+		primaryVideoEncoder = nullptr;
+		if (const StreamDestinationRuntime *primary = main->PrimaryRuntime(); primary && !primary->id.empty()) {
+			const auto policy = main->Destinations().videoBitratePolicy(primary->id);
+			if (policy.overridden && policy.kbps > 0)
+				primaryVideoEncoder =
+					CreateDestinationVideoEncoder(primary->id, primary->name, policy.kbps, service);
+		}
+
+		AttachStreamEncoders(streamOutput, primaryVideoEncoder);
 
 		return true;
 	};
@@ -734,15 +752,124 @@ std::shared_future<void> AdvancedOutput::SetupStreaming(obs_service_t *service,
 				    });
 }
 
-/* Attach the streaming encoders to one connection's output: the same video encoder and the same audio mix
- * for every connection of the session, a multitrack service getting its per-mix tracks. Both the handler's
- * own output and the destination outputs are wired through here, so the first connection of a session can
- * never send different media than the ones after it. */
-void AdvancedOutput::AttachStreamEncoders(obs_output_t *output)
+/* A destination that asked for a picture rate of its own pays for an encoder of its own. The starting point is
+ * the profile's stream-encoder settings - the same codec, the same defaults, the same scaling and frame-rate
+ * divisor - with one number replaced, and the limits applied are those of the service *this* destination
+ * uploads to, which is what a per-destination endpoint makes possible: a Twitch card gets Twitch's ceiling, an
+ * SRT card none at all.
+ *
+ * The shared encoder is never retouched here: every destination without an override is fed by it, so one card's
+ * number cannot change what another connection sends. That is the whole shape of the sharing rule - one encoder
+ * per distinct configuration, not one per connection. */
+OBSEncoder AdvancedOutput::CreateDestinationVideoEncoder(const std::string &id, const std::string &display_name,
+							long long kbps, obs_service_t *service)
+{
+	const char *encoder_id = config_get_string(main->Config(), "AdvOut", "Encoder");
+	if (!encoder_id || !*encoder_id) {
+		blog(LOG_WARNING, "streaming destination '%s' cannot get its own encoder: the profile names no stream encoder",
+		     display_name.c_str());
+		return nullptr;
+	}
+
+	OBSData settings = GetDataFromJsonFile("streamEncoder.json");
+	ApplyEncoderDefaults(settings, videoStreaming);
+
+	const long long requested = kbps;
+	obs_data_set_int(settings, "bitrate", requested);
+
+	/* The same two switches the shared encoder honours, read from the same places: whether the service gets
+	 * to say anything about the encoder at all, and whether the user asked to ignore the service's bitrate
+	 * recommendation. */
+	if (config_get_bool(main->Config(), "AdvOut", "ApplyServiceSettings")) {
+		const bool enforceBitrate = !config_get_bool(main->Config(), "Stream1", "IgnoreRecommended");
+		const int keyint_sec = (int)obs_data_get_int(settings, "keyint_sec");
+
+		if (service)
+			obs_service_apply_encoder_settings(service, settings, nullptr);
+
+		if (!enforceBitrate)
+			obs_data_set_int(settings, "bitrate", requested);
+
+		const long long applied = obs_data_get_int(settings, "bitrate");
+		if (applied != requested)
+			blog(LOG_INFO, "streaming destination '%s': its service changed the requested %lld kb/s to %lld kb/s",
+			     display_name.c_str(), requested, applied);
+
+		const int enforced_keyint_sec = (int)obs_data_get_int(settings, "keyint_sec");
+		if (keyint_sec != 0 && keyint_sec < enforced_keyint_sec)
+			obs_data_set_int(settings, "keyint_sec", keyint_sec);
+	} else {
+		blog(LOG_WARNING, "streaming destination '%s' gets its encoder settings without its service's limits",
+		     display_name.c_str());
+	}
+
+	if (config_get_bool(main->Config(), "Output", "DynamicBitrate") && strstr(encoder_id, "nvenc") != nullptr)
+		obs_data_set_bool(settings, "lookahead", false);
+
+	/* A bitrate says nothing to a rate control that is not bitrate-driven (CQP, IQ, CRF...); the number is
+	 * still written and the card still shows it, so the log has to be able to explain the difference. */
+	const char *rate_control = obs_data_get_string(settings, "rate_control");
+	if (rate_control && *rate_control && astrcmpi(rate_control, "CBR") != 0 && astrcmpi(rate_control, "VBR") != 0 &&
+	    astrcmpi(rate_control, "ABR") != 0)
+		blog(LOG_WARNING,
+		     "streaming destination '%s': its encoder uses rate control '%s', so its %lld kb/s does not mean "
+		     "what a CBR/VBR/ABR encoder's does",
+		     display_name.c_str(), rate_control, requested);
+
+	/* The object name is what the stats table calls the row, and the id is what survives renames - the
+	 * display name is not, so the row stays comparable across sessions. */
+	const std::string name = "adv_stream_" + id;
+
+	OBSEncoder encoder = obs_video_encoder_create(encoder_id, name.c_str(), settings, nullptr);
+	if (!encoder) {
+		blog(LOG_WARNING, "streaming destination '%s': creating its own video encoder (%s) failed",
+		     display_name.c_str(), encoder_id);
+		return nullptr;
+	}
+	obs_encoder_release(encoder); /* the create reference; the wrapper holds the assignment's own */
+
+	/* Same order as UpdateStreamSettings(): the divisor goes in before the settings update, so the encoder
+	 * backends see the effective frame rate in the same pass. */
+	uint32_t divisor = config_get_uint(main->Config(), "AdvOut", "StreamFpsDivisor");
+	if (divisor < 1)
+		divisor = 1;
+	obs_encoder_update_frame_rate_divisor(encoder, divisor);
+	obs_encoder_update(encoder, settings);
+
+	const char *rescaleRes = config_get_string(main->Config(), "AdvOut", "RescaleRes");
+	const int rescaleFilter = config_get_int(main->Config(), "AdvOut", "RescaleFilter");
+	uint32_t cx = 0, cy = 0;
+	if (rescaleFilter != OBS_SCALE_DISABLE && rescaleRes && *rescaleRes) {
+		if (sscanf(rescaleRes, "%ux%u", &cx, &cy) != 2) {
+			cx = 0;
+			cy = 0;
+		}
+	}
+	obs_encoder_set_scaled_size(encoder, cx, cy);
+	obs_encoder_set_gpu_scale_type(encoder, (obs_scale_type)rescaleFilter);
+	obs_encoder_set_frame_rate_divisor(encoder, divisor);
+
+	obs_encoder_set_video(encoder, obs_get_video());
+
+	blog(LOG_INFO,
+	     "streaming destination '%s' uploads %lld kb/s of video on an encoder of its own (%s); the profile's "
+	     "shared encoder stays as it is for the destinations without an override",
+	     display_name.c_str(), requested, encoder_id);
+
+	return encoder;
+}
+
+
+/* Attach the streaming encoders to one connection's output: the same audio mix for every connection of the
+ * session, a multitrack service getting its per-mix tracks, and the video encoder this connection was given -
+ * the profile's shared one when the caller has nothing of its own. Both the handler's own output and the
+ * destination outputs are wired through here, so a connection can only differ where the model says it does. */
+void AdvancedOutput::AttachStreamEncoders(obs_output_t *output, obs_encoder_t *videoEncoder)
 {
 	const int multiTrackAudioMixes = config_get_int(main->Config(), "AdvOut", "StreamMultiTrackAudioMixes");
 
-	obs_output_set_video_encoder(output, videoStreaming);
+	obs_encoder_t *video = videoEncoder ? videoEncoder : videoStreaming.Get();
+	obs_output_set_video_encoder(output, video);
 
 	if (!allowsMultiTrack()) {
 		obs_output_set_audio_encoder(output, streamAudioEnc, 0);
@@ -1041,11 +1168,41 @@ bool AdvancedOutput::StartDestinationOutput(const StreamingDestination &dest)
 		return false;
 	}
 
+	/* Q25's other half: a destination may upload a different picture rate than the rest of the session, and
+	 * then it cannot be fed by the shared encoder - it pays for one of its own, while the destinations
+	 * without an override keep using the profile's. Building it before the output exists keeps the failure
+	 * cheap: nothing has to be undone, and a connection is never left running on media the card did not ask
+	 * for. */
+	const auto bitrate_policy = destinations.videoBitratePolicy(dest.id);
+	const bool wants_own_encoder = bitrate_policy.overridden && bitrate_policy.kbps > 0;
+	if (wants_own_encoder && multitrackVideo && multitrackVideoActive) {
+		/* The encoders of a multitrack-video session are what the ingest negotiated; substituting one
+		 * here would send media the other side never agreed to receive. */
+		markNotStarted("a multitrack-video connection cannot change its picture rate on one destination");
+		return false;
+	}
+
 	auto stream = std::make_unique<ExtraDestinationStream>();
 	stream->id = dest.id;
 	stream->name = dest.name;
 	stream->owner = main;
 	stream->service = service;
+
+	if (wants_own_encoder) {
+		stream->videoEncoder = CreateDestinationVideoEncoder(dest.id, dest.name, bitrate_policy.kbps, service);
+		if (!stream->videoEncoder) {
+			markNotStarted("its own video encoder could not be created");
+			return false;
+		}
+	}
+
+	/* The create reference belongs to this entry, and OBSSafeRef's assignment takes a reference of its own:
+	 * assigning the create result straight into the wrapper leaves the object with one owner more than
+	 * anybody holds. That extra reference is what kept a destination output alive after its session ended,
+	 * until obs_free_data() destroyed it - after obs_shutdown() had already unloaded the encoder plugins, so
+	 * the destroy pointer of the audio encoder it still carried read back as zero and libobs called it.
+	 * Handing the create reference back through the auto-release wrapper makes the entry the only owner, so
+	 * the output goes away with the entry. */
 	/* The create reference belongs to this entry, and OBSSafeRef's assignment takes a reference of its own:
 	 * assigning the create result straight into the wrapper leaves the object with one owner more than
 	 * anybody holds. That extra reference is what kept a destination output alive after its session ended,
@@ -1060,10 +1217,10 @@ bool AdvancedOutput::StartDestinationOutput(const StreamingDestination &dest)
 	}
 	stream->output = created;
 
-	/* Same encoder attachment and connection settings as the primary output: both helpers are shared with
-	 * it on purpose, so the first connection of a session and the destinations behind it cannot be
-	 * configured differently. */
-	AttachStreamEncoders(stream->output);
+	/* Same attachment rules as the primary output - the same audio mix, and the video encoder this
+	 * destination was configured with: its own when the card asked for a picture rate, the profile's shared
+	 * encoder otherwise. */
+	AttachStreamEncoders(stream->output, stream->videoEncoder);
 
 	obs_output_set_service(stream->output, stream->service);
 

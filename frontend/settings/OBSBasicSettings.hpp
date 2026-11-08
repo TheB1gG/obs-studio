@@ -239,8 +239,8 @@ private:
 	void RenameDestination(const std::string &id);
 	void RemoveDestination(const std::string &id);
 	/* The "where does this stream go" part of a card: the endpoint editor, with its own summary line.
-	 * restate_header is how the block re-states its header line, which names the endpoint the card is
-	 * about to stream to - that line has to follow the fields as they are typed. */
+	 * restate_header is the card's restatement closure - it re-writes the block's header line and the cost
+	 * line from the model - because that line has to follow the fields as they are typed. */
 	QWidget *BuildDestinationServiceSection(const std::string &id, const std::function<void()> &restate_header);
 	/* One line naming where a destination uploads: its own server/provider, the profile's default service,
 	 * or nothing at all. Built from the model, which is what the connection will really use. */
@@ -248,6 +248,9 @@ private:
 	/* An edit that changes no structure: the page is dirty and Apply is enabled, but the blocks keep their
 	 * widgets - a rebuild while somebody is typing a stream key would eat what they typed. */
 	void TouchDestinations();
+	/* The page's total-upload line: the sum over the enabled cards. A card calls it whenever it restates
+	 * its own cost, so the bar and the cards are always the same computation. */
+	void UpdateDestinationsTotal();
 	/* The first endpoint the cards leave unusable, empty when all of them are fine. Apply/OK refuses to
 	 * save until that is fixed (QueryAllowedToClose). */
 	QString DestinationServiceProblems();

@@ -78,6 +78,13 @@ public:
 	 * configured and cannot be started. */
 	static constexpr const char *own_service_key = "OwnService";
 	static constexpr const char *follows_profile_key = "FollowsProfileService";
+	/* The picture rate one destination uploads. Every connection of a session is fed by the profile's single
+	 * stream encoder by default - sharing it costs upload bandwidth, not encoding time - so an override here
+	 * means something specific: the engine builds a video encoder of its own for this one connection, and
+	 * every destination without the key keeps using the shared one. Stored as the switch plus one number,
+	 * exactly like the reconnect override below. */
+	static constexpr const char *video_bitrate_override_key = "VideoBitrateOverride";
+	static constexpr const char *video_bitrate_key = "VideoBitrate";
 	/* Q14: a destination may reconnect differently from the rest of the profile. ReconnectOverride is
 	 * the switch, so the three values below only mean anything when it is true; without it the
 	 * destination follows the profile-wide [Output] values that the hidden Advanced dialog edits.
@@ -146,10 +153,28 @@ public:
 		long long videoKbps = 0;
 		long long audioKbps = 0;
 		bool shared_video = false;
+		/* True when the video number is the destination's own, because the destination asked for an
+		 * encoder of its own; the number is then not something another connection shares. */
+		bool own_encoder = false;
 	};
 	BitrateBreakdown bitrateFor(std::string_view id) const;
 	/* Sum over the enabled destinations - a disabled destination uploads nothing. */
 	long long totalUploadKbps() const;
+
+	/* A destination's own video bitrate, in kbps. Without the override the destination is fed by the shared
+	 * stream encoder and its bitrate is the profile's (streamEncoder.json); with it the engine creates a
+	 * second encoder for this connection alone, so the override can never change what another destination
+	 * uploads. It only speaks for a destination that has no video tracks of its own, where the per-track
+	 * values of stream_<id>.json already add up to a bitrate. */
+	struct VideoBitratePolicy {
+		bool overridden = false;
+		long long kbps = 0;
+	};
+	VideoBitratePolicy videoBitratePolicy(std::string_view id) const;
+	/* What the shared stream encoder uploads: the bitrate the profile's advanced video encoder settings
+	 * write into streamEncoder.json (0 when the file or the field is missing). */
+	long long profileVideoBitrateKbps() const;
+	void setVideoBitratePolicy(std::string_view id, const VideoBitratePolicy &policy);
 	/* The audio a destination's stream carries: the profile's selected mixes, plus the VOD track copy
 	 * for a service that uses one. */
 	long long streamingAudioKbps(std::string_view id) const;

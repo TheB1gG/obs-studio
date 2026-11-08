@@ -468,23 +468,8 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 			tracks == 0 ? QTStr("Basic.Settings.Stream.Destinations.Tracks.None")
 				    : QTStr("Basic.Settings.Stream.Destinations.Tracks.Count").arg(int(tracks));
 
-		/* What this destination will upload on its own. There is no capacity comparison here on
-		 * purpose: the number is information, not a warning. */
-		const auto bandwidth = destinations.bitrateFor(dest.id);
-		QString bandwidthText;
-		if (bandwidth.videoKbps == 0 && bandwidth.audioKbps == 0) {
-			bandwidthText = QTStr("Basic.Settings.Stream.Destinations.Bitrate.None");
-		} else {
-			bandwidthText = QTStr("Basic.Settings.Stream.Destinations.Bitrate.Value")
-						.arg(bandwidth.videoKbps)
-						.arg(bandwidth.audioKbps)
-						.arg(bandwidth.videoKbps + bandwidth.audioKbps);
-			if (bandwidth.shared_video)
-				bandwidthText += QTStr("Basic.Settings.Stream.Destinations.Bitrate.SharedVideo");
-		}
-		const QString totalText = bandwidth.videoKbps || bandwidth.audioKbps
-						  ? QString("%1 kbps").arg(bandwidth.videoKbps + bandwidth.audioKbps)
-						  : QString();
+		/* What the card uploads is computed once, by the cost closure below: the row, the section header
+		 * line and the block line all come from that one place. */
 
 		/* What it costs, in a section of its own: that number is the one worth comparing between
 		 * destinations, so it also sits in the section header line and stays visible when closed. */
@@ -497,23 +482,107 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		uploadForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
 		uploadSection->bodyLayout()->addLayout(uploadForm);
 		uploadForm->addRow(QTStr("Basic.Settings.Stream.Destinations.Tracks"), SecondaryLabel(tracksText));
-		uploadForm->addRow(SecondaryLabel(bandwidthText));
+		auto bandwidthRow = SecondaryLabel(QString());
+		uploadForm->addRow(bandwidthRow);
 		uploadForm->addRow(QTStr("Basic.Settings.Stream.Destinations.Recording"),
 				   SecondaryLabel(QTStr("Basic.Settings.Stream.Destinations.Recording.Session")));
 
-		/* The block's own line says which destination this is, where it goes and what it costs, so the
-		 * collapsed list can be scanned for the one the user means. The endpoint part of it comes from the
-		 * model and is re-stated by the Service section's editor as its fields change - which is why the
-		 * closure is built here and handed to that section when it is created below. */
-		auto restate_header = [this, summary, id = dest.id, totalText]() {
+		/* One closure answers "what does this card say it costs", reading the model rather than the
+		 * widgets: the row inside the section, the section's header line and the block's own line are all
+		 * written from the same numbers, so they cannot disagree. The block's line also carries where the
+		 * stream goes, which the endpoint editor restates as its fields change - and neither of the two
+		 * rebuilds the card, because a rebuild would throw away a half-typed stream key. */
+		auto restate_card = [this, id = dest.id, summary, uploadSection, bandwidthRow]() {
+			const auto bandwidth = destinationEdits.bitrateFor(id);
+			QString bandwidthText;
+			QString totalText;
+
+			if (bandwidth.videoKbps == 0 && bandwidth.audioKbps == 0) {
+				bandwidthText = QTStr("Basic.Settings.Stream.Destinations.Bitrate.None");
+			} else {
+				bandwidthText = QTStr("Basic.Settings.Stream.Destinations.Bitrate.Value")
+							.arg(bandwidth.videoKbps)
+							.arg(bandwidth.audioKbps)
+							.arg(bandwidth.videoKbps + bandwidth.audioKbps);
+				if (bandwidth.own_encoder)
+					bandwidthText += QTStr("Basic.Settings.Stream.Destinations.Bitrate.OwnVideo");
+				else if (bandwidth.shared_video)
+					bandwidthText +=
+						QTStr("Basic.Settings.Stream.Destinations.Bitrate.SharedVideo");
+
+				totalText = QString("%1 kbps").arg(bandwidth.videoKbps + bandwidth.audioKbps);
+			}
+
+			bandwidthRow->setText(bandwidthText);
+			uploadSection->setSummary(totalText);
+
 			QString headerText =
 				QString::fromStdString(id) + " \xE2\x80\xA2 " + DestinationEndpointSummary(id);
 			if (!totalText.isEmpty())
 				headerText += " \xE2\x80\xA2 " + totalText;
 			summary->setFullText(headerText);
+
+			UpdateDestinationsTotal();
 		};
-		restate_header();
-		uploadSection->setSummary(totalText);
+		restate_card();
+
+		/* Q25's other half, on the card: the picture rate this destination uploads. Left alone, the
+		 * destination is fed by the profile's single stream encoder - one encode serving every connection,
+		 * which costs upload bandwidth but no encoding time. Checking the box pays for an encoder of this
+		 * connection alone, and the engine caps that number by the service *this* destination uploads to
+		 * rather than by the profile's. */
+		const auto encoder_policy = destinations.videoBitratePolicy(dest.id);
+		const long long profile_kbps = destinations.profileVideoBitrateKbps();
+
+		auto ownEncoder = new QCheckBox(QTStr("Basic.Settings.Stream.Destinations.Encoder.Own"));
+		ownEncoder->setChecked(encoder_policy.overridden);
+		ownEncoder->setToolTip(QTStr("Basic.Settings.Stream.Destinations.Encoder.ToolTip"));
+		uploadSection->bodyLayout()->addWidget(ownEncoder);
+
+		auto encoderDetail = new QWidget;
+		auto encoderForm = new QFormLayout;
+		encoderForm->setContentsMargins(0, 0, 0, 0);
+		encoderForm->setHorizontalSpacing(10);
+		encoderForm->setLabelAlignment(Qt::AlignLeft | Qt::AlignTop);
+		encoderForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+		encoderDetail->setLayout(encoderForm);
+
+		auto encoderBitrate = new QSpinBox;
+		encoderBitrate->setRange(100, 50000);
+		encoderBitrate->setSuffix(QTStr("Basic.Settings.Stream.Destinations.Encoder.Suffix"));
+		const long long initial_kbps = encoder_policy.kbps > 0 ? encoder_policy.kbps : profile_kbps;
+		encoderBitrate->setValue(static_cast<int>(std::clamp<long long>(initial_kbps, 100, 50000)));
+		encoderForm->addRow(QTStr("Basic.Settings.Stream.Destinations.Encoder.Bitrate"), encoderBitrate);
+		uploadSection->bodyLayout()->addWidget(encoderDetail);
+
+		/* Said out loud, because it is the fact the checkbox changes: the number in this note is what the
+		 * other connections of the session upload, and it does not move. */
+		const QString shared_note =
+			profile_kbps > 0 ? QTStr("Basic.Settings.Stream.Destinations.Encoder.Shared").arg(profile_kbps)
+					 : QTStr("Basic.Settings.Stream.Destinations.Encoder.SharedUnknown");
+		auto encoderSharedNote = SecondaryLabel(shared_note);
+		uploadSection->bodyLayout()->addWidget(encoderSharedNote);
+
+		auto pushEncoder = [this, id = dest.id, ownEncoder, encoderBitrate, restate_card]() {
+			StreamingDestinations::VideoBitratePolicy policy;
+			policy.overridden = ownEncoder->isChecked();
+			if (policy.overridden)
+				policy.kbps = encoderBitrate->value();
+			destinationEdits.setVideoBitratePolicy(id, policy);
+			restate_card();
+			/* No rebuild: the number lives in the labels the closure restates, and a rebuild would
+			 * destroy the endpoint fields of this very card mid-edit. */
+			TouchDestinations();
+		};
+
+		connect(ownEncoder, &QCheckBox::toggled, encoderDetail, &QWidget::setVisible);
+		connect(ownEncoder, &QCheckBox::toggled, encoderSharedNote,
+			[encoderSharedNote](bool overridden) { encoderSharedNote->setVisible(!overridden); });
+		connect(ownEncoder, &QCheckBox::toggled, this, pushEncoder);
+		connect(encoderBitrate, &QSpinBox::valueChanged, this, pushEncoder);
+
+		encoderDetail->setVisible(encoder_policy.overridden);
+		encoderSharedNote->setVisible(!encoder_policy.overridden);
 
 		/* What happens when the link drops. */
 		auto connectionSection =
@@ -619,7 +688,7 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 		/* The endpoint editor goes at the top of the details, above the cost and the connection: it is
 		 * built last because it needs the header-line closure just above, and it re-states that line each
 		 * time one of its fields changes. */
-		detailsLayout->insertWidget(0, BuildDestinationServiceSection(id, restate_header));
+		detailsLayout->insertWidget(0, BuildDestinationServiceSection(id, restate_card));
 
 		DimBlockIfNeeded(block, !dest.enabled);
 		destinationsBlocksLayout->addWidget(block);
@@ -628,14 +697,21 @@ void OBSBasicSettings::RebuildDestinationBlocks()
 	if (destinationsEmptyLabel)
 		destinationsEmptyLabel->setVisible(list.empty());
 
-	if (destinationsTotalBitrateLabel) {
-		const long long total = destinations.totalUploadKbps();
-		destinationsTotalBitrateLabel->setText(
-			total > 0 ? QTStr("Basic.Settings.Stream.Destinations.TotalUpload").arg(total)
-				  : QTStr("Basic.Settings.Stream.Destinations.TotalUpload.None"));
-		destinationsTotalBitrateLabel->setToolTip(
-			QTStr("Basic.Settings.Stream.Destinations.TotalUpload.ToolTip"));
-	}
+	UpdateDestinationsTotal();
+}
+
+/* What the profile would upload altogether: the sum over the enabled cards, recomputed by every card that
+ * restates its own cost - one checkbox on one card moves the number the whole page reports. */
+void OBSBasicSettings::UpdateDestinationsTotal()
+{
+	if (!destinationsTotalBitrateLabel)
+		return;
+
+	const long long total = destinationEdits.totalUploadKbps();
+	destinationsTotalBitrateLabel->setText(
+		total > 0 ? QTStr("Basic.Settings.Stream.Destinations.TotalUpload").arg(total)
+			  : QTStr("Basic.Settings.Stream.Destinations.TotalUpload.None"));
+	destinationsTotalBitrateLabel->setToolTip(QTStr("Basic.Settings.Stream.Destinations.TotalUpload.ToolTip"));
 }
 
 /* The "where does this stream go" part of a destination card. Every card needs an answer, because each
