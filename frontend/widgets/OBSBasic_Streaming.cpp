@@ -116,8 +116,13 @@ void OBSBasic::NoteDestinationStopped(const std::string &id, long long code, con
 	 * destination is still attempting or uploading this was a per-destination failure, and StreamingStop
 	 * must not run: it reports the destination of its own signal through CurrentRuntime(), which would
 	 * otherwise pick up that other destination's entry. When this is the last connection every entry is
-	 * already stopped, which is exactly the case its own report skips. */
-	if (outputHandler && (outputHandler->StreamingActive() || RunningDestinationCount() > 0)) {
+	 * already stopped, which is exactly the case its own report skips.
+	 *
+	 * The runtime count alone again, for the reason spelled out at the other test in StreamingStop(): the
+	 * handler still reports the connection that is ending - here the primary output, whose active flag
+	 * clears only after this queued report runs - so asking it holds the session open for a connection that
+	 * is already gone, and the session would never come down. */
+	if (outputHandler && RunningDestinationCount() > 0) {
 		blog(LOG_INFO,
 		     "streaming session continues after destination '%s' went down: %zu of %zu enabled destinations still attempting or uploading",
 		     runtime->name.c_str(), RunningDestinationCount(), EnabledDestinationCount());
@@ -219,8 +224,14 @@ void OBSBasic::ReportDestinationFailure(const StreamDestinationRuntime &runtime,
 
 void OBSBasic::StartStreaming()
 {
-	if (outputHandler->StreamingActive())
+	if (outputHandler->StreamingActive()) {
+		/* The session that is coming down still owns its connections - an extra destination keeps
+		 * StreamingActive() true until its stop signal arrives, which on a quick restart is after this
+		 * click. Say so: without this line a Start that lands in that window looks exactly like an OBS that
+		 * has stopped responding, and the request itself is simply lost. */
+		blog(LOG_INFO, "start streaming refused: the previous session is still winding down");
 		return;
+	}
 
 	/* A new session reports its failures on their own: correlated drops of the previous one must not collapse
 	 * into this session's first message. */
@@ -757,9 +768,18 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 	 * not the tray entry, not the frontend/websocket event, and not the recording or replay-buffer
 	 * coupling. They all follow the session, which ends with the last connection. A destination that is
 	 * still working on its handshake counts as a connection of the session even though libobs does not
-	 * call its output active yet, which is what the runtime count is for. */
+	 * call its output active yet, which is what the runtime count is for.
+	 *
+	 * The runtime count decides this alone - outputHandler->StreamingActive() must not be part of the test.
+	 * When a connection's stop signal reaches this handler, libobs still flags that very output as active:
+	 * measured on the multi-destination path, the primary output's active flag clears about 0.35 s after
+	 * its own stop signal has already been handled here. Asking the handler whether the session is still
+	 * running therefore answers with the connection that is ending right now, the session never comes down
+	 * with its last connection, and the block below - the status bar, the tray entry, streamingStopping,
+	 * OBS_FRONTEND_EVENT_STREAMING_STOPPED, OnDeactivate() and the log separator - is skipped. The runtimes
+	 * are the session's own record and are current at this point: this connection was set to Stopped above. */
 	const size_t stillRunning = RunningDestinationCount();
-	if (outputHandler->StreamingActive() || stillRunning > 0) {
+	if (stillRunning > 0) {
 		blog(LOG_INFO,
 		     "streaming session continues after a destination went down: %zu of %zu enabled destinations still attempting or uploading",
 		     stillRunning, EnabledDestinationCount());

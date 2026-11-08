@@ -91,8 +91,12 @@ void OBSBasic::AutoRemux(QString input, bool no_show)
 
 void OBSBasic::StartRecording()
 {
-	if (outputHandler->RecordingActive())
+	if (outputHandler->RecordingActive()) {
+		/* Same window as the streaming start: the recorder from the previous cycle has not finished
+		 * winding down, and a Start click in that window is dropped without a trace. */
+		blog(LOG_INFO, "start recording refused: the previous recording is still winding down");
 		return;
+	}
 	if (disableOutputsRef)
 		return;
 
