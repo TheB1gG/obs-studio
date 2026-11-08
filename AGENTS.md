@@ -84,6 +84,13 @@ time, `scratch/plan/*.md` keeps the narrative and the harness commands. Never th
   the final solution needs: no debug logging added during diagnosis (unless it
   has permanent value), no commented-out code, no unrelated formatting changes.
 - Revert cosmetic-only edits to files that are not part of the fix.
+- **Write source with the file-edit tool, and read the diff of a touched file before
+  building it.** A shell write channel (`Get-Content`/`Set-Content`, `>` redirection)
+  rewrites the payload on the way in: a C block spliced into `libobs/obs-encoder.c` that
+  way arrived with every `"` as the two characters `34` - `obs_encoder_valid(encoder,
+  34obs_encoder_keyframe_requested34)` - and a `%s` that had gained a space, so the file
+  did not compile. `git diff --stat` reported "36 insertions", which says nothing; the
+  diff of the file shows it at a glance.
 
 ## 3. One gate per finished feature: finish, verify locally, shape the commits, tag once
 
@@ -95,13 +102,25 @@ tagging.
 1. Finish the whole feature locally, working as if it were one commit.
 2. Pre-tag checklist - all of it, before any tag exists:
    - `cmake --build build_x64 --config RelWithDebInfo --target obs-studio`
-   - `scratch/tmp/scan-newline.ps1` against the sources the batch touched (Apple clang `-Wnewline-eof`; MSVC
-     never reports it - section 3a)
+   - `pwsh -NoProfile -File test/pre-gate/run.ps1` green, or every SKIP named in CI-PENDING
+     (`-NoMeasure` is the fast lifecycle half; `test/pre-gate/README.md` says what each case pins down).
+     Once the batch is committed, name it - `-Base <the commit the batch starts from>` - and gate with
+     `-Strict`, so a SKIP has to be explained instead of passing quietly. `-Background` returns at once and
+     the run is followed in `scratch/tmp/pregate/run-<time>.txt`.
+     This one command covers what used to be the newline scan, the clang-format probe and the probe-leak
+     grep, and it is the only place those rules get re-checked from now on.
    - the gcc-strictness read of the new code: signed/unsigned comparisons, unused members and functions, and
-     STL includes Apple libc++ does not provide transitively
-   - `scratch/tmp/cformat.ps1` on the changed C/C++ files
+     STL includes Apple libc++ does not provide transitively - a read, not a script: the suite cannot do it
    - one portable smoke launch (section 6) with no crash report written
-   - `git grep -e TEMP-SHOT -e OBS_TEST_ -- frontend` empty: no probe survives into a gated batch
+   - never finish a verification run by killing OBS: `obs_shutdown()` only runs on a real close, and that is
+     where the fan-out's outputs, encoders and services die. Ask the app to quit - `test/pre-gate` does that
+     with `OBS_PREGATE_ACTIONS=quit@<s>` - and a run that had to be killed tested no shutdown at all.
+   - after an operation that rewrites source files (a `git checkout`, a restore from a copy, a commit split),
+     prove the binary carries that code before believing a test result: `Copy-Item` and `git checkout` give
+     the file the mtime of its source, which can be older than the `.obj`, and MSBuild then relinks the stale
+     objects - the build is clean and the reverted behaviour is quietly back in the executable. Check the
+     `.obj` timestamp, or look for the new identifier in the built binary (the frontend is compiled into
+     `obs64.exe`, there is no frontend DLL to inspect).
 3. Shape the history to its final form **before** the gate (section 7): squash the batch and correct a build
    slip by amending the commit that contains it, so a mistake never becomes a commit of its own.
 4. Tag the tip once: schema `test-<problem-or-feature>` - the name of the problem being fixed or the feature
@@ -134,22 +153,46 @@ The frontend is compiled with Apple clang on both macOS targets and the build tu
 `CMAKE_COMPILE_WARNING_AS_ERROR ON` unless the caller decided otherwise (lines 85-86) - which the CI presets
 force on anyway (`CMAKE_COMPILE_WARNING_AS_ERROR: true` in `CMakePresets.json`). MSVC never reports a missing
 final newline, so a source file written without one passes every Windows job and kills both macOS jobs - that
-is exactly what failed run 42284720040. Before pushing a tag, run `scratch/tmp/scan-newline.ps1` and compare
-its list against the sources the batch touched; `scratch/tmp/fix-newline.ps1` appends what is missing.
+is exactly what failed run 42284720040. Case `s01-static` checks every C/C++ file the batch changed;
+`scratch/tmp/fix-newline.ps1` appends what is missing.
+
+The same file turns on `-Wshorten-64-to-32` (line 48), which MSVC has no equivalent of: a Qt 6 `qsizetype`
+(the return type of `QString::indexOf`/`lastIndexOf`, container `size()`) must never be assigned to `int`.
+Write `const qsizetype at = name.indexOf(':');` - `int` compiles here and breaks both macOS legs.
 
 A branch push also runs `.github/workflows/check-format.yaml`, which pipes the changed C/C++ files through
 clang-format 22 (Homebrew `clang-format@22`). The local VS LLVM clang-format is the same major (22.1.3) and
-`scratch/tmp/cformat.ps1` runs it as a probe or with `-InPlace`; `scratch/tmp/same-tokens.ps1` then proves
-such a pass moved nothing but whitespace (it hashes the file with all spaces, tabs, CR and LF removed).
-`scratch/tmp/format-scan.ps1 -Base 31.1.2` counts the offenders: 75 of the 174 sources changed since 31.1.2
-would be reformatted, so that job is expected to be red for reasons older than any single batch - a repo-wide
-format pass is the user's call, not an agent's.
+`s01-static` runs it over the changed files, comparing each against its version at the base so only drift the
+batch itself added can fail the gate (the repository carries older debt; `scratch/tmp/format-scan.ps1 -Base
+31.1.2` counted 75 of 174 sources, and a repo-wide pass is the user's call, not an agent's).
+`scratch/tmp/same-tokens.ps1 -A <file> -B <file>` (it takes two files) then proves such a pass moved nothing but
+whitespace, by hashing both with all spaces, tabs, CR and LF removed.
 
 `scratch/plan/CI-PENDING.md` lists the commits that are committed but not on the branch yet because their
 gate is still running (or went red). Never leave a commit out of it.
 
 Exception: changes that only touch `.github/workflows` (CI configuration) or documentation (`AGENTS.md`) do
 not change program code and do **not** require the test-tag build gate.
+
+## 3b. libobs object ownership: hand a create result over, never assign it
+
+Every `obs_*_create()` returns a reference the caller owns, and the wrapper types take a **second** reference
+when they are assigned or constructed from it. So the two shapes below both leak the create reference:
+
+```c
+stream->output = obs_output_create(...);      /* OBSSafeRef member: assignment addrefs, nobody drops this one */
+OBSService svc(obs_service_create(...));      /* constructor owns one, the create reference is extra */
+```
+
+Write it the other way round instead: create into an auto-release wrapper and assign that
+(`OBSOutputAutoRelease created = obs_output_create(...); member = created;`), or release the create reference
+explicitly right after constructing the wrapper. The entry then owns exactly one reference.
+
+A leaked reference does not merely leak memory: the object stays registered until `obs_free_data()` frees it,
+which runs **after** `obs_shutdown()` unloaded the plugin modules, so the encoder type's `destroy` pointer is
+read out of unloaded code and libobs calls through it. That is the OBS-quit-with-a-live-session crash, and it
+cost ~350 MB of encoder state per destination per session. `test/pre-gate` fails a case on the leak even when
+nothing crashes: libobs logs `N output(s)/encoder(s)/service(s) were remaining`, and any such line is a FAIL.
 
 ## 4. Launching the local rundir build (Windows, mandatory)
 
