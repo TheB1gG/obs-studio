@@ -253,12 +253,295 @@ function pg_wait_live {
 	return $false
 }
 
+# Cycles and liveness, for the cases that start and stop sessions repeatedly.
+#
+# Scripted actions run as timers on the main window, so an action that never fires, or fires seconds late,
+# means the UI thread was blocked: that is OBS being unresponsive, and a clean exit afterwards would hide it.
+# Every start and stop also has to show up as a real output transition. A start that silently no-ops because
+# the previous cycle's encoder never came free is exactly the stuck-encoder failure these cases look for, and
+# it reads as a missing separator line in the log.
+function pg_log_seconds {
+	param($m)
+	([int] $m.Groups[1].Value * 3600) + ([int] $m.Groups[2].Value * 60) + [int] $m.Groups[3].Value +
+		([int] $m.Groups[4].Value / 1000.0)
+}
+
+function pg_check_cycles {
+	param([string]$logText, [int]$streamStarts = 0, [int]$streamStops = 0, [int]$recStarts = 0,
+		[int]$recStops = 0, [double]$latenessTolSec = 3.0, [double]$maxGraphicsStallMs = 2000,
+		[double]$maxStopLatencySec = 0, [double]$fps = 0, [int]$frameAllowFrames = 80,
+		[switch]$AllowRefusedStarts)
+
+	$scheduled = @{}
+	foreach ($m in [regex]::Matches($logText, '(\d{2}):(\d{2}):(\d{2})\.(\d{3}):\s*pregate: ''([^'']+)'' scheduled for t\+(\d+) s')) {
+		$armedAt = pg_log_seconds $m
+		$scheduled[$m.Groups[5].Value + '@' + $m.Groups[6].Value] = @($armedAt, [double]$m.Groups[6].Value)
+	}
+
+	$worst = 0.0
+	$worstKey = ''
+	$fired = @{}
+	foreach ($m in [regex]::Matches($logText, '(\d{2}):(\d{2}):(\d{2})\.(\d{3}):\s*pregate: running ''([^'']+)'' \(t\+(\d+) s\)')) {
+		$key = $m.Groups[5].Value + '@' + $m.Groups[6].Value
+		$fired[$key] = $true
+		if (-not $scheduled.ContainsKey($key)) { continue }
+		$late = (pg_log_seconds $m) - $scheduled[$key][0] - $scheduled[$key][1]
+		if ([math]::Abs($late) -gt [math]::Abs($worst)) {
+			$worst = $late
+			$worstKey = $key
+		}
+	}
+
+	$missing = @($scheduled.Keys | Where-Object { -not $fired.ContainsKey($_) })
+	pg_check ($missing.Count -eq 0) ("every scripted action ran, so the main loop stayed alive ($($scheduled.Count) scheduled, missing: $($missing -join ', '))")
+	if ($scheduled.Count -gt 0) {
+		pg_check ([math]::Abs($worst) -le $latenessTolSec) (
+			"no action ran more than $latenessTolSec s after its timer (worst: $worstKey by $([math]::Round($worst, 2)) s)")
+	}
+
+	$seen = [ordered]@{
+		'stream start' = ([regex]::Matches($logText, '==== Streaming Start ')).Count
+		'stream stop'  = ([regex]::Matches($logText, '==== Streaming Stop ')).Count
+		'rec start'    = ([regex]::Matches($logText, '==== Recording Start ')).Count
+		'rec stop'     = ([regex]::Matches($logText, '==== Recording Stop ')).Count
+	}
+	$want = [ordered]@{'stream start' = $streamStarts; 'stream stop' = $streamStops; 'rec start' = $recStarts;
+		'rec stop' = $recStops}
+	foreach ($k in $want.Keys) {
+		if ($want[$k] -le 0) { continue }
+		pg_check ($seen[$k] -ge $want[$k]) ("$k happened at least $($want[$k]) time(s): the log shows $($seen[$k])")
+	}
+
+	# Refusals and forced teardowns: the fingerprints of an output or encoder that did not come free.
+	$alarm = @('Failed to start output', 'is already active', 'Tried to start output', 'Tried to stop output',
+		'Invalid call to obs_', 'Forcing shutdown', 'Failed to allocate memory', 'Failed to create',
+		'streaming refused: the previous session', 'recording refused: the previous recording')
+	$hits = @()
+	foreach ($line in ($logText -split "`r`n")) {
+		foreach ($p in $alarm) {
+			if ($line -match $p) {
+				$hits += $line.Trim()
+				break
+			}
+		}
+	}
+	foreach ($h in ($hits | Select-Object -First 6)) { pg_say "  note  refused or forced: $h" }
+	if (-not $AllowRefusedStarts) {
+		pg_check ($hits.Count -eq 0) "no start was refused and no output was forced down through the cycles ($($hits.Count) such lines)"
+	} else {
+		pg_check ($true) "a refused start is allowed by this case (the cycles it counts are the ones performed)"
+	}
+
+	# How long a stop takes to come home. A fan-out session has to walk every one of its connections down;
+	# measured on a healthy cycle the separator follows the request by 1.2-1.9 s. Far above that means a
+	# connection is being held - and while it is held StreamingActive() still answers "running", so every
+	# start issued in that window is refused and lost. That window is what t16 drives on purpose.
+	if ($maxStopLatencySec -gt 0) {
+		$sepAt = @{}
+		foreach ($kind in @('Streaming', 'Recording')) {
+			$startTimes = @()
+			$stopTimes = @()
+			foreach ($m in [regex]::Matches($logText, "(\d{2}):(\d{2}):(\d{2})\.(\d{3}):\s*==== $kind Start =+")) {
+				$startTimes += pg_log_seconds $m
+			}
+			foreach ($m in [regex]::Matches($logText, "(\d{2}):(\d{2}):(\d{2})\.(\d{3}):\s*==== $kind Stop =+")) {
+				$stopTimes += pg_log_seconds $m
+			}
+			$sepAt[$kind] = @($startTimes, $stopTimes)
+		}
+		$lateStops = @()
+		$worstStop = 0.0
+		foreach ($m in [regex]::Matches($logText, '(\d{2}):(\d{2}):(\d{2})\.(\d{3}):\s*pregate: running ''(stop|rec-stop)'' \(t\+(\d+) s\)')) {
+			$kind = if ($m.Groups[5].Value -eq 'stop') { 'Streaming' } else { 'Recording' }
+			$asked = pg_log_seconds $m
+			$startTimes = @($sepAt[$kind][0] | Where-Object { $_ -lt $asked })
+			$stopTimes = @($sepAt[$kind][1] | Where-Object { $_ -lt $asked })
+			# Was anything of this kind actually running when the request came? A start that was refused
+			# leaves nothing to stop, and then no separator may be demanded of the stop action that follows.
+			$running = ($startTimes.Count -gt 0) -and
+				(($stopTimes.Count -eq 0) -or ($startTimes[-1] -gt $stopTimes[-1]))
+			if (-not $running) {
+				pg_say ("  note  {0} at {1} s asked while nothing was running: nothing to bring down" -f
+					$m.Groups[5].Value, $m.Groups[6].Value)
+				continue
+			}
+			$finished = @($sepAt[$kind][1] | Where-Object { $_ -ge $asked } | Select-Object -First 1)
+			if ($finished.Count -eq 0) {
+				$lateStops += "$($m.Groups[5].Value) at $($m.Groups[6].Value) s never reported a finished stop"
+				continue
+			}
+			$took = $finished[0] - $asked
+			if ($took -gt $worstStop) { $worstStop = $took }
+			if ($took -gt $maxStopLatencySec) {
+				$lateStops += "$($m.Groups[5].Value) at $($m.Groups[6].Value) s took $([math]::Round($took, 2)) s"
+			}
+		}
+		foreach ($s in ($lateStops | Select-Object -First 4)) { pg_say "  note  slow stop: $s" }
+		pg_check ($lateStops.Count -eq 0) (
+			"every stop of a session that was actually up finished within $maxStopLatencySec s of being asked (worst observed: $([math]::Round($worstStop, 2)) s)")
+	}
+
+	# Frame accounting over each output's own session window.
+	#
+	# The counters libobs prints at a stop belong to different lifetimes: "Total frames output: N" is
+	# what one output sent, while its encoder's "Total frames drawn" spans the encoder's whole run,
+	# which begins with the first consumer that started it. A recorder sharing that encoder, or a
+	# destination attached later, is charged for frames drawn before it existed - comparing the two
+	# counters called a healthy 2 s recording a loss of 296 of 359. The window of a stream output is
+	# its session's "Streaming Start" to "Streaming Stop" separator, of the recorder the recording's,
+	# and what an output should have delivered is fps times that window.
+	#
+	# The allowance is two measured costs summed with margin: a start reaches the ingest ~1.2 s after
+	# its request (the connect), and a stop discards the ~1.2 s of video the encoder still holds -
+	# 36-38 frames, whatever the session length (scratch/plan/CI-PENDING.md defects 2 and 3). Both
+	# are open defects, so the allowance is a fixed frame count and the check fails on a stall, not
+	# on the pipeline's normal latency: 33 delivered in a 3.2 s window is the healthy shape, 12 of
+	# 10 s (the mid-GOP attach of defect 1) is not.
+	pg_check_frame_windows -logText $logText -fps $fps -allowFrames $frameAllowFrames
+
+	$g = [regex]::Match($logText, 'obs_graphics_thread\([^)]*\): min=([\d.]+) ms, median=([\d.]+) ms, max=([\d.]+) ms')
+	if ($g.Success) {
+		pg_say ("  note  graphics thread over the run: median {0} ms, max {1} ms (a frame period is 33.3 ms)" -f
+			$g.Groups[2].Value, $g.Groups[3].Value)
+		pg_check ([double]$g.Groups[3].Value -le $maxGraphicsStallMs) (
+			"the graphics thread never stalled (max {0} ms over {1} ms)" -f $g.Groups[3].Value, $maxGraphicsStallMs)
+	}
+}
+
+# What each output delivered across its own session window, against what that window calls for.
+#
+# An output's "Total frames output" counter is its own; the encoder's "Total frames drawn" spans the
+# encoder's whole run, which starts with the first consumer that opened it - so a recorder sharing the
+# encoder, or a destination attached later, is charged for frames drawn before it existed. The window
+# of a stream output is its session's "Streaming Start"/"Streaming Stop" separators, the recorder's the
+# recording's, and the number it should reach is fps times that window minus the measured latency
+# allowance (a start needs ~1.2 s to reach the ingest, a stop discards ~1.2 s of held video).
+function pg_check_frame_windows {
+	param([string]$logText, [double]$fps = 30, [int]$allowFrames = 80)
+
+	if ($fps -le 0) { $fps = 30 }
+
+	# The case knows its own profile frame rate; without it a 25 fps profile would be measured against 30.
+	$fm = [regex]::Match($logText, 'Output Size: \d+x\d+ (\d+(?:\.\d+)?) fps')
+	if ($fm.Success) { $fps = [double]$fm.Groups[1].Value }
+
+	$windows = New-Object System.Collections.Generic.List[object]
+	$openKind = @{}
+	foreach ($m in [regex]::Matches($logText,
+			'(\d{2}):(\d{2}):(\d{2})\.(\d{3}):\s*==== (Streaming|Recording) (Start|Stop) =+')) {
+		$t = pg_log_seconds $m
+		$kind = $m.Groups[5].Value
+		if ($m.Groups[6].Value -eq 'Start') {
+			$w = [pscustomobject]@{Kind = $kind; Start = $t; End = $null}
+			$windows.Add($w)
+			$openKind[$kind] = $w
+			continue
+		}
+		if ($openKind.ContainsKey($kind)) {
+			$openKind[$kind].End = $t
+			$openKind.Remove($kind)
+		}
+	}
+
+	# A session ended by quitting OBS has no "Streaming Stop" separator - the counters print during the
+	# teardown, so the window is still open there. Its end is the last counter line of the run.
+	$lastCounter = 0.0
+	foreach ($m in [regex]::Matches($logText,
+			"(\d{2}):(\d{2}):(\d{2})\.(\d{3}):\s*Output '[^']+': Total frames output: \d+")) {
+		$t = pg_log_seconds $m
+		if ($t -gt $lastCounter) { $lastCounter = $t }
+	}
+	foreach ($w in @($openKind.Values)) {
+		if ($lastCounter -gt $w.Start) { $w.End = $lastCounter }
+	}
+
+	if ($windows.Count -eq 0) {
+		if ($lastCounter -gt 0) {
+			pg_check $false 'the log carries output counters but no session separator, so the frames cannot be scored'
+		} else {
+			pg_say '  note  frame accounting: this log has no streaming or recording session to measure'
+		}
+		return
+	}
+
+	$bad = @()
+	$measured = 0
+	$worstLoss = 0
+	$worstText = 'every run was too short to judge'
+
+	# The two counters of a stop block belong to the run that just ended: "Total frames output" is what
+	# this output sent, "Total drawn frames" what its encoder produced for it. They are written in
+	# separate passes and interleave between outputs, so they are paired by output name and by index -
+	# the i-th "frames output" of an output with the i-th "drawn frames" of the same output.
+	#
+	# A run shorter than two seconds is not judged: at 30 fps its entire frame count is inside the
+	# latency allowance, and demanding 2.7 s of delivery from a 1.2 s reconnect is not a finding.
+	$sent = @{}
+	$drawn = @{}
+	foreach ($m in [regex]::Matches($logText,
+			"(\d{2}):(\d{2}):(\d{2})\.(\d{3}):\s*Output '([^']+)': Total (frames output|drawn frames): (\d+)")) {
+		$t = pg_log_seconds $m
+		$e = [pscustomobject]@{T = $t; N = [int]$m.Groups[7].Value}
+		if ($m.Groups[6].Value -eq 'frames output') {
+			if (-not $sent.ContainsKey($m.Groups[5].Value)) { $sent[$m.Groups[5].Value] = @() }
+			$sent[$m.Groups[5].Value] += $e
+		} else {
+			if (-not $drawn.ContainsKey($m.Groups[5].Value)) { $drawn[$m.Groups[5].Value] = @() }
+			$drawn[$m.Groups[5].Value] += $e
+		}
+	}
+
+	foreach ($name in $drawn.Keys) {
+		$dl = $drawn[$name]
+		$sl = @()
+		if ($sent.ContainsKey($name)) { $sl = $sent[$name] }
+		for ($i = 0; $i -lt $dl.Count; $i++) {
+			$t = $dl[$i].T
+			$got = if ($i -lt $sl.Count) { $sl[$i].N } else { 0 }
+
+			# The run this stop closes: the innermost window of its own kind containing the line, so a
+			# recorder stopped inside a live stream is measured over its recording, not the stream.
+			$w = $null
+			foreach ($cand in $windows) {
+				if ($null -eq $cand.End -or $cand.Start -ge $t -or $cand.End -lt $t) { continue }
+				if ($null -eq $w -or ($cand.End - $cand.Start) -lt ($w.End - $w.Start)) { $w = $cand }
+			}
+			if ($null -eq $w) { continue }
+			$span = $t - $w.Start
+			if ($span -lt 2) { continue }
+
+			$measured++
+			$lost = $dl[$i].N - $got
+			if ($lost -gt $worstLoss) {
+				$worstLoss = $lost
+				$worstText = "$name delivered $got of $($dl[$i].N) drawn over a $([math]::Round($span, 1)) s $($w.Kind) run"
+			}
+			if ($lost -gt $allowFrames) {
+				$bad += "$name delivered $got of $($dl[$i].N) drawn over a $([math]::Round($span, 1)) s " +
+					"$($w.Kind) run (lost $lost frames, allowance $allowFrames)"
+			}
+		}
+	}
+
+	if ($measured -eq 0) {
+		pg_check $false ("the frame accounting judged none of the $($windows.Count) session windows " +
+			'(every run shorter than two seconds, or no drawn-frame counter to read)')
+		return
+	}
+
+	foreach ($b in ($bad | Select-Object -First 4)) { pg_say "  note  starved run: $b" }
+	pg_check ($bad.Count -eq 0) (
+		"$measured output runs delivered their encoder's frames (worst loss $worstLoss frames: $worstText)")
+}
+
 function pg_session {
 	param([string]$Case, [string]$Actions, [int]$Destinations = 2, [int]$SharedKbps = 3000,
 		[string]$OverrideOn = '', [int]$OverrideKbps = 500, [switch]$Stream, [switch]$Record,
 		[switch]$Media, [switch]$Ingest, [int]$ExitTimeoutSec = 150, [string[]]$ExpectInLog = @(),
 		[int]$ExpectLive = 0, [string]$Server = 'rtmp://127.0.0.1:1935/live', [switch]$Reconnect = $true,
-		[int]$LiveTimeoutSec = 30)
+		[int]$LiveTimeoutSec = 30, [int]$ExpectStreamStarts = 0, [int]$ExpectStreamStops = 0,
+		[int]$ExpectRecStarts = 0, [int]$ExpectRecStops = 0, [double]$MaxStopLatencySec = 0,
+		[switch]$AllowRefusedStarts)
 
 	pg_prepare_tree
 	if ($Ingest -and -not (pg_ingest_ready)) {
@@ -311,6 +594,12 @@ function pg_session {
 	if (-not $log) { pg_ingest_stop $session; pg_check $false 'OBS wrote a log file'; return }
 	$text = [System.IO.File]::ReadAllText($log.FullName)
 	pg_check_shutdown -logText $text -crashes (pg_new_crashes $crashesBefore) -exitCode $exitCode -selfExited $exited
+
+	# Every session case, not just the cycle cases: the actions were scheduled on the main window, so seeing
+	# them all run near their time is the liveness proof; the cycle counts only mean something when given.
+	pg_check_cycles -logText $text -streamStarts $ExpectStreamStarts -streamStops $ExpectStreamStops `
+		-recStarts $ExpectRecStarts -recStops $ExpectRecStops -maxStopLatencySec $MaxStopLatencySec `
+		-AllowRefusedStarts:$AllowRefusedStarts
 
 	if ($ExpectLive -gt 0) {
 		$live = ([regex]::Matches($text, "is live \(\d+ of \d+ enabled destinations up\)")).Count

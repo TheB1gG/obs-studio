@@ -1081,6 +1081,10 @@ void OBSBasic::SchedulePregateActions(const QString &spec)
 				StopStreaming();
 			} else if (verb == "start") {
 				StartStreaming();
+			} else if (verb == "rec-stop") {
+				StopRecording();
+			} else if (verb == "rec-start") {
+				StartRecording();
 			} else if (verb == "restart-dest") {
 				RestartDestination(id);
 			} else if (verb == "stop-dest") {

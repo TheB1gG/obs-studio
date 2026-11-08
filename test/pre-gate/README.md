@@ -6,6 +6,7 @@ Run this **after a local build and before any `test-*` tag exists** (AGENTS.md s
 pwsh -NoProfile -File test/pre-gate/run.ps1                  # everything (~15 min)
 pwsh -NoProfile -File test/pre-gate/run.ps1 -NoMeasure       # lifecycle only, the fast half
 pwsh -NoProfile -File test/pre-gate/run.ps1 -Cases t03-quit-while-streaming-two
+pwsh -NoProfile -File test/pre-gate/run.ps1 -Cases t15,t16   # an unambiguous prefix names a case
 pwsh -NoProfile -File test/pre-gate/run.ps1 -Base 727a470f2  # gate a batch that is already committed
 pwsh -NoProfile -File test/pre-gate/run.ps1 -Strict          # a SKIP counts as a failure
 pwsh -NoProfile -File test/pre-gate/run.ps1 -Background      # return at once, follow the transcript
@@ -53,6 +54,7 @@ separate cases and only the first one has a live gate.
 | case | state at quit | what it pins down |
 |---|---|---|
 | `s01-static` | - | final newline (Apple clang `-Wnewline-eof`, errors in CI), clang-format 22 attributed to this batch rather than to repo debt, no `TEMP-`/`OBS_TEST_` probe left in program code |
+| `s02-accounting-selftest` | - | the frame accounting is proven to bite: the defect-1 shape is rejected, a healthy stop tail and a 1.2 s reconnect run are not, counters without session separators are reported |
 | `t01-cold-quit` | idle | the baseline: nothing running, still shuts down clean |
 | `t02-quit-while-streaming-one` | one destination uploading | the handler's own output and encoders are released in time |
 | `t03-quit-while-streaming-two` | two destinations uploading | the fan-out's extra outputs: the crash this suite was written for |
@@ -61,9 +63,47 @@ separate cases and only the first one has a live gate.
 | `t06-restart-one-destination` | one restarted, one never dropped | single-destination kill/restart inside a live session |
 | `t10-quit-after-refused-session` | session ended (refused, no reconnect) | the objects of a finished session must not linger either |
 | `t11-quit-while-reconnecting` | retry timers armed | shutdown in the middle of a reconnect |
+| `t12-quit-while-connecting` | connect never answered | shutdown while an output is still in the connect phase, before any header was sent |
+| `t13-rapid-stream-cycles` | last session stopped, then quit | four stop/start pairs two seconds apart: every cycle really starts and really stops, nothing is refused |
+| `t14-rapid-recording-cycles` | recorder restarted four times | the muxer and the recording encoders rebuilt under the same rapid cycling |
+| `t15-mixed-stream-and-recording-cycles` | both cycled, three seconds apart | stream and recorder going down and up close to each other on top of a live fan-out |
+| `t16-restart-inside-a-pending-stop` | the same at two seconds, a start landing inside a stop | the wind-down window: stops still come home, a refused start is logged rather than lost, nothing stays attached to a dead output |
 | `t07-two-destinations-one-encoder` | two uploading | both keys really reach the ingest, both cost the profile bitrate |
 | `t08-backup-own-bitrate` | two uploading | the destination with an override pays for its own encoder, the other keeps the shared one |
 | `t09-primary-own-bitrate` | two uploading | the shared encoder is not retuned when the primary overrides its bitrate |
+
+The cycle cases (`t13`-`t16`) add three checks on top of the shutdown ones, because a clean exit proves
+nothing about the cycling itself: every scripted action has to be seen running and within three seconds of
+its timer (the actions are timers on the main window, so a late or missing one is the log record of an
+unresponsive UI thread); every start and stop has to appear in the log as a real output transition, which is
+what a silently no-opping restart would cost; and no output may end up starved - frames drawn for it but
+almost none delivered, the shape an encoder or send path that is being held leaves behind.
+
+The frame accounting (`pg_check_frame_windows`) is the check that pins defect 1, and it scores each
+output **run** by comparing the two counters of the stop that closed it: `Total frames output` (what the
+output sent) against `Total drawn frames` (what its encoder produced for it). A run that drew frames and
+delivered hardly any is the signature of a consumer attached to a running encoder, which is what the
+mid-GOP keyframe gate used to do.
+
+Three measurements make the comparison honest, all of them from this suite's own logs:
+- The two counters are written in **separate passes and interleave between outputs**, so pairing them by
+  line adjacency matches nothing as soon as a session has two outputs - which is how a 1-of-144 delivery
+  hid in plain sight for a day. They are paired by output name and by index instead.
+- The encoder's "drawn" counter spans the *encoder*, which starts with the first consumer that opened it.
+  A recorder that shares that encoder, or a destination attached later, is charged for frames drawn before
+  it existed, so a healthy 2 s recording read as 63 of 359 lost. This is why the loss is scored per run of
+  one output, and the run's window (the `Streaming Start`/`Stop` separators, `Recording Start`/`Stop` for
+  the recorder) only decides whether the run is long enough to judge.
+- Every healthy stop discards the ~1.2 s of video the encoder still holds - 36-38 frames, whatever the
+  session length - and a start needs ~1.2 s to reach the ingest. The allowance is therefore a fixed
+  80 frames, twice that constant, and a run shorter than two seconds is not judged at all: its whole frame
+  count is inside the allowance, so scoring a 1.2 s reconnect run against a 2.7 s demand is not a finding.
+
+`s02-accounting-selftest` runs on synthetic logs and asserts both directions of that check: the defect-1
+shape is rejected, a healthy stop tail and a short reconnect run are not, and a log whose counters have no
+session separator is reported instead of scored as nothing. It exists because a check that measures nothing
+passes - which is exactly what the first version of this accounting did, and OBS keeps only the ten newest
+logs, so the pre-fix evidence that would have caught it rotates out of the rundir within a suite run.
 
 ## Environment
 
@@ -72,7 +112,7 @@ Nothing outside the rundir and `scratch/` is touched: the runs use `--portable`,
 
 | variable | meaning |
 |---|---|
-| `OBS_PREGATE_ACTIONS` (read by OBS) | `<action>@<seconds>` list, fired by the frontend hook in `OBSBasic::OBSInit`: `start`, `stop`, `quit` (a real window close), `restart-dest:<id>`, `stop-dest:<id>`, `kill-dest:<id>` |
+| `OBS_PREGATE_ACTIONS` (read by OBS) | `<action>@<seconds>` list, fired by the frontend hook in `OBSBasic::OBSInit`: `start`, `stop`, `rec-start`, `rec-stop`, `quit` (a real window close), `restart-dest:<id>`, `stop-dest:<id>`, `kill-dest:<id>` |
 | `OBS_PREGATE_MEDIAMTX` | path of the ingest binary (default `E:\Downloads\mediamtx_v1.21.0_windows_amd64\mediamtx.exe`) |
 | `OBS_PREGATE_MEDIA` | a sample video for the cases that need moving content |
 | `OBS_PREGATE_CLANGFORMAT` | clang-format to use, when it is not on PATH |
