@@ -1045,9 +1045,66 @@ static inline void LogEncoders()
 	list_encoders(OBS_ENCODER_AUDIO);
 }
 
+/* The pre-gate test hook (see test/pre-gate/README.md): turn "start@18,stop@24,quit@30" into timers that call
+ * the very slots the buttons in the UI call, so a scripted run exercises session lifecycle - including the
+ * shutdown path, which no force-kill ever reaches. Nothing happens unless the environment names the variable. */
+void OBSBasic::SchedulePregateActions(const QString &spec)
+{
+	const QStringList entries = spec.split(',', Qt::SkipEmptyParts);
+
+	for (QString entry : entries) {
+		const qsizetype at = entry.lastIndexOf('@');
+		if (at <= 0)
+			continue;
+
+		QString action = entry.left(at).trimmed().toLower();
+		const int secs = entry.mid(at + 1).trimmed().toInt();
+		if (secs <= 0 || action.isEmpty())
+			continue;
+
+		std::string id;
+		const qsizetype colon = action.indexOf(':');
+		if (colon != -1) {
+			id = action.mid(colon + 1).trimmed().toStdString();
+			action.truncate(colon);
+		}
+
+		const QByteArray verb = action.toUtf8();
+		blog(LOG_INFO, "pregate: '%s' scheduled for t+%d s", verb.constData(), secs);
+
+		QTimer::singleShot(secs * 1000, this, [this, verb, id, secs]() {
+			blog(LOG_INFO, "pregate: running '%s' (t+%d s)", verb.constData(), secs);
+
+			if (verb == "quit") {
+				close();
+			} else if (verb == "stop") {
+				StopStreaming();
+			} else if (verb == "start") {
+				StartStreaming();
+			} else if (verb == "restart-dest") {
+				RestartDestination(id);
+			} else if (verb == "stop-dest") {
+				StopDestination(id);
+			} else if (verb == "kill-dest") {
+				KillDestinationUngracefully(id);
+			} else {
+				blog(LOG_WARNING, "pregate: unknown action '%s'", verb.constData());
+			}
+		});
+	}
+}
+
 void OBSBasic::OBSInit()
 {
 	ProfileScope("OBSBasic::OBSInit");
+
+	/* Test-surface hook, not an ad-hoc probe: see test/pre-gate/README.md. A force-killed process never runs
+	 * obs_shutdown, which is how the teardown of a running session went untested for two slices. */
+	{
+		const QByteArray actions = qgetenv("OBS_PREGATE_ACTIONS");
+		if (!actions.isEmpty())
+			SchedulePregateActions(QString::fromUtf8(actions));
+	}
 
 	if (!InitBasicConfig())
 		throw "Failed to load basic.ini";

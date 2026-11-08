@@ -1,0 +1,19 @@
+# Local ingest for the pre-gate cases that measure bytes instead of reading a label back from the UI.
+# The API is what turns "the settings card says 800 kb/s" into a measured upload rate on the wire.
+logLevel: info
+logDestinations: [stdout]
+logFile: none
+
+api: yes
+apiAddress: :9997
+
+rtmpAddress: :1935
+
+# Both connections of a two-destination session publish here: 'a' through the profile's default
+# service, 'b' through the service file the destination carries of its own. Paths are listed on
+# purpose - MediaMTX refuses an unlisted path, so a wrong stream key fails loudly.
+paths:
+  live/pregate-a:
+    source: publisher
+  live/pregate-b:
+    source: publisher

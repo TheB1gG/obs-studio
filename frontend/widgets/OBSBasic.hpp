@@ -947,6 +947,9 @@ public:
 	 * one back while the rest of the session runs (the restart action of a failure notice). */
 	void StopDestination(std::string id, bool force = false);
 	bool RestartDestination(const std::string &id);
+	/* The pre-gate hook: schedule UI-level actions ("start@18,stop@24,quit@30") from the environment; see
+	 * test/pre-gate/README.md. */
+	void SchedulePregateActions(const QString &spec);
 	/* What the widgets that show the session need: one entry per destination that is live or still
 	 * attempting, with its output, its state and its reconnect counter. Copies on purpose - a widget ticks
 	 * on its own and must not hold on to the runtime vector. With includeStopped the destinations that
