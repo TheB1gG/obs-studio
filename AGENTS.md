@@ -145,6 +145,14 @@ tagging.
    as an offline-runner artefact. Ubuntu is slow; skipping it needs the user's go-ahead and the CI-PENDING
    entry must say so. A red Ubuntu job whose **Build** step passed but whose **Package** step died on a
    network error is an infrastructure flake, not a code failure (see scratch/plan/CI-NOTES.md).
+   A macOS leg may be skipped **only on the evidence that no runner was ever assigned to it**:
+   `scratch/tmp/gate-jobs.ps1 <run id>` shows the cancelled job with an empty `runner_name` (it stayed queued
+   until the cancel), and `scratch/tmp/gate-run-compare.ps1 <red run> <last green run>` proves the same pool
+   built recently. `cancelled` **with** a runner assigned, and `failure`, are build results and must be fixed,
+   not skipped. When macOS is skipped, the CI-PENDING row has to state the evidence and what the batch
+   touched, so the unverified surface is written down (2026-11-10, run 42837843752: both macOS legs cancelled
+   after a 15 min queue with no runner, Ubuntu and both Windows legs green, batch = one plugin file and the
+   harness, so the branch moved).
 
 ## 3a. What the macOS job catches and the Windows jobs do not (check before tagging)
 
