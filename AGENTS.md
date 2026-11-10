@@ -202,6 +202,34 @@ read out of unloaded code and libobs calls through it. That is the OBS-quit-with
 cost ~350 MB of encoder state per destination per session. `test/pre-gate` fails a case on the leak even when
 nothing crashes: libobs logs `N output(s)/encoder(s)/service(s) were remaining`, and any such line is a FAIL.
 
+## 3c. libobs locks: what a send thread may never take
+
+`struct obs_encoder`'s `init_mutex` (recursive) is the lock `obs_encoder_start_internal()`,
+`obs_encoder_stop()` and `obs_encoder_shutdown()` hold while they create/destroy the plugin context and move
+the raw-video connection. **A thread that consumes the encoder's packet queue must never take it**, because
+the holder is waiting on exactly that pipeline:
+
+```
+obs_encoder_start / _stop / _shutdown   [holds init_mutex]
+   └─ waits for the video/encode pipeline to settle (the connection, the in-flight frame)
+        └─ the encode thread delivers into the output's packet callback
+             └─ the RTMP add_packet path is full and waits for the send thread to drain
+                  └─ the send thread is inside a libobs entry point that takes init_mutex   ✗ cycle
+```
+
+This is not theoretical. Adding `obs_encoder_copy_extra_data()` - which took `init_mutex`, on the theory
+that it is the lock guarding the plugin context the RTMP send thread reads - turned every RTMP case into a
+hang: `t02`, `t12`, `t13`, `t16` ended with OBS frozen, exit -1, no `obs_free_data` line, and `t16` lost all
+13 scripted actions, i.e. it deadlocked during startup. The recording-only and cold-quit cases stayed green,
+because they have no send thread. The change was reverted.
+
+So the fix for the `send_audio_header` use-after-free must not put a libobs lock on the send thread. The
+shape that works is **moving the read to the thread the encoder already orders against**: the plugin snapshots
+the audio header bytes (its own `bmemdup`) from the audio packet callback - that callback runs on the
+encoder's own thread, where the borrowed pointer is safe by contract - and the send thread sends from the
+snapshot, the way `video_headers[]`/`update_video_header_snapshot` already does for video. Rule of thumb:
+snapshot the header where the lifecycle is ordered, consume it where it is not.
+
 ## 4. Launching the local rundir build (Windows, mandatory)
 
 `obs64.exe` resolves its data files **relative to the current working
