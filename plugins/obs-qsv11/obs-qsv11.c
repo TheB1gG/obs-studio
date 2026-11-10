@@ -2963,6 +2963,15 @@ static bool obs_qsv_encode(void *data, struct encoder_frame *frame, struct encod
 		return true; // skip this frame - encoder is transitioning
 	}
 
+	if (obs_encoder_keyframe_requested(obsqsv->encoder)) {
+		if (obs_encoder_is_in_group(obsqsv->encoder)) {
+			info("keyframe request dropped: grouped encoder keeps its shared keyframe grid");
+		} else {
+			info("forcing IDR for a consumer that attached mid-session (pts %lld)", (long long)enc->pts);
+			qsv_encoder_force_idr(obsqsv->context);
+		}
+	}
+
 	if (obs_encoder_has_roi(obsqsv->encoder))
 		obs_qsv_setup_rois(obsqsv);
 
@@ -3069,6 +3078,15 @@ static bool obs_qsv_encode_tex(void *data, struct encoder_texture *tex, int64_t 
 		*next_key = lock_key;
 		*received_packet = false;
 		return true; // skip this frame - encoder is transitioning
+	}
+
+	if (obs_encoder_keyframe_requested(obsqsv->encoder)) {
+		if (obs_encoder_is_in_group(obsqsv->encoder)) {
+			info("keyframe request dropped: grouped encoder keeps its shared keyframe grid");
+		} else {
+			info("forcing IDR for a consumer that attached mid-session (pts %lld)", (long long)pts);
+			qsv_encoder_force_idr(obsqsv->context);
+		}
 	}
 
 	if (obs_encoder_has_roi(obsqsv->encoder))

@@ -1265,6 +1265,27 @@ void pause_reset(struct pause_data *pause)
 	pthread_mutex_unlock(&pause->mutex);
 }
 
+EXPORT void obs_encoder_request_keyframe(obs_encoder_t *encoder)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_request_keyframe"))
+		return;
+	if (encoder->info.type != OBS_ENCODER_VIDEO)
+		return;
+
+	os_atomic_set_long(&encoder->keyframe_request, 1);
+}
+
+EXPORT bool obs_encoder_keyframe_requested(obs_encoder_t *encoder)
+{
+	if (!obs_encoder_valid(encoder, "obs_encoder_keyframe_requested"))
+		return false;
+
+	/* Exchange rather than load-then-store: a request can be raised while the encode thread
+	 * consumes one, and every request belongs to exactly one frame.
+	 */
+	return os_atomic_set_long(&encoder->keyframe_request, 0) != 0;
+}
+
 static inline void obs_encoder_start_internal(obs_encoder_t *encoder, encoded_callback_t new_packet, void *param)
 {
 	struct encoder_callback cb = {false, new_packet, param};
@@ -1283,11 +1304,26 @@ static inline void obs_encoder_start_internal(obs_encoder_t *encoder, encoded_ca
 
 	pthread_mutex_unlock(&encoder->callbacks_mutex);
 
+	/* A second output attaching to an encoder that is already encoding: the packet gate in
+	 * send_first_video_packet() holds back every packet until this callback has seen a
+	 * keyframe, so without a forced IDR the new consumer gets nothing decodable until the
+	 * next GOP boundary, while the consumers already attached keep streaming.
+	 */
+	if (!first && encoder_active(encoder)) {
+		blog(LOG_INFO, "Encoder '%s': output attached while encoding is running, requesting a keyframe",
+		     obs_encoder_get_name(encoder));
+		obs_encoder_request_keyframe(encoder);
+	}
+
 	if (first) {
 		os_atomic_set_bool(&encoder->paused, false);
 		pause_reset(&encoder->pause);
 
 		encoder->cur_pts = 0;
+		/* A fresh context emits an IDR as its first packet: drop a request left over from a
+		 * previous session so it cannot fire on the first frames of this one.
+		 */
+		os_atomic_set_long(&encoder->keyframe_request, 0);
 		// A fresh stream starts clean: drop any divisor change staged mid-stream so it is not re-applied on top
 		// of the rate already configured for this start.
 		encoder->pending_frame_rate_divisor = 0;

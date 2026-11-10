@@ -1844,6 +1844,29 @@ static bool obs_x264_encode(void *data, struct encoder_frame *frame, struct enco
 		obsx264->last_keyframe_pts = frame->pts;
 	}
 
+	/* A consumer attached while this encoder was already encoding, so libobs raised a
+	 * keyframe request for it (obs_encoder_request_keyframe): its packet gate drops every
+	 * packet until it sees a keyframe, and without help that is a whole GOP of dead air for
+	 * the new output while the consumers already attached keep streaming.  x264 has no
+	 * per-picture IDR request, so re-open the context - a freshly opened one emits an IDR
+	 * with inline SPS/PPS as its first frame (the mechanism the keyframe-grid realignment
+	 * above relies on), and the pts stay continuous across the re-open.
+	 */
+	if (obs_encoder_keyframe_requested(obsx264->encoder)) {
+		if (obs_encoder_is_in_group(obsx264->encoder)) {
+			info("keyframe request dropped: grouped encoder keeps its shared keyframe grid");
+		} else {
+			info("keyframe request: re-opening the encoder so a late consumer starts at an IDR");
+			if (!obs_x264_reopen_context(obsx264)) {
+				err("keyframe-request re-open failed - restart required");
+				return false;
+			}
+			obsx264->inited_fps_num = (uint32_t)obsx264->params.i_fps_num;
+			obsx264->inited_fps_den = (uint32_t)obsx264->params.i_fps_den;
+			obsx264->last_keyframe_pts = frame->pts;
+		}
+	}
+
 	init_pic_data(obsx264, &pic, frame);
 
 	if (obs_encoder_has_roi(obsx264->encoder))

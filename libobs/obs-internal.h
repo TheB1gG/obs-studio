@@ -1404,6 +1404,9 @@ struct obs_encoder {
 
 	/* track encoders that are part of a gop-aligned multi track group */
 	struct obs_encoder_group *encoder_group;
+	/* Raised when a consumer attached while this encoder was already producing and needs an IDR to
+ * start from; consumed by the plugin on its encode thread (see obs_encoder_request_keyframe). */
+	volatile long keyframe_request;
 
 	pthread_mutex_t outputs_mutex;
 	DARRAY(obs_output_t *) outputs;

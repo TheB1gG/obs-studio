@@ -2732,6 +2732,21 @@ bool nvenc_encode_base(struct nvenc_data *enc, struct nv_bitstream *bs, void *pi
 	if (obs_encoder_has_roi(enc->encoder))
 		add_roi(enc, &params);
 
+	/* A consumer attached while this encoder was already encoding - a recording on the shared
+	 * encoder, a fan-out destination started mid-session: libobs raised a keyframe request
+	 * because that consumer's packet gate (send_first_video_packet) drops every packet until
+	 * it has seen a keyframe, so without a fresh IDR it receives a whole GOP of undecodable
+	 * stream while the consumers already attached keep playing.  forceIDR restarts the
+	 * driver's idrPeriod from this frame, so a grouped encoder must not take one off-grid. */
+	if (obs_encoder_keyframe_requested(enc->encoder)) {
+		if (obs_encoder_is_in_group(enc->encoder)) {
+			info("keyframe request dropped: grouped encoder keeps its shared keyframe grid");
+		} else {
+			params.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
+			info("forcing IDR for a consumer that attached mid-session (pts=%lld)", (long long)pts);
+		}
+	}
+
 	/* Forced IDR at a shared boundary to re-anchor an off-grid session (see
 	 * nvenc_schedule_reanchor): the driver restarts its idrPeriod from any IDR, so one
 	 * on-grid IDR restores keyframe alignment with the sibling tracks. */

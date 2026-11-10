@@ -2346,6 +2346,29 @@ struct obs_encoder_frame_counters {
  */
 EXPORT void obs_encoder_get_frame_counters(const obs_encoder_t *encoder, struct obs_encoder_frame_counters *out);
 
+/*
+ * Ask a video encoder to emit an IDR as soon as it encodes its next frame.
+ *
+ * A second output attaching to an encoder that is already encoding receives nothing
+ * decodable until the first keyframe of its own callback: send_first_video_packet()
+ * drops every earlier packet.  Without a forced IDR that is a full GOP of dead air
+ * for the new consumer only (up to 8 s at keyint 250).  libobs raises this request
+ * itself when an output attaches mid-session; call it to re-anchor a running session.
+ *
+ * Safe to call from any thread: the request is a flag on the encoder, consumed by the
+ * plugin on its own encode thread (see obs_encoder_keyframe_requested).  An encoder
+ * whose plugin has no forced-keyframe support simply waits for its next natural
+ * keyframe, which is the behaviour from before this API existed.
+ */
+EXPORT void obs_encoder_request_keyframe(obs_encoder_t *encoder);
+
+/*
+ * Consumes a request raised with obs_encoder_request_keyframe(): returns true once per
+ * request.  Video encoder plugins must call this on their encode thread and, when it
+ * returns true, force an IDR onto the frame they are about to submit.
+ */
+EXPORT bool obs_encoder_keyframe_requested(obs_encoder_t *encoder);
+
 /** For audio encoders, returns the sample rate of the audio */
 EXPORT uint32_t obs_encoder_get_sample_rate(const obs_encoder_t *encoder);
 

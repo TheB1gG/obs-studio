@@ -1852,6 +1852,29 @@ static bool obs_x265_encode(void *data, struct encoder_frame *frame, struct enco
 		obsx265->last_keyframe_pts = frame->pts;
 	}
 
+	/* A consumer attached while this encoder was already encoding, so libobs raised a
+	 * keyframe request for it (obs_encoder_request_keyframe): its packet gate drops every
+	 * packet until it sees a keyframe, and without help that is a whole GOP of dead air for
+	 * the new output while the consumers already attached keep streaming.  x265 has no
+	 * per-picture IDR request, so re-open the context - a freshly opened one emits an IDR
+	 * with the parameter sets as its first frame (the mechanism the keyframe-grid
+	 * realignment above relies on), and the pts stay continuous across the re-open.
+	 */
+	if (obs_encoder_keyframe_requested(obsx265->encoder)) {
+		if (obs_encoder_is_in_group(obsx265->encoder)) {
+			info("keyframe request dropped: grouped encoder keeps its shared keyframe grid");
+		} else {
+			info("keyframe request: re-opening the encoder so a late consumer starts at an IDR");
+			if (!obs_x265_reopen_context(obsx265)) {
+				err("keyframe-request re-open failed - restart required");
+				return false;
+			}
+			obsx265->inited_fps_num = (uint32_t)obsx265->params.fpsNum;
+			obsx265->inited_fps_den = (uint32_t)obsx265->params.fpsDenom;
+			obsx265->last_keyframe_pts = frame->pts;
+		}
+	}
+
 	init_pic_data(obsx265, &pic, frame);
 
 	if (obs_encoder_has_roi(obsx265->encoder))
