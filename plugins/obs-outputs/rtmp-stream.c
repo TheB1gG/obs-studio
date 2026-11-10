@@ -165,8 +165,23 @@ static void rtmp_stream_destroy(void *data)
 		pthread_join(stream->send_thread, NULL);
 
 	} else if (connecting(stream) || active(stream)) {
-		if (stream->connecting)
-			pthread_join(stream->connect_thread, NULL);
+		if (stream->connecting) {
+			/* Record the stop before joining: the connect thread detaches itself only when no
+			 * stop is pending, and a join must never target a thread that has detached. The claim
+			 * on the thread is taken under connect_mutex - the same lock the thread holds while it
+			 * clears `connecting` and decides about that detach - and the join runs outside it,
+			 * because the thread's tail needs the lock and would deadlock against a held join. */
+			stream->stop_ts = 0;
+			os_event_signal(stream->stop_event);
+
+			bool join_connect;
+			pthread_mutex_lock(&stream->connect_mutex);
+			join_connect = stream->connecting;
+			pthread_mutex_unlock(&stream->connect_mutex);
+
+			if (join_connect)
+				pthread_join(stream->connect_thread, NULL);
+		}
 
 		stream->stop_ts = 0;
 		os_event_signal(stream->stop_event);
@@ -189,6 +204,7 @@ static void rtmp_stream_destroy(void *data)
 	os_event_destroy(stream->stop_event);
 	os_sem_destroy(stream->send_sem);
 	pthread_mutex_destroy(&stream->packets_mutex);
+	pthread_mutex_destroy(&stream->connect_mutex);
 	deque_free(&stream->packets);
 #ifdef TEST_FRAMEDROPS
 	deque_free(&stream->droptest_info);
@@ -215,12 +231,17 @@ static void *rtmp_stream_create(obs_data_t *settings, obs_output_t *output)
 	struct rtmp_stream *stream = bzalloc(sizeof(struct rtmp_stream));
 	stream->output = output;
 	pthread_mutex_init_value(&stream->packets_mutex);
+	pthread_mutex_init_value(&stream->connect_mutex);
 
 	RTMP_LogSetCallback(log_rtmp);
 	RTMP_LogSetLevel(RTMP_LOGWARNING);
 
 	if (pthread_mutex_init(&stream->packets_mutex, NULL) != 0)
 		goto fail;
+	if (pthread_mutex_init(&stream->connect_mutex, NULL) != 0) {
+		warn("Failed to initialize connect thread mutex");
+		goto fail;
+	}
 	if (os_event_init(&stream->stop_event, OS_EVENT_TYPE_MANUAL) != 0)
 		goto fail;
 
@@ -266,13 +287,27 @@ static void rtmp_stream_stop(void *data, uint64_t ts)
 	if (stopping(stream) && ts != 0)
 		return;
 
-	if (connecting(stream))
-		pthread_join(stream->connect_thread, NULL);
-
 	stream->stop_ts = ts / 1000ULL;
 
 	if (ts)
 		stream->shutdown_timeout_ts = ts + (uint64_t)stream->max_shutdown_time_sec * 1000000000ULL;
+
+	/* The connect thread is told about the stop before anything is joined, and the join is dropped from
+	 * this thread entirely. Two reasons, both measured:
+	 *  - the thread detaches itself when no stop is pending, and it cannot see a stop that is recorded
+	 *    after the join, so a connect finishing in that window used to leave the caller joining a
+	 *    detached thread - undefined, and the shape of a hang with no crash report;
+	 *  - the join runs on the thread that asked for the stop, which for a Stop press is the UI thread, and
+	 *    librtmp bounds the handshake only by its receive/send socket timeouts (20 s by default) - so the
+	 *    app answers nothing, including its own scripted timers, for that long.
+	 * connect_thread completes the stop when it returns; see its tail. */
+	pthread_mutex_lock(&stream->connect_mutex);
+	if (connecting(stream)) {
+		os_event_signal(stream->stop_event);
+		pthread_mutex_unlock(&stream->connect_mutex);
+		return;
+	}
+	pthread_mutex_unlock(&stream->connect_mutex);
 
 	if (active(stream)) {
 		os_event_signal(stream->stop_event);
@@ -289,9 +324,18 @@ static void rtmp_stream_abort(void *data)
 
 	os_atomic_set_bool(&stream->aborted, true);
 
+	/* The same hand-over as in rtmp_stream_stop: the abort is recorded here and connect_thread completes
+	 * it, so the caller never joins a thread that may be detaching itself and never waits for the
+	 * handshake. stop_ts == 0 is what tells the send thread to tear down without a graceful shutdown. */
+	pthread_mutex_lock(&stream->connect_mutex);
 	if (connecting(stream)) {
-		pthread_join(stream->connect_thread, NULL); /* wait for connect phase to finish */
+		stream->stop_ts = 0;
+		os_event_signal(stream->stop_event);
+		os_sem_post(stream->send_sem);
+		pthread_mutex_unlock(&stream->connect_mutex);
+		return;
 	}
+	pthread_mutex_unlock(&stream->connect_mutex);
 
 	if (active(stream)) {
 		info("Ungraceful abort requested - tearing down without graceful shutdown");
@@ -1594,10 +1638,23 @@ static void *connect_thread(void *data)
 		info("Connection to %s failed: %d", stream->path.array, ret);
 	}
 
-	if (!stopping(stream))
+	/* A stop asked while this thread was connecting was handed over to it by rtmp_stream_stop/abort, so
+	 * the stop's tail runs here: a stream that did become active has to be told to wind down. The detach
+	 * decision is made under connect_mutex - the lock the joiner holds when it claims the thread - which
+	 * is what keeps a pthread_join from ever meeting a pthread_detach on the same thread: a joiner only
+	 * joins after signalling stop_event, and this branch detaches only when no stop is pending. */
+	pthread_mutex_lock(&stream->connect_mutex);
+	if (stopping(stream)) {
+		if (active(stream)) {
+			os_event_signal(stream->stop_event);
+			if (stream->stop_ts == 0)
+				os_sem_post(stream->send_sem);
+		}
+	} else {
 		pthread_detach(stream->connect_thread);
-
+	}
 	os_atomic_set_bool(&stream->connecting, false);
+	pthread_mutex_unlock(&stream->connect_mutex);
 	return NULL;
 }
 
@@ -1610,8 +1667,13 @@ static bool rtmp_stream_start(void *data)
 	if (!obs_output_initialize_encoders(stream->output, 0))
 		return false;
 
+	/* `connecting` and the thread handle are one claim under connect_mutex: a stop that tests connecting
+	 * and joins must not interleave with the start that creates the thread. */
+	pthread_mutex_lock(&stream->connect_mutex);
 	os_atomic_set_bool(&stream->connecting, true);
-	return pthread_create(&stream->connect_thread, NULL, connect_thread, stream) == 0;
+	const bool created = pthread_create(&stream->connect_thread, NULL, connect_thread, stream) == 0;
+	pthread_mutex_unlock(&stream->connect_mutex);
+	return created;
 }
 
 static inline bool add_packet(struct rtmp_stream *stream, struct encoder_packet *packet)

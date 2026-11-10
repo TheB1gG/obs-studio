@@ -65,6 +65,10 @@ struct rtmp_stream {
 
 	volatile bool connecting;
 	pthread_t connect_thread;
+	/* Guards the connect thread's handle. Whoever joins it takes this lock, and the connect thread takes
+	 * it to clear `connecting` and decide about detaching, so a pthread_join can never land on a thread
+	 * that has detached itself (which is undefined and, on win32-pthreads, a way to hang forever). */
+	pthread_mutex_t connect_mutex;
 
 	volatile bool active;
 	volatile bool disconnected;
