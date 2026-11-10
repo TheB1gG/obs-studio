@@ -114,8 +114,10 @@ function pg_prepare_tree {
 # file of its own - the two shapes the destination engine has to keep apart.
 function pg_install_profile {
 	param([string]$Name, [int]$Destinations = 2, [int]$SharedKbps = 3000,
-		[string]$OverrideOn = '', [int]$OverrideKbps = 500, [string]$Server = 'rtmp://127.0.0.1:1935/live',
+		[string]$OverrideOn = '', [int]$OverrideKbps = 500, [string]$Server = '',
 		[switch]$Reconnect = $true)
+
+	if (-not $Server) { $Server = pg_rtmp_url }
 
 	$dir = Join-Path $PG.Profiles $Name
 	if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
@@ -391,12 +393,13 @@ function pg_check_cycles {
 	# its session's "Streaming Start" to "Streaming Stop" separator, of the recorder the recording's,
 	# and what an output should have delivered is fps times that window.
 	#
-	# The allowance is two measured costs summed with margin: a start reaches the ingest ~1.2 s after
-	# its request (the connect), and a stop discards the ~1.2 s of video the encoder still holds -
-	# 36-38 frames, whatever the session length (scratch/plan/CI-PENDING.md defects 2 and 3). Both
-	# are open defects, so the allowance is a fixed frame count and the check fails on a stall, not
-	# on the pipeline's normal latency: 33 delivered in a 3.2 s window is the healthy shape, 12 of
-	# 10 s (the mid-GOP attach of defect 1) is not.
+	# The allowance is a start window, not a stop tail: a start reaches the ingest ~1.2 s after its request
+	# (the connect), spawns its muxer ~1.2 s after it, and at launch waits for the graphics thread to exist -
+	# while the drawn counter already counted from the request. The stop tail is intact, because the muxer
+	# gates the close on the packet's capture timestamp (sys_dts_usec), so the file ends at the press. The
+	# deficit is a constant 36-39 frames over runs of 3.2 s and of 24.3 s, and the containers hold exactly
+	# what the log claims (a 2.0 s run holds 60 frames; the 181-of-219 run holds 181 packets), so 80 frames
+	# is the allowance and the starved shape defect 1 left behind (12 frames of a 10 s run) is what fails it.
 	pg_check_frame_windows -logText $logText -fps $fps -allowFrames $frameAllowFrames
 
 	$g = [regex]::Match($logText, 'obs_graphics_thread\([^)]*\): min=([\d.]+) ms, median=([\d.]+) ms, max=([\d.]+) ms')
@@ -414,8 +417,10 @@ function pg_check_cycles {
 # encoder's whole run, which starts with the first consumer that opened it - so a recorder sharing the
 # encoder, or a destination attached later, is charged for frames drawn before it existed. The window
 # of a stream output is its session's "Streaming Start"/"Streaming Stop" separators, the recorder's the
-# recording's, and the number it should reach is fps times that window minus the measured latency
-# allowance (a start needs ~1.2 s to reach the ingest, a stop discards ~1.2 s of held video).
+# recording's, and the number it should reach is fps times that window minus the start-window allowance: a
+# start needs ~1.2 s to reach the ingest or to spawn its muxer, and the drawn counter counts from the request
+# while the output sends only once its session is up. The stop tail is intact - the ffmpeg muxer closes the
+# file on the packet's capture timestamp (sys_dts_usec), so the recording ends at the instant Stop was pressed.
 function pg_check_frame_windows {
 	param([string]$logText, [double]$fps = 30, [int]$allowFrames = 80)
 
@@ -538,12 +543,13 @@ function pg_session {
 	param([string]$Case, [string]$Actions, [int]$Destinations = 2, [int]$SharedKbps = 3000,
 		[string]$OverrideOn = '', [int]$OverrideKbps = 500, [switch]$Stream, [switch]$Record,
 		[switch]$Media, [switch]$Ingest, [int]$ExitTimeoutSec = 150, [string[]]$ExpectInLog = @(),
-		[int]$ExpectLive = 0, [string]$Server = 'rtmp://127.0.0.1:1935/live', [switch]$Reconnect = $true,
+		[int]$ExpectLive = 0, [string]$Server = '', [switch]$Reconnect = $true,
 		[int]$LiveTimeoutSec = 30, [int]$ExpectStreamStarts = 0, [int]$ExpectStreamStops = 0,
 		[int]$ExpectRecStarts = 0, [int]$ExpectRecStops = 0, [double]$MaxStopLatencySec = 0,
 		[switch]$AllowRefusedStarts)
 
 	pg_prepare_tree
+	if (-not $Server) { $Server = pg_rtmp_url }
 	if ($Ingest -and -not (pg_ingest_ready)) {
 		pg_skip "the ingest is not installed (set OBS_PREGATE_MEDIAMTX, looked for: $($PG.MtxExe))"
 		return
@@ -565,7 +571,7 @@ function pg_session {
 	if ($Ingest) {
 		pg_say "  ingst starting the ingest ($($PG.MtxExe))"
 		$session = pg_ingest_start
-		pg_say "  ingst ingest is up (pid $($session.proc.Id)), log $($session.log)"
+		pg_say "  ingst ingest is up (pid $($session.proc.Id), RTMP on $($session.port)), log $($session.log)"
 	}
 	pg_say "  run   profile=$profile destinations=$Destinations actions='$Actions'"
 
@@ -617,6 +623,31 @@ function pg_session {
 # --- ingest: cases that count bytes on the wire, not labels in a dialog ------
 function pg_ingest_ready { Test-Path $PG.MtxExe }
 
+# The RTMP port the ingest serves and every case streams into. 1935 is the port mediamtx-api.yml names and the
+# one the generated profile services carry, but Windows reserves dynamic TCP port ranges at boot
+# (`netsh int ipv4 show excludedportrange protocol=tcp`) and a reservation that covers 1935 - which is what
+# happened on 2026-11-10, range 1895-1994 - makes the ingest die on "listen tcp :1935: bind: access denied".
+# The suite then spends 40 s per case reporting "the ingest never answered", which blames the code under test
+# for a listener that could never exist. So the port is chosen by binding it: the first candidate that answers
+# a bind is the number the generated yml, the profile services and the readiness probe agree on, and it is
+# printed so a transcript names the port it measured.
+function pg_rtmp_port {
+	if ($script:pgRtmpPort) { return $script:pgRtmpPort }
+	foreach ($cand in @(1935, 19350, 19351, 19352, 19353, 19354)) {
+		try {
+			$probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $cand)
+			$probe.Start()
+			$probe.Stop()
+			$script:pgRtmpPort = $cand
+			return $cand
+		} catch {}
+	}
+	throw ('no RTMP port can be bound on the loopback (tried 1935 and 19350-19354); ' +
+		'check "netsh int ipv4 show excludedportrange protocol=tcp"')
+}
+
+function pg_rtmp_url { "rtmp://127.0.0.1:$(pg_rtmp_port)/live" }
+
 # A TCP connect is the only honest check that the RTMP port is really served: the ingest answers on its API
 # even when the media listener it needs is the one that died, and a case that streams into nothing would
 # report a shutdown problem instead of saying that nothing was ever uploaded.
@@ -640,7 +671,13 @@ function pg_ingest_start {
 	Get-Process mediamtx -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill(); $null } catch {} }
 	Start-Sleep -Seconds 2
 	$apiPort = ([System.Uri]$PG.Api).Port
-	foreach ($port in @(1935, $apiPort)) {
+	$rtmpPort = pg_rtmp_port
+	# The committed yml is the template; the run's copy names the port that was actually free, so the ingest's
+	# media listener, the profile services and the readiness probe below all agree on one number.
+	$conf = Join-Path $PG.Work 'mediamtx-run.yml'
+	[System.IO.File]::WriteAllText($conf, ([System.IO.File]::ReadAllText($PG.MtxConf) -replace
+		'(?m)^rtmpAddress: :.*$', "rtmpAddress: :$rtmpPort"))
+	foreach ($port in @($rtmpPort, $apiPort)) {
 		$owner = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
 			Select-Object -First 1
 		if ($owner) {
@@ -650,7 +687,7 @@ function pg_ingest_start {
 
 	$mtxLog = Join-Path $PG.Work 'mediamtx.log'
 	if (Test-Path $mtxLog) { Remove-Item $mtxLog -Force -ErrorAction SilentlyContinue }
-	$p = Start-Process -FilePath $PG.MtxExe -ArgumentList "`"$($PG.MtxConf)`"" -WorkingDirectory $PG.Work `
+	$p = Start-Process -FilePath $PG.MtxExe -ArgumentList "`"$conf`"" -WorkingDirectory $PG.Work `
 		-RedirectStandardOutput $mtxLog -RedirectStandardError "$mtxLog.err" -PassThru -WindowStyle Hidden
 
 	# The ingest has to answer on its API before OBS is started: a run whose ingest never came up would fail
@@ -662,8 +699,8 @@ function pg_ingest_start {
 			$null = Invoke-RestMethod -Uri "$($PG.Api)/v3/paths/list" -TimeoutSec 3
 			$api = $true
 		} catch {}
-		if ($api -and (pg_tcp_open '127.0.0.1' $apiPort) -and (pg_tcp_open '127.0.0.1' 1935)) {
-			return @{ proc = $p; log = $mtxLog }
+		if ($api -and (pg_tcp_open '127.0.0.1' $apiPort) -and (pg_tcp_open '127.0.0.1' $rtmpPort)) {
+			return @{ proc = $p; log = $mtxLog; port = $rtmpPort }
 		}
 	}
 

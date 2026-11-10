@@ -94,10 +94,21 @@ Three measurements make the comparison honest, all of them from this suite's own
   it existed, so a healthy 2 s recording read as 63 of 359 lost. This is why the loss is scored per run of
   one output, and the run's window (the `Streaming Start`/`Stop` separators, `Recording Start`/`Stop` for
   the recorder) only decides whether the run is long enough to judge.
-- Every healthy stop discards the ~1.2 s of video the encoder still holds - 36-38 frames, whatever the
-  session length - and a start needs ~1.2 s to reach the ingest. The allowance is therefore a fixed
-  80 frames, twice that constant, and a run shorter than two seconds is not judged at all: its whole frame
-  count is inside the allowance, so scoring a 1.2 s reconnect run against a 2.7 s demand is not a finding.
+- The gap between the two counters is a **start window**, not a loss at the stop. `Total drawn frames`
+  starts counting at the start *request* (libobs snapshots the global frame counter in `obs_output_start`),
+  while an output only starts sending when its session is up: ~1.2 s to reach the ingest, ~1.2 s to spawn the
+  muxer process, and at launch the time until the graphics thread exists. The stop tail is intact - the ffmpeg
+  muxer gates the close on the packet's *capture* timestamp (`sys_dts_usec`, which libobs sets from the
+  packet's own clock, not its delivery time), so the file ends at the instant Stop was pressed. The containers
+  this suite recorded hold exactly what the log claims: a 2.0 s run holds 60 frames, and the run whose log
+  reads "delivered 181 of 219" holds 181 video packets. The deficit is a constant 36-39 frames in runs of
+  3.2 s and of 24.3 s alike, which is what a fixed window looks like and not what a proportional loss does.
+- The allowance is therefore 80 frames (~2.7 s of start window at 30 fps) and the shape the check exists to
+  catch stays far outside it: defect 1 delivered 12 frames of a 10 s run. A run shorter than two seconds is
+  not judged at all - its whole frame count is inside the allowance, so scoring a 1.2 s reconnect run against
+  a 2.7 s demand is not a finding. The one measured case that sits near the allowance, 66 frames (32 of 98
+  over a 3.2 s run), is `t16`: a restart issued inside a stop that has not finished. That overlap, not the
+  stop tail, is the open half of defect 2.
 
 `s02-accounting-selftest` runs on synthetic logs and asserts both directions of that check: the defect-1
 shape is rejected, a healthy stop tail and a short reconnect run are not, and a log whose counters have no
