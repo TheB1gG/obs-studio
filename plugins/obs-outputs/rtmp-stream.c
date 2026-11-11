@@ -2065,7 +2065,13 @@ static void rtmp_stream_data(void *data, struct encoder_packet *packet)
 		 * calls this callback, so its plugin context is alive by contract, and the send thread can then
 		 * work purely from the copy. A video header can only *change* at a keyframe - the reconfigure that
 		 * changes it also forces one - audio config can change with any packet, and the first packet of a
-		 * track seeds the snapshot, which is what makes a consumer that attaches mid-session connectable. */
+		 * track seeds the snapshot, which is what makes a consumer that attaches mid-session connectable.
+	 *
+		 * The encoder comes from the packet, never from the output: this callback runs on the encode thread,
+		 * the output that owns the track can be mid-start or mid-teardown here, and
+		 * obs_output_get_video_encoder2()/obs_output_get_audio_encoder() validate against libobs' object list
+		 * and read the encoder slot the start path writes - a layering violation and a data race, not a lookup.
+	 */
 		if (packet->type == OBS_ENCODER_VIDEO) {
 			if (packet->track_idx < MAX_OUTPUT_VIDEO_ENCODERS &&
 			    (packet->keyframe || !stream->video_headers_valid[packet->track_idx])) {
@@ -2078,14 +2084,12 @@ static void rtmp_stream_data(void *data, struct encoder_packet *packet)
 				const size_t idx = packet->track_idx;
 				snapshot_track_header(&stream->video_headers[idx], &stream->video_header_sizes[idx],
 						      &stream->video_headers_valid[idx],
-						      &stream->video_header_changed[idx],
-						      obs_output_get_video_encoder2(stream->output, idx));
+						      &stream->video_header_changed[idx], packet->encoder);
 			}
 		} else if (packet->track_idx < MAX_OUTPUT_AUDIO_ENCODERS) {
 			const size_t idx = packet->track_idx;
 			snapshot_track_header(&stream->audio_headers[idx], &stream->audio_header_sizes[idx],
-					      &stream->audio_headers_valid[idx], NULL,
-					      obs_output_get_audio_encoder(stream->output, idx));
+					      &stream->audio_headers_valid[idx], NULL, packet->encoder);
 		}
 
 		added_packet = (packet->type == OBS_ENCODER_VIDEO) ? add_video_packet(stream, &new_packet)
