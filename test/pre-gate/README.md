@@ -10,7 +10,16 @@ pwsh -NoProfile -File test/pre-gate/run.ps1 -Cases t15,t16   # an unambiguous pr
 pwsh -NoProfile -File test/pre-gate/run.ps1 -Base 727a470f2  # gate a batch that is already committed
 pwsh -NoProfile -File test/pre-gate/run.ps1 -Strict          # a SKIP counts as a failure
 pwsh -NoProfile -File test/pre-gate/run.ps1 -Background      # return at once, follow the transcript
+pwsh -NoProfile -File test/pre-gate/run.ps1 -ForceBusy       # measure on a loaded box, on the record
 ```
+
+Before the first case the runner runs a **preflight**: it samples the per-process CPU-time deltas over one
+second (the WMI `LoadPercentage` counter reads 0 on this box even under 12 spinners, so it is not used),
+names the processes that moved, and checks the free memory and disk. The delivery check counts frames
+delivered over a run, and CPU starvation looks exactly like a starved consumer, so a loaded machine is a
+**hard stop** (`exit 2`) rather than a note: a gate that passes on a loaded box proves less than one that
+refuses to run. `-ForceBusy` accepts it and the transcript prints `ACCEPTED ON A LOADED BOX`, so the record
+says which kind of run it was - and the serialization rule in AGENTS.md section 3 is why it exists.
 
 `s01-static` reads the C/C++ files **the batch changed**, so a committed batch has to be named: with the
 working tree clean and the default `-Base HEAD` it reports SKIP, and `-Strict` turns that into a failure

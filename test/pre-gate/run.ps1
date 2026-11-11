@@ -7,6 +7,12 @@
 	  pwsh -NoProfile -File test/pre-gate/run.ps1 -Cases t03-quit-while-streaming-two
 	  pwsh -NoProfile -File test/pre-gate/run.ps1 -NoMeasure        # lifecycle only, the fast half
 	  pwsh -NoProfile -File test/pre-gate/run.ps1 -Strict          # a SKIP is a failure (for gating)
+	  pwsh -NoProfile -File test/pre-gate/run.ps1 -ForceBusy       # accept a run measured on a loaded box
+
+ Before the first case the runner runs a preflight: active compilers, the WSL VM, CPU load, free memory and
+ free disk. The delivery check counts frames delivered over a run, so a busy machine reads exactly like a
+ starved consumer, and the suite refuses to measure on one (AGENTS.md section 3). -ForceBusy accepts it, and
+ the transcript then prints "ACCEPTED ON A LOADED BOX" so the record says which kind of run it was.
 
 	Exit code 0 means every case passed; 1 means at least one failed or errored. Each case runs in its own
 	powerhouse so a crashed OBS cannot take the rest of the suite with it.
@@ -17,7 +23,8 @@ param(
 	[switch]$NoMeasure,
 	[switch]$Strict,
 	[int]$CaseTimeoutSec = 420,
-	[switch]$Background
+	[switch]$Background,
+	[switch]$ForceBusy
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,6 +58,51 @@ Get-Process obs64, mediamtx -ErrorAction SilentlyContinue | ForEach-Object {
 	try { $_.Kill(); $null } catch {}
 }
 Start-Sleep -Seconds 2
+
+# Preflight: is this machine quiet enough to measure on? The delivery check counts frames delivered over a
+# run, and CPU starvation reads **exactly** like a starved consumer: two gates on 2026-11-10/11 were scored
+# while local builds ran, and one of them cost a 40-minute hunt for a deadlock the code did not contain.
+# A loaded box is a hard stop rather than a note - a gate that passes on a loaded machine proves less than
+# one that refuses to run - and only -ForceBusy accepts it, on the record.
+$busy = @()
+$probe = 'cl', 'link', 'MSBuild', 'VBCSCompiler', 'gcc', 'g++', 'cc1plus', 'ninja', 'cmake', 'ccache', 'vmmem', 'wslservice'
+# Win32_Processor.LoadPercentage reads 0 on this box even under 12 spinners (measured 2026-11-11), so the
+# utilization is sampled directly: the sum of the per-process CPU-time deltas over one wall-clock second,
+# divided by the core count. It costs two Get-Process passes and it names the processes that moved.
+$cores = [Environment]::ProcessorCount
+$before = @{}
+foreach ($pr in Get-Process) { try { $before[$pr.Id] = $pr.CPU } catch {} }
+Start-Sleep -Milliseconds 1000
+$used = 0.0
+$movers = @()
+foreach ($pr in Get-Process) {
+	if (-not $before.ContainsKey($pr.Id)) { continue }
+	try { $delta = $pr.CPU - $before[$pr.Id] } catch { continue }
+	if ($delta -le 0) { continue }
+	$used += $delta
+	if ($delta -gt 0.25) { $movers += [pscustomobject]@{ Name = $pr.ProcessName; Sec = $delta } }
+}
+$util = [math]::Round(100 * $used / $cores)
+if ($util -gt 25) {
+	$top = ($movers | Sort-Object Sec -Descending | Select-Object -First 4 |
+		ForEach-Object { "$($_.Name) $([math]::Round($_.Sec, 1))s" }) -join ', '
+	$busy += "CPU at $util% of $cores cores over the last second" + $(if ($top) { " (top: $top)" } else { '' })
+}
+$hot = @($movers | Where-Object { $probe -contains $_.Name } | ForEach-Object { $_.Name } | Select-Object -First 4)
+if ($hot.Count) { $busy += ("compiler/VM active: " + ($hot -join ', ')) }
+$freeGB = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)
+if ($freeGB -lt 4) { $busy += "only $freeGB GB physical memory free" }
+$drive = ($repo -split ':')[0]
+$freeDiskGB = [math]::Round((Get-PSDrive $drive).Free / 1GB, 1)
+if ($freeDiskGB -lt 5) { $busy += "only $freeDiskGB GB free on ${drive}: (the cases write recordings)" }
+if ($busy.Count -and -not $ForceBusy) {
+	Write-Output 'PREFLIGHT FAIL - the machine is not idle, and the delivery metric cannot tell CPU starvation from a code defect'
+	foreach ($b in $busy) { Write-Output "  - $b" }
+	Write-Output '  let the job finish first, or pass -ForceBusy to accept a run measured on a loaded box (and say so in scratch/plan/CI-PENDING.md)'
+	exit 2
+}
+$note = if ($ForceBusy -and $busy.Count) { ", ACCEPTED ON A LOADED BOX: $($busy -join '; ')" } else { '' }
+Write-Output ("preflight: machine usable (CPU " + $util + "% of $cores cores, $freeGB GB RAM free, ${drive}: $freeDiskGB GB free$note)")
 
 $pgLib = Join-Path $PSScriptRoot 'lib\pregate.ps1'
 if (-not (Test-Path $pgLib)) { throw "missing the suite library: $pgLib" }
