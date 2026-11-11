@@ -53,8 +53,10 @@ if ($Background) {
 	exit 0
 }
 
-# Anything still running from an earlier attempt poisons the ports and the log/crash comparisons.
-Get-Process obs64, mediamtx -ErrorAction SilentlyContinue | ForEach-Object {
+# Anything still running from an earlier attempt poisons the ports and the log/crash comparisons, and OBS's
+# WebView2 children outlive it often enough to matter: they burn cores, which the preflight below reads as a
+# busy box.
+Get-Process obs64, mediamtx, msedgewebview2 -ErrorAction SilentlyContinue | ForEach-Object {
 	try { $_.Kill(); $null } catch {}
 }
 Start-Sleep -Seconds 2
@@ -75,14 +77,21 @@ foreach ($pr in Get-Process) { try { $before[$pr.Id] = $pr.CPU } catch {} }
 Start-Sleep -Milliseconds 1000
 $used = 0.0
 $movers = @()
+$own = 'obs64', 'mediamtx', 'msedgewebview2'
+$suite = 0.0
 foreach ($pr in Get-Process) {
 	if (-not $before.ContainsKey($pr.Id)) { continue }
 	try { $delta = $pr.CPU - $before[$pr.Id] } catch { continue }
 	if ($delta -le 0) { continue }
+	# The suite's own process family is not external load: a repeat loop (scratch/tmp/pg-repeat.ps1) ran
+	# cases back to back and the preflight refused runs 2-12 in 4 s each, because the previous case's OBS
+	# x264 threads and its lingering WebView2 children were still burning cores.
+	if ($own -contains $pr.ProcessName) { $suite += $delta; continue }
 	$used += $delta
 	if ($delta -gt 0.25) { $movers += [pscustomobject]@{ Name = $pr.ProcessName; Sec = $delta } }
 }
 $util = [math]::Round(100 * $used / $cores)
+if ($suite -gt 0.5) { Write-Output ("preflight: the suite family used " + [math]::Round($suite, 1) + " CPU-s in the sample (obs64, mediamtx, msedgewebview2) and is not counted as load") }
 if ($util -gt 25) {
 	$top = ($movers | Sort-Object Sec -Descending | Select-Object -First 4 |
 		ForEach-Object { "$($_.Name) $([math]::Round($_.Sec, 1))s" }) -join ', '
