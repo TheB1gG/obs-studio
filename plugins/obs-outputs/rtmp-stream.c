@@ -92,36 +92,92 @@ static inline void free_packets(struct rtmp_stream *stream)
 static bool send_video_header(struct rtmp_stream *stream, size_t idx);
 static bool send_video_header_ts(struct rtmp_stream *stream, size_t idx, struct encoder_packet *ref);
 
-static void update_video_header_snapshot(struct rtmp_stream *stream, size_t idx)
+/* The codec header of a track is snapshotted on the encoder's own packet thread - rtmp_stream_data() below -
+ * and only ever handed to the send thread as a copy. The send thread must not call into an encoder object:
+ * obs_encoder_get_extra_data() runs the plugin's get_extra_data callback, which hands back a pointer into the
+ * plugin context, and that context is destroyed on the encoder's teardown, which the send thread does not
+ * synchronize with. A live stream closed at OBS quit used to read the audio header exactly there: the "size"
+ * it received was a heap address (1.2 TB), and the copy of it died in memcpy - see AGENTS.md section 3c and
+ * the audio-header entry in scratch/plan/CI-PENDING.md.
+ *
+ * snapshot_track_header() runs with packets_mutex held; a changed header (an encoder reconfigure, which also
+ * forces a keyframe) sets *changed so that the track's sequence start gets re-emitted before the first
+ * keyframe carrying the new bytes. take_track_header() is the send thread's private copy of it.
+ */
+static void snapshot_track_header(uint8_t **dst, size_t *dst_size, bool *valid, bool *changed, obs_encoder_t *encoder)
 {
-	obs_encoder_t *enc = obs_output_get_video_encoder2(stream->output, idx);
-	uint8_t *header;
+	uint8_t *header = NULL;
 	size_t size = 0;
+	const bool was_valid = *valid;
 
-	bfree(stream->video_headers[idx]);
-	stream->video_headers[idx] = NULL;
-	stream->video_header_sizes[idx] = 0;
+	if (!encoder || !obs_encoder_get_extra_data(encoder, &header, &size) || !header || !size)
+		return;
 
-	if (enc && obs_encoder_get_extra_data(enc, &header, &size) && size > 0) {
-		stream->video_headers[idx] = bmemdup(header, size);
-		stream->video_header_sizes[idx] = size;
+	if (*valid && *dst_size == size && memcmp(*dst, header, size) == 0)
+		return; // unchanged since the last snapshot
+
+	bfree(*dst);
+	*dst = bmemdup(header, size);
+	if (!*dst) {
+		*dst_size = 0;
+		*valid = false;
+		return;
 	}
+
+	*dst_size = size;
+	*valid = true;
+
+	/* A snapshot taken for the first time is not a mid-stream change: the header phase of the connection
+	 * sends it. Only bytes that replace a header already on the wire re-arm the resend. */
+	if (changed)
+		*changed = was_valid;
+}
+
+static bool take_track_header(struct rtmp_stream *stream, uint8_t **headers, size_t *sizes, bool *valid, size_t count,
+			      size_t idx, uint8_t **out, size_t *out_size)
+{
+	*out = NULL;
+	*out_size = 0;
+
+	for (int attempt = 0; attempt < 400; attempt++) {
+		bool have = false;
+
+		pthread_mutex_lock(&stream->packets_mutex);
+		if (idx < count && valid[idx] && headers[idx] && sizes[idx]) {
+			*out = bmemdup(headers[idx], sizes[idx]);
+			if (*out) {
+				*out_size = sizes[idx];
+				have = true;
+			}
+		}
+		pthread_mutex_unlock(&stream->packets_mutex);
+
+		if (have)
+			return true;
+
+		/* A stream that is going away must not be held up by a header whose producer will never run
+		 * again: an audio-only track with no packets, a video track that never keyed - bail out. */
+		if (os_atomic_load_bool(&stream->disconnected) || stream->stop_ts)
+			return false;
+
+		os_sleep_ms(5);
+	}
+
+	warn("no codec header snapshot for track %zu within 2 seconds", idx);
+	return false;
 }
 
 static void resend_video_header_if_changed(struct rtmp_stream *stream, struct encoder_packet *packet)
 {
-	size_t idx = packet->track_idx;
-	obs_encoder_t *enc = obs_output_get_video_encoder2(stream->output, idx);
-	uint8_t *header;
-	size_t size = 0;
+	const size_t idx = (size_t)packet->track_idx;
 
-	if (!enc || !obs_encoder_get_extra_data(enc, &header, &size))
+	if (idx >= MAX_OUTPUT_VIDEO_ENCODERS || !stream->video_header_changed[idx])
 		return;
 
-	if (stream->video_header_sizes[idx] == size && memcmp(stream->video_headers[idx], header, size) == 0)
-		return; // unchanged since last send
+	/* The producer of the snapshot is the encoder thread, so a fresh change shows up again at the next
+	 * keyframe; clear the flag before sending, a reconfigure during the send re-arms it. */
+	stream->video_header_changed[idx] = false;
 
-	update_video_header_snapshot(stream, idx);
 	/* Log the triggering keyframe's pts so a delayed header (encoder re-init vs. this
 	 * packet) can be diagnosed from the log alone - see 2026-10-23 x264 live-resize test. */
 	info("resending video codec header on track %zu (codec data changed mid-stream, first keyframe pts %lld)", idx,
@@ -220,6 +276,9 @@ static void rtmp_stream_destroy(void *data)
 
 	for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++)
 		bfree(stream->video_headers[i]);
+
+	for (size_t i = 0; i < MAX_OUTPUT_AUDIO_ENCODERS; i++)
+		bfree(stream->audio_headers[i]);
 
 	if (stream->write_buf)
 		bfree(stream->write_buf);
@@ -810,9 +869,6 @@ static void *send_thread(void *data)
 				os_atomic_set_bool(&stream->disconnected, true);
 				break;
 			}
-
-			for (size_t i = 0; i < MAX_OUTPUT_VIDEO_ENCODERS; i++)
-				update_video_header_snapshot(stream, i);
 		}
 
 		if (stream->dbr_enabled) {
@@ -951,55 +1007,67 @@ static bool send_audio_header(struct rtmp_stream *stream, size_t idx, bool *next
 		return true;
 	}
 
-	if (obs_encoder_get_extra_data(aencoder, &header, &packet.size)) {
-		packet.data = bmemdup(header, packet.size);
-		if (idx == 0 && stream->audio_codec[idx] == AUDIO_CODEC_AAC) {
-			return send_packet(stream, &packet, true) >= 0;
-		} else {
-			return send_audio_packet_ex(stream, &packet, true, idx) >= 0;
-		}
-	}
-	return false;
+	/* The bytes come from the snapshot the audio encoder's own packet callback took, on the thread where
+	 * reading the encoder is safe: this thread has no claim on the encoder, and its plugin context is
+	 * destroyed on the encoder's teardown - reading the extra data here is the use-after-free that killed
+	 * a stream that was still live when OBS quit (the "size" was then a heap address). */
+	if (!take_track_header(stream, stream->audio_headers, stream->audio_header_sizes, stream->audio_headers_valid,
+			       MAX_OUTPUT_AUDIO_ENCODERS, idx, &header, &packet.size))
+		return false;
+
+	packet.data = header;
+
+	if (idx == 0 && stream->audio_codec[idx] == AUDIO_CODEC_AAC)
+		return send_packet(stream, &packet, true) >= 0;
+
+	return send_audio_packet_ex(stream, &packet, true, idx) >= 0;
 }
 
 static bool send_video_header(struct rtmp_stream *stream, size_t idx)
 {
 	obs_output_t *context = stream->output;
 	obs_encoder_t *vencoder = obs_output_get_video_encoder2(context, idx);
-	uint8_t *header;
-	size_t size;
+	uint8_t *header = NULL;
+	size_t size = 0;
 
 	struct encoder_packet packet = {.type = OBS_ENCODER_VIDEO, .timebase_den = 1, .keyframe = true};
 
 	if (!vencoder)
 		return false;
 
-	if (!obs_encoder_get_extra_data(vencoder, &header, &size))
+	/* Snapshot-fed, as send_audio_header is. VP9 synthesizes its sequence start from the video mode and
+	 * needs no codec-private bytes, so only the other codecs require a snapshot. */
+	if (stream->video_codec[idx] != CODEC_VP9 &&
+	    !take_track_header(stream, stream->video_headers, stream->video_header_sizes, stream->video_headers_valid,
+			       MAX_OUTPUT_VIDEO_ENCODERS, idx, &header, &size))
 		return false;
+
+	bool success = false;
 
 	switch (stream->video_codec[idx]) {
 	case CODEC_NONE:
 		do_log(LOG_ERROR, "Codec not initialized for track %zu while sending header", idx);
-		return false;
+		break;
 
 	case CODEC_H264:
 		packet.size = obs_parse_avc_header(&packet.data, header, size);
 		// Always send H.264 on track 0 as old style for compatibility.
 		if (idx == 0) {
-			return send_packet(stream, &packet, true) >= 0;
+			success = send_packet(stream, &packet, true) >= 0;
 		} else {
-			return send_packet_ex(stream, &packet, true, false, idx) >= 0;
+			success = send_packet_ex(stream, &packet, true, false, idx) >= 0;
 		}
+		break;
 	case CODEC_HEVC:
 #ifdef ENABLE_HEVC
 		packet.size = obs_parse_hevc_header(&packet.data, header, size);
-		return send_packet_ex(stream, &packet, true, false, idx) >= 0;
-#else
-		return false;
+		success = send_packet_ex(stream, &packet, true, false, idx) >= 0;
 #endif
+		break;
 	case CODEC_AV1:
 		packet.size = obs_parse_av1_header(&packet.data, header, size);
-		return send_packet_ex(stream, &packet, true, false, idx) >= 0;
+		success = send_packet_ex(stream, &packet, true, false, idx) >= 0;
+		break;
 	case CODEC_VP9: {
 		// QSV VP9 delivers raw, self-contained frames and no IVF/decoder
 		// extradata, so synthesize the 'vpcC' decoder-configuration record that
@@ -1010,11 +1078,13 @@ static bool send_video_header(struct rtmp_stream *stream, size_t idx)
 		size_t n = flv_build_vp9_seq_header(vpcc, info);
 		packet.data = bmemdup(vpcc, n);
 		packet.size = n;
-		return send_packet_ex(stream, &packet, true, false, idx) >= 0;
+		success = send_packet_ex(stream, &packet, true, false, idx) >= 0;
+		break;
 	}
 	}
 
-	return false;
+	bfree(header);
+	return success;
 }
 
 /* Mid-stream re-emit of a track's codec header (see resend_video_header_if_changed).
@@ -1029,8 +1099,8 @@ static bool send_video_header_ts(struct rtmp_stream *stream, size_t idx, struct 
 
 	obs_output_t *context = stream->output;
 	obs_encoder_t *vencoder = obs_output_get_video_encoder2(context, idx);
-	uint8_t *header;
-	size_t size;
+	uint8_t *header = NULL;
+	size_t size = 0;
 
 	struct encoder_packet packet = {.type = OBS_ENCODER_VIDEO, .keyframe = true};
 	packet.dts          = ref->dts;
@@ -1040,12 +1110,16 @@ static bool send_video_header_ts(struct rtmp_stream *stream, size_t idx, struct 
 	if (!vencoder)
 		return false;
 
-	if (!obs_encoder_get_extra_data(vencoder, &header, &size))
+	/* Snapshot-fed, as in send_video_header: the encoder's bytes arrive as a copy the encoder thread took. */
+	if (stream->video_codec[idx] != CODEC_VP9 &&
+	    !take_track_header(stream, stream->video_headers, stream->video_header_sizes, stream->video_headers_valid,
+			       MAX_OUTPUT_VIDEO_ENCODERS, idx, &header, &size))
 		return false;
 
 	switch (stream->video_codec[idx]) {
 	case CODEC_NONE:
 		do_log(LOG_ERROR, "Codec not initialized for track %zu while resending header", idx);
+		bfree(header);
 		return false;
 
 	case CODEC_H264:
@@ -1054,10 +1128,11 @@ static bool send_video_header_ts(struct rtmp_stream *stream, size_t idx, struct 
 	case CODEC_HEVC:
 #ifdef ENABLE_HEVC
 		packet.size = obs_parse_hevc_header(&packet.data, header, size);
+		break;
 #else
+		bfree(header);
 		return false;
 #endif
-		break;
 	case CODEC_AV1:
 		packet.size = obs_parse_av1_header(&packet.data, header, size);
 		break;
@@ -1072,7 +1147,10 @@ static bool send_video_header_ts(struct rtmp_stream *stream, size_t idx, struct 
 	}
 	}
 
-	return send_packet_start_ts(stream, &packet, idx) >= 0;
+	int ret = send_packet_start_ts(stream, &packet, idx);
+	bfree(header);
+
+	return ret >= 0;
 }
 
 // only returns false if there's an error, not if no metadata needs to be sent
@@ -1198,6 +1276,14 @@ static inline bool send_headers(struct rtmp_stream *stream)
 		if (!send_audio_header(stream, i++, &next))
 			return false;
 	}
+
+	/* Everything this connection needs is on the wire from here on, so the change flags describe only the
+	 * headers that arrive after this point. They are cleared under packets_mutex, the lock the producer of
+	 * a snapshot holds. */
+	pthread_mutex_lock(&stream->packets_mutex);
+	for (size_t j = 0; j < MAX_OUTPUT_VIDEO_ENCODERS; j++)
+		stream->video_header_changed[j] = false;
+	pthread_mutex_unlock(&stream->packets_mutex);
 
 	return true;
 }
@@ -1975,6 +2061,33 @@ static void rtmp_stream_data(void *data, struct encoder_packet *packet)
 	pthread_mutex_lock(&stream->packets_mutex);
 
 	if (!disconnected(stream)) {
+		/* Snapshot this track's codec header here, on the thread that produced the packet: the encoder
+		 * calls this callback, so its plugin context is alive by contract, and the send thread can then
+		 * work purely from the copy. A video header can only *change* at a keyframe - the reconfigure that
+		 * changes it also forces one - audio config can change with any packet, and the first packet of a
+		 * track seeds the snapshot, which is what makes a consumer that attaches mid-session connectable. */
+		if (packet->type == OBS_ENCODER_VIDEO) {
+			if (packet->track_idx < MAX_OUTPUT_VIDEO_ENCODERS &&
+			    (packet->keyframe || !stream->video_headers_valid[packet->track_idx])) {
+				/* A keyframe refreshes the snapshot; the track's first packet also seeds it. The seed is
+				 * what keeps a destination usable that attaches to an encoder that is already encoding: its
+				 * first keyframe can be a whole GOP away, and the send thread needs the header before it can
+				 * flush the publish command, so with a keyframe-only snapshot the ingest accepts the
+				 * connection, receives nothing, closes it at its read timeout, and the destination reconnects.
+				 */
+				const size_t idx = packet->track_idx;
+				snapshot_track_header(&stream->video_headers[idx], &stream->video_header_sizes[idx],
+						      &stream->video_headers_valid[idx],
+						      &stream->video_header_changed[idx],
+						      obs_output_get_video_encoder2(stream->output, idx));
+			}
+		} else if (packet->track_idx < MAX_OUTPUT_AUDIO_ENCODERS) {
+			const size_t idx = packet->track_idx;
+			snapshot_track_header(&stream->audio_headers[idx], &stream->audio_header_sizes[idx],
+					      &stream->audio_headers_valid[idx], NULL,
+					      obs_output_get_audio_encoder(stream->output, idx));
+		}
+
 		added_packet = (packet->type == OBS_ENCODER_VIDEO) ? add_video_packet(stream, &new_packet)
 								   : add_packet(stream, &new_packet);
 	}

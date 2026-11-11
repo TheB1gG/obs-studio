@@ -125,6 +125,14 @@ struct rtmp_stream {
 	/* Last-sent codec data per video track (mid-stream change detection) */
 	uint8_t *video_headers[MAX_OUTPUT_VIDEO_ENCODERS];
 	size_t video_header_sizes[MAX_OUTPUT_VIDEO_ENCODERS];
+	bool video_headers_valid[MAX_OUTPUT_VIDEO_ENCODERS];
+	bool video_header_changed[MAX_OUTPUT_VIDEO_ENCODERS];
+	/* The audio counterpart of the video header snapshots. Both are written on the encoder's own packet
+	 * thread and read by the send thread as copies: that thread may not call into an encoder object at
+	 * all, whose plugin context is torn down on another thread. */
+	uint8_t *audio_headers[MAX_OUTPUT_AUDIO_ENCODERS];
+	size_t audio_header_sizes[MAX_OUTPUT_AUDIO_ENCODERS];
+	bool audio_headers_valid[MAX_OUTPUT_AUDIO_ENCODERS];
 
 	RTMP rtmp;
 
