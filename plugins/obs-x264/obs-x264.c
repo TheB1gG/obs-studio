@@ -153,6 +153,26 @@ struct obs_x264 {
 	int64_t  target_pts;        /* next shared keyframe pts to re-open on (0 = not staged) */
 	int64_t  last_keyframe_pts; /* most recent steady-state on-grid keyframe pts (-1 = none yet) */
 	int64_t  gop_pts;           /* measured keyframe interval in pts units */
+
+	/* x264's output DTS (pic_out.i_dts) is the encoder's own frame counter: it restarts from
+	 * -delay in every freshly opened context, while the pts is the caller's (frame->pts, echoed
+	 * back as pic_out.i_pts) and keeps running across re-opens. libobs derives each packet's
+	 * wall-clock dts_usec from packet->dts, and the outputs treat that as a monotone timeline: the
+	 * interleave gate in obs-output.c releases a packet of one type only while the opposing type's
+	 * highest dts_usec is above it (both are running maxima), and the muxers compute durations from
+	 * it. So a mid-session context re-open (a late consumer's keyframe request, a live resize, a
+	 * live FPS change, the keyframe-grid realignment) drops the timeline of every output attached
+	 * to this encoder by the elapsed session - the interleave gate then withholds the audio of every
+	 * attached output until real time catches up, and the muxers reject the packets: a destination
+	 * that delivers almost nothing, an ingest that closes a publisher it never read a publish
+	 * command from, a recording that delivers 1 frame of 300.
+	 *
+	 * The grid to re-anchor on is the pts, which never jumps. dts_lag is this encoder's reordering
+	 * lag (pts - dts) as measured in steady state, carried across a re-open: the DTS is pts - lag.
+	 * In steady state that reproduces x264's own number exactly (lag is by definition pts - i_dts),
+	 * so an encoder that never re-opens emits what it always emitted; only the frames a fresh
+	 * context produces before it has caught up change, and they stop dragging the timeline back. */
+	int64_t dts_lag;
 };
 
 /* Forward declarations */
@@ -1295,6 +1315,19 @@ static void *obs_x264_create(obs_data_t *settings, obs_encoder_t *encoder)
 	return obsx264;
 }
 
+/* Re-anchor one context's own DTS counter onto the pts grid the caller keeps running (see dts_lag).
+ * In steady state the lag is measured from the encoder's own numbers, so this hands back i_dts
+ * unchanged; only a freshly opened context - whose counter starts over, hundreds of frames behind
+ * the pts - gets its output moved onto the grid. 64 is far above any real reordering lag (B-frame
+ * delay at most ~17 frames) and far below the gap a restarted counter leaves, so it separates them. */
+static int64_t x264_grid_dts(struct obs_x264 *obsx264, int64_t pts, int64_t i_dts)
+{
+	const int64_t lag = pts - i_dts;
+	if (lag >= 0 && lag <= 64)
+		obsx264->dts_lag = lag;
+	return pts - obsx264->dts_lag;
+}
+
 static void parse_packet(struct obs_x264 *obsx264, struct encoder_packet *packet, x264_nal_t *nals, int nal_count,
 			 x264_picture_t *pic_out)
 {
@@ -1312,7 +1345,7 @@ static void parse_packet(struct obs_x264 *obsx264, struct encoder_packet *packet
 	packet->size = obsx264->packet_data.num;
 	packet->type = OBS_ENCODER_VIDEO;
 	packet->pts = pic_out->i_pts;
-	packet->dts = pic_out->i_dts;
+	packet->dts = x264_grid_dts(obsx264, pic_out->i_pts, pic_out->i_dts);
 	packet->keyframe = pic_out->b_keyframe != 0;
 }
 
@@ -1369,7 +1402,7 @@ static void obs_x264_flush_enqueue(struct obs_x264 *obsx264, x264_nal_t *nals, i
 	}
 	pkt->size     = total;
 	pkt->pts      = pic_out->i_pts;
-	pkt->dts      = pic_out->i_dts;
+	pkt->dts      = x264_grid_dts(obsx264, pic_out->i_pts, pic_out->i_dts);
 	pkt->keyframe = pic_out->b_keyframe != 0;
 }
 
@@ -1568,7 +1601,8 @@ static void add_roi(struct obs_x264 *obsx264, x264_picture_t *pic)
  * rate (e.g. 30->60 fps doubles it, 30->15 halves it). Re-opening the context re-runs
  * rate_control_init() with the new fps and emits a fresh IDR + SPS/PPS. Output timing is
  * driven by the caller's i_pts (frame->pts), which libobs keeps continuous via the
- * frame-rate divisor, so DTS/PTS do not regress across the re-init. This runs on the
+ * frame-rate divisor; the DTS is x264's own frame counter and does restart at the re-init,
+ * which x264_grid_dts re-anchors onto the running pts grid (see dts_lag). This runs on the
  * encode thread - the same thread libobs uses for deferred update() - so no extra lock
  * is needed. */
 /* Close the x264 context, drop its cached headers, and re-open it with the current

@@ -121,6 +121,18 @@ struct obs_x265 {
 	int64_t  last_keyframe_pts; /* most recent steady-state on-grid keyframe pts (-1 = none yet) */
 	int64_t  gop_pts;           /* measured keyframe interval in pts units */
 
+	/* x265's output DTS (pic_out.dts) is the encoder's own frame counter: it restarts in every
+	 * freshly opened context, while the pts is the caller's and keeps running across re-opens.
+	 * libobs derives each packet's wall-clock dts_usec from packet->dts, and the outputs treat that
+	 * as a monotone timeline (the interleave gate in obs-output.c releases a packet of one type only
+	 * while the opposing type's highest dts_usec is above it; the muxers compute durations from it).
+	 * A mid-session context re-open therefore drops the timeline of every output attached to this
+	 * encoder by the elapsed session. dts_lag is this encoder's reordering lag (pts - dts) measured
+	 * in steady state and carried across a re-open, so the DTS is pts - lag: identical to x265's own
+	 * number in steady state, and re-anchored onto the running grid for the frames a fresh context
+	 * emits before it has caught up. Mirrors obs-x264.c. */
+	int64_t dts_lag;
+
 	DARRAY(uint8_t) packet_data;
 
 	uint8_t *extra_data;
@@ -505,6 +517,18 @@ static const char *obs_x265_getname(void *unused)
 	return "x265";
 }
 
+/* Re-anchor one context's own DTS counter onto the pts grid the caller keeps running (see dts_lag).
+ * In steady state the lag is measured from the encoder's own numbers, so this hands back pic_out.dts
+ * unchanged; only a freshly opened context gets its output moved onto the running grid. See the same
+ * helper in obs-x264.c for why 64 separates a real reordering lag from a restarted counter. */
+static int64_t x265_grid_dts(struct obs_x265 *obsx265, uint64_t pts, uint64_t dts)
+{
+	const int64_t lag = (int64_t)pts - (int64_t)dts;
+	if (lag >= 0 && lag <= 64)
+		obsx265->dts_lag = lag;
+	return (int64_t)pts - obsx265->dts_lag;
+}
+
 /* Copy one flushed access unit into the re-emit queue. */
 static void obs_x265_flush_enqueue(struct obs_x265 *obsx265, x265_nal *nals, int nal_count, const x265_picture *pic_out)
 {
@@ -521,7 +545,7 @@ static void obs_x265_flush_enqueue(struct obs_x265 *obsx265, x265_nal *nals, int
 	}
 	pkt->size     = total;
 	pkt->pts      = pic_out->pts;
-	pkt->dts      = pic_out->dts;
+	pkt->dts      = x265_grid_dts(obsx265, pic_out->pts, pic_out->dts);
 	pkt->keyframe = IS_X265_TYPE_I(pic_out->sliceType);
 }
 
@@ -1396,8 +1420,9 @@ static void parse_packet(struct obs_x265 *obsx265, struct encoder_packet *packet
 	/* Use the encoder's decode-order timestamp (reordered pts), not the display
 	 * pts. With B-frames the two differ, and stamping DTS with display pts makes
 	 * the DTS sequence non-monotonic; the MP4 muxer then computes a bogus track
-	 * duration (>UINT32_MAX -> malformed mvhd). x264 does the same via i_dts. */
-	packet->dts = pic_out->dts;
+	 * duration (>UINT32_MAX -> malformed mvhd). x264 does the same via i_dts.
+	 * The value is x265's own frame counter, so it goes through the DTS grid. */
+	packet->dts = x265_grid_dts(obsx265, pic_out->pts, pic_out->dts);
 	packet->keyframe = IS_X265_TYPE_I(pic_out->sliceType);
 }
 
@@ -1572,8 +1597,9 @@ static void add_roi(struct obs_x265 *obsx265, x265_picture *pic)
  * bitrate scales with the delivery rate (e.g. 30->60 fps doubles it, 30->15 halves it).
  * Re-opening the context re-runs the rate-control init with the new fps and emits a
  * fresh IDR + VPS/SPS/PPS. Output timing is driven by the caller's pts (frame->pts),
- * which libobs keeps continuous via the frame-rate divisor, so DTS/PTS do not regress
- * across the re-init. This runs on the encode thread - the same thread libobs uses for
+ * which libobs keeps continuous via the frame-rate divisor; the DTS is x265's own frame
+ * counter and does restart at the re-init, which x265_grid_dts re-anchors onto the running
+ * pts grid (see dts_lag). This runs on the encode thread - the same thread libobs uses for
  * deferred update() - so no extra lock is needed. */
 /* Close and re-open the x265 context with the current params. A freshly opened context emits
  * VPS/SPS/PPS + IDR as its first frame, so any live change that requires a re-init (FPS, size)
