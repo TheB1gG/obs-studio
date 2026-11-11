@@ -99,7 +99,13 @@ longer on arm64, 30-45 min on Ubuntu, so letting a runner discover what a local 
 whole cycle. Waiting for a run while doing nothing is still forbidden - start the next slice right after
 tagging.
 
-1. Finish the whole feature locally, working as if it were one commit.
+1. Finish the whole feature locally, working as if it were one commit: **development happens
+   in the working tree** - build targets, run case subsets, change code freely; create the
+   commits only when the feature is finished (section 7). A commit made mid-development is a
+   commit that gets amended, cherry-picked or re-shaped, and each of those costs more than
+   writing it last (a cherry-pick onto a tip that already contains the commit yields an empty
+   commit; `--amend` applies to HEAD, which is not the commit you mean during a per-slice
+   sequence).
 2. Pre-tag checklist - all of it, before any tag exists:
    - `cmake --build build_x64 --config RelWithDebInfo --target obs-studio`
    - `pwsh -NoProfile -File test/pre-gate/run.ps1` green, or every SKIP named in CI-PENDING
@@ -111,6 +117,14 @@ tagging.
      grep, and it is the only place those rules get re-checked from now on.
    - the gcc-strictness read of the new code: signed/unsigned comparisons, unused members and functions, and
      STL includes Apple libc++ does not provide transitively - a read, not a script: the suite cannot do it
+   - the **Ubuntu parity build**, which is local now: the dedicated WSL instance `obsbuild26`
+     configures and builds the tree with the CI's own `ubuntu-ci` preset
+     (`CMAKE_COMPILE_WARNING_AS_ERROR=true`, gcc `-Wextra`). The commands and the reason are in
+     `scratch/plan/THROUGHPUT.md`; a tag cycle costs 30-45 min to learn what this learns in minutes
+   - the gate runs on an **idle machine**: the delivery metric counts frames delivered over a run, and CPU
+     starvation from a local build, a WSL build, a Defender scan or a large copy looks exactly like a starved
+     consumer - two gates on 2026-11-10/11 were scored that way, and one of them caused a 40-minute hunt for a
+     deadlock the code did not contain
    - one portable smoke launch (section 6) with no crash report written
    - never finish a verification run by killing OBS: `obs_shutdown()` only runs on a real close, and that is
      where the fan-out's outputs, encoders and services die. Ask the app to quit - `test/pre-gate` does that
@@ -121,6 +135,13 @@ tagging.
      objects - the build is clean and the reverted behaviour is quietly back in the executable. Check the
      `.obj` timestamp, or look for the new identifier in the built binary (the frontend is compiled into
      `obs64.exe`, there is no frontend DLL to inspect).
+   - timestamps are the cheap half; the strong proof is a build that **names the file you changed**. On
+     2026-11-11 an `obs64.exe` of 21:26 carried the verdicts of gates meant to verify an
+     `OBSBasic_Streaming.cpp` last written at 22:35, and three gate runs (one of them a 19/19) had scored the
+     older shape. The next build printed `Compiling OBSBasic_Streaming.cpp` - the proof the object was stale -
+     and on the rebuilt binary the suite found a regression the stale binary had hidden (the codec-header seed
+     in the plugin commit). So: compare the source mtime with the binary's before trusting a gate that is
+     supposed to cover it, and read the build output for the file, not only for its exit code.
 3. Shape the history to its final form **before** the gate (section 7): squash the batch and correct a build
    slip by amending the commit that contains it, so a mistake never becomes a commit of its own.
 4. Tag the tip once: schema `test-<problem-or-feature>` - the name of the problem being fixed or the feature
@@ -167,6 +188,28 @@ is exactly what failed run 42284720040. Case `s01-static` checks every C/C++ fil
 The same file turns on `-Wshorten-64-to-32` (line 48), which MSVC has no equivalent of: a Qt 6 `qsizetype`
 (the return type of `QString::indexOf`/`lastIndexOf`, container `size()`) must never be assigned to `int`.
 Write `const qsizetype at = name.indexOf(':');` - `int` compiles here and breaks both macOS legs.
+
+`cmake/common/compiler_common.cmake` names `-Wunused-parameter` explicitly (line 34, next to `-Wunused-variable`
+and `-Wunused-value`, while lines 32-33 silence the unused-function and unused-label variants), and the Ubuntu
+leg builds with `-Wextra` plus the same set; `-Werror` is on for all three. **A parameter a function does not
+use therefore kills the Ubuntu leg and both macOS legs, and MSVC never reports it.** The batch at `55c4f393a`
+passed 19 of 19 pre-gate cases and lost three CI legs on
+`rtmp-stream.c:107:55: unused parameter 'stream'` - a snapshot helper that took the plugin's stream pointer and
+never read it. So the gcc-strictness read of new code (section 3, step 2) covers unused parameters, unused
+members and unused statics next to the signed/unsigned checks: when a helper does not need a value, take it out
+of the signature rather than silencing the warning.
+
+`-Wextra` (on the Linux leg's command line, not in the clang list) brings `-Wtype-limits`, and that one is
+gcc-only in practice: **a `size_t >= 0` comparison is a tautology, and Ubuntu alone turns it into an error.** The
+second CI cycle of the batch at `55c4f393a` died on
+`rtmp-stream.c:2069:67: comparison of unsigned expression in '>= 0' is always true [-Werror=type-limits]` with
+macOS x86_64, macOS arm64 and Windows x64 all green in that run (42924150663) - `encoder_packet::track_idx` is
+`size_t` (libobs/obs-encoder.h:139), so the guard is `track_idx < MAX_OUTPUT_*` and nothing more. Read added
+comparisons against the type of the value, not against the compiler being built with: `>= 0`, `< 0` and
+`!x`-style tests on an unsigned value, and the same tests on a function's return type, which is where a
+`bool`-returning helper turns `>= 0` into `-Wbool-compare`.
+
+These Linux-leg rules are checked locally now: the dedicated WSL distro `obsbuild26` (its own instance name and its own location, so the normal WSL Ubuntu stays free) builds the tree with the CI's own `ubuntu-ci` preset, gcc `-Wextra` and `CMAKE_COMPILE_WARNING_AS_ERROR=true` - run the bundle refresh and the build, and a gcc-only compile error becomes a local failure instead of a 30-45 minute CI leg. The recipe is in `scratch/plan/THROUGHPUT.md`. Two facts about it cost time to learn: a Windows-authored shell script arrives with CRLF, and bash treats a quoted heredoc delimiter followed by `\r` as non-matching, so the body is echoed and the toolchain is never installed - run it as `tr -d '\r' < /mnt/e/... | bash -s`; and `apt-get install` **aborts the whole transaction** when one name is unlocatable (26.04 renamed `libvpl*`), so the script prints its own success line while having installed nothing - filter the list against `apt-cache policy` first.
 
 A branch push also runs `.github/workflows/check-format.yaml`, which pipes the changed C/C++ files through
 clang-format 22 (Homebrew `clang-format@22`). The local VS LLVM clang-format is the same major (22.1.3) and
