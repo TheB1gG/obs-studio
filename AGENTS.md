@@ -124,7 +124,12 @@ tagging.
    - the gate runs on an **idle machine**: the delivery metric counts frames delivered over a run, and CPU
      starvation from a local build, a WSL build, a Defender scan or a large copy looks exactly like a starved
      consumer - two gates on 2026-11-10/11 were scored that way, and one of them caused a 40-minute hunt for a
-     deadlock the code did not contain
+     deadlock the code did not contain. The rule has a useful inverse: a measurement that is **not** a
+     frame count - a timestamp discontinuity printed by a probe, a `were remaining` leak line, a crash
+     report, a static check - is a code property, and `-ForceBusy` is the honest flag for it. It buys the
+     diagnosis while a foreign app (today: a CUDA inference server bursting 100-140% of 16 cores) owns the
+     box, it prints `ACCEPTED ON A LOADED BOX` with the load named, and `scratch/tmp/pg-repeat.ps1` passes
+     it through - so the measurement runs and the verdicts stay unclaimed.
    - one portable smoke launch (section 6) with no crash report written
    - never finish a verification run by killing OBS: `obs_shutdown()` only runs on a real close, and that is
      where the fan-out's outputs, encoders and services die. Ask the app to quit - `test/pre-gate` does that
@@ -273,6 +278,41 @@ encoder's own thread, where the borrowed pointer is safe by contract - and the s
 snapshot, the way `video_headers[]`/`update_video_header_snapshot` already does for video. Rule of thumb:
 snapshot the header where the lifecycle is ordered, consume it where it is not.
 
+## 3d. libobs timestamps: a producer that restarts its own counter must re-anchor it
+
+`packet->dts` and `packet->pts` are **counter values in the encoder's timebase**, and libobs turns them
+into the timeline every output uses (`obs-encoder.c`):
+
+```c
+pkt->dts_usec = encoder->start_ts / 1000 + packet_dts_usec(pkt) - encoder->offset_usec;
+```
+
+with `offset_usec` captured once, from the first packet that encoder produced. Two consumers then treat
+`dts_usec` as monotone: the interleave gate `has_higher_opposing_ts()` (`obs-output.c`, applied in
+`send_interleaved()`) releases a packet of one type only while the **opposing** type's running maximum is
+above it, and the muxers compute durations from it. Both maxima only ever grow.
+
+So any plugin that can **re-create its codec context while the encoder keeps running** - x264/x265
+re-open for a live resize, a live FPS change, the keyframe-grid realignment, or a late consumer's
+keyframe request - restarts the counter (a fresh x264 context emits `pic_out.i_dts = -2` while the
+caller's pts is already at 396) and drags the timeline of **every output attached to that encoder** back
+by the elapsed encoding time. The symptom is not "bad timestamps", it is a starved consumer, and it
+lands on whichever output is unlucky: the audio of every attached output is withheld until real time
+catches up with the frozen maximum (measured `audio in 446 rel 0`), a destination delivers 11 of 301, an
+ingest closes a publisher it never read a publish command from, an MP4 track delivers 1 frame of 283.
+
+Anchor on the **pts** - the caller's `frame->pts`, echoed back, it never jumps - and carry the encoder's
+own reordering lag across the re-open (`dts_lag`/`x264_grid_dts()`). The lag then stays frozen at the
+pre-re-open value for the rest of that encoder's life, because `pts - i_dts` keeps growing once the
+counters are in different universes: that is intended. A constant lag keeps the grid monotone, which is
+all the consumers above require; a lag that tracks a restarted counter is what produced the defect.
+Do **not** add the elapsed counter
+to the new one: `base = dts_max + 1` per re-open re-adds the elapsed time at every re-open and runs the
+timeline progressively ahead of real time (measured: 15 jumps up to 20 s, 63% of packets released, 21
+starved outputs, against 99.6% and 0 for the lag form). A re-open that flushes and re-emits in-flight
+frames keeps the *frame sequence* continuous, which says nothing about the *counter* - the comments in
+that flush code speak of frames, and one of them asserted the stamps were safe. They were not.
+
 ## 4. Launching the local rundir build (Windows, mandatory)
 
 `obs64.exe` resolves its data files **relative to the current working
@@ -385,6 +425,15 @@ Gotchas (all hit during the QSV HEVC ABR tests):
   empty sentinel at `build_x64/rundir/RelWithDebInfo/disable_updater`
   (`BASE_PATH/disable_updater`). The `--disable-updater` flag covers a single launch; the
   sentinel covers all launches without the flag.
+- **Never start a second OBS while a pre-gate attempt is running.** The harness collects a case's log as
+  the newest file in the portable logs dir, so a manual launch (a smoke test, a profile experiment) makes
+  the case that is live at that moment read *that* session's log: on 2026-11-11, `t05` FAILed four checks
+  at once - "4 destination(s) reached 'is live' (the log said 0)", "no streaming or recording session to
+  measure" - because a smoke launch at 19:06:11 landed inside the attempt's `t05` window, and the kept file
+  was the smoke log, `2026-11-11 19-06-11.txt.t05-...log`. It also steals cores from the delivery metric,
+  and the preflight cannot see a launch that starts after its one-second sample. Launch smoke tests only in
+  the retry gap of `scratch/tmp/patient-suite.ps1`, and read the attempt's start time, not the last refusal.
+
 
 ## 7. History is written once: shape the commits at feature completion, before the gate
 
