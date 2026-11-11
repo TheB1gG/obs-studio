@@ -30,6 +30,7 @@
 #include <qt-wrappers.hpp>
 
 #include <QDateTime>
+#include <QTimer>
 
 #define STREAMING_START "==== Streaming Start ==============================================="
 #define STREAMING_STOP "==== Streaming Stop ================================================"
@@ -37,6 +38,12 @@
 /* Q13 (ii): two or more connections dropping inside this window are reported as one correlated failure - the
  * likely cause is then the uplink rather than the destinations, and one line per destination would hide it. */
 static constexpr qint64 failure_collapse_window_ms = 5000;
+
+/* How long a deferred streaming start waits for the previous session to release its encoders, and how often
+ * it asks. The bound is above the 6.2 s a held connection was measured at, so a session that does not come
+ * free is reported rather than retried forever. */
+static constexpr qint64 deferred_stream_start_bound_ms = 8000;
+static constexpr int deferred_stream_start_retry_ms = 100;
 
 void OBSBasic::DisplayStreamStartError()
 {
@@ -224,12 +231,24 @@ void OBSBasic::ReportDestinationFailure(const StreamDestinationRuntime &runtime,
 
 void OBSBasic::StartStreaming()
 {
-	if (outputHandler->StreamingActive()) {
+	if (outputHandler->StreamingActive() || RunningDestinationCount() > 0) {
 		/* The session that is coming down still owns its connections - an extra destination keeps
 		 * StreamingActive() true until its stop signal arrives, which on a quick restart is after this
-		 * click. Say so: without this line a Start that lands in that window looks exactly like an OBS that
-		 * has stopped responding, and the request itself is simply lost. */
-		blog(LOG_INFO, "start streaming refused: the previous session is still winding down");
+		 * click. Say so: without this line a Start that lands in that window looks exactly like an OBS
+		 * that has stopped responding.
+		 *
+		 * The request must not be lost: a session that is coming down defers it, and
+		 * ServeDeferredStreamStart() runs it once the connections are down and their encoders are
+		 * released, which is what pressing Stop and Start in a row means. A session that is up refuses
+		 * the click, because there is nothing to wait for; the two cases say different things, which is
+		 * what makes the window readable in a log. */
+		if (streamingStopping) {
+			pendingStreamStart = true;
+			pendingStreamStartMs = QDateTime::currentMSecsSinceEpoch();
+			blog(LOG_INFO, "start streaming deferred: the previous session is still winding down");
+		} else {
+			blog(LOG_INFO, "start streaming refused: a streaming session is already running");
+		}
 		return;
 	}
 
@@ -659,6 +678,10 @@ void OBSBasic::StreamStopping()
 		sysTrayStream->setText(QTStr("Basic.Main.StoppingStreaming"));
 
 	streamingStopping = true;
+	/* A Stop is the user's last word about the session: a start deferred during an earlier stop must not
+	 * survive it. This signal fires on every way the session comes down - the Stop button, the force stop,
+	 * the ungraceful kill, a quit - so it also covers OBS closing with a deferred request pending. */
+	pendingStreamStart = false;
 	OnEvent(OBS_FRONTEND_EVENT_STREAMING_STOPPING);
 }
 
@@ -840,8 +863,55 @@ void OBSBasic::StreamingStop(int code, QString last_error)
 	// Reset broadcast button state/text
 	if (!broadcastActive)
 		SetBroadcastFlowEnabled(auth && auth->broadcastFlow());
-	if (should_reconnect)
+
+	/* The session's connections are down, so a Start that landed during the wind-down can go ahead -
+	 * through ServeDeferredStreamStart(), not directly: libobs takes the outputs and their encoders down a
+	 * little after the stop signal that reaches this handler, and starting inside that window re-attaches
+	 * an active encoder (the function says what that costs). Queued, so this stop's own bookkeeping
+	 * finishes first. The reconnect branch is the same request for a different reason, and one stop must
+	 * not produce two sessions. */
+	if (pendingStreamStart) {
+		QTimer::singleShot(0, this, [this] { ServeDeferredStreamStart(); });
+	} else if (should_reconnect)
 		QMetaObject::invokeMethod(this, "StartStreaming", Qt::QueuedConnection);
+}
+
+void OBSBasic::ServeDeferredStreamStart()
+{
+	if (!pendingStreamStart)
+		return;
+
+	/* The stop signal that armed this request is emitted before libobs has finished taking the session's
+	 * outputs and encoders down: measured on the multi-destination path, a connection's active flag clears
+	 * about 0.35 s after its own stop signal has been handled in StreamingStop() - the same lag Q13
+	 * documents there. Starting inside that window is not harmless: SetupStreaming() re-attaches the shared
+	 * encoders and every call in that path is refused ("Cannot apply a new video_t object while the encoder
+	 * is active", "tried to set audio encoder 0 on output \"adv_stream\" while the output is still
+	 * active!"), after which the stream output fails to start and the session the user asked for is lost
+	 * with an error dialog. So the request is retried on the UI thread by timer - never by sleeping, the UI
+	 * thread is what the click came from - and given up on with a warning past the bound: a session that
+	 * has not come free in 8 s (above the 6.2 s a held connection was measured at) is something to report,
+	 * not something to keep queueing behind. */
+	const qint64 waited = QDateTime::currentMSecsSinceEpoch() - pendingStreamStartMs;
+
+	if (outputHandler->StreamingActive() || RunningDestinationCount() > 0) {
+		if (waited < deferred_stream_start_bound_ms) {
+			QTimer::singleShot(deferred_stream_start_retry_ms, this,
+					   [this] { ServeDeferredStreamStart(); });
+			return;
+		}
+
+		pendingStreamStart = false;
+		blog(LOG_WARNING,
+		     "the deferred streaming start was dropped: the previous session had not released its encoders within %lld ms",
+		     (long long)deferred_stream_start_bound_ms);
+		return;
+	}
+
+	pendingStreamStart = false;
+	blog(LOG_INFO, "serving the streaming start the winding-down session had deferred, after %lld ms",
+	     (long long)waited);
+	StartStreaming();
 }
 
 void OBSBasic::StreamActionTriggered()

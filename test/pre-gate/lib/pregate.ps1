@@ -175,6 +175,22 @@ function pg_newest_log([string[]]$before) {
 	return $null
 }
 
+# Keep the case's OBS log under scratch/tmp/pregate so it outlives libobs' ten-log rotation, and name it after
+# the case the way the ingest log is (mediamtx-<case>.log): a red's two accounts then sit side by side.
+function pg_save_log {
+	param($Log, [string]$Name)
+
+	if (-not $Log) { return }
+	try {
+		$dest = Join-Path $PG.Work ($Log.Name + '.' + $Name + '.log')
+		Copy-Item -LiteralPath $Log.FullName -Destination $dest -Force
+		pg_say "  note  OBS log kept: $dest"
+	} catch {
+		pg_say "  note  OBS log could not be kept: $($_.Exception.Message)"
+	}
+}
+
+
 function pg_start_obs {
 	param([string]$Profile, [string]$Collection, [string]$Actions, [switch]$Stream, [switch]$Record)
 
@@ -247,12 +263,13 @@ function pg_wait_live {
 				$reader.Dispose(); $stream.Dispose()
 			} catch {}
 			$seen = ([regex]::Matches($text, "is live \(\d+ of \d+ enabled destinations up\)")).Count
-			if ($seen -ge $Want) { return $true }
+			# Answer as one hashtable: pg_say writes to the pipeline, so a note emitted from inside a
+			# function whose result is a boolean arrives as a second value and the caller gets an array.
+			if ($seen -ge $Want) { return @{ok = $true; seen = $seen} }
 		}
 		Start-Sleep -Milliseconds 700
 	}
-	pg_say "  note  after $TimeoutSec s the log showed $seen of $Want destination(s) live"
-	return $false
+	return @{ok = $false; seen = $seen; note = "after $TimeoutSec s the log showed $seen of $Want destination(s) live"}
 }
 
 # Cycles and liveness, for the cases that start and stop sessions repeatedly.
@@ -272,7 +289,7 @@ function pg_check_cycles {
 	param([string]$logText, [int]$streamStarts = 0, [int]$streamStops = 0, [int]$recStarts = 0,
 		[int]$recStops = 0, [double]$latenessTolSec = 3.0, [double]$maxGraphicsStallMs = 2000,
 		[double]$maxStopLatencySec = 0, [double]$fps = 0, [int]$frameAllowFrames = 80,
-		[switch]$AllowRefusedStarts)
+		[switch]$AllowRefusedStarts, [int]$minDeferredStarts = 0)
 
 	$scheduled = @{}
 	foreach ($m in [regex]::Matches($logText, '(\d{2}):(\d{2}):(\d{2})\.(\d{3}):\s*pregate: ''([^'']+)'' scheduled for t\+(\d+) s')) {
@@ -317,7 +334,7 @@ function pg_check_cycles {
 	# Refusals and forced teardowns: the fingerprints of an output or encoder that did not come free.
 	$alarm = @('Failed to start output', 'is already active', 'Tried to start output', 'Tried to stop output',
 		'Invalid call to obs_', 'Forcing shutdown', 'Failed to allocate memory', 'Failed to create',
-		'streaming refused: the previous session', 'recording refused: the previous recording')
+		'start streaming refused', 'start recording refused')
 	$hits = @()
 	foreach ($line in ($logText -split "`r`n")) {
 		foreach ($p in $alarm) {
@@ -332,6 +349,19 @@ function pg_check_cycles {
 		pg_check ($hits.Count -eq 0) "no start was refused and no output was forced down through the cycles ($($hits.Count) such lines)"
 	} else {
 		pg_check ($true) "a refused start is allowed by this case (the cycles it counts are the ones performed)"
+	}
+
+	# A streaming start that lands while the previous session is winding down is *deferred* by the frontend
+	# and served by the stop handler once the last connection is down: the request is honoured, not lost (it
+	# used to be refused and dropped, which is defect 2's restart window). The two log lines are that
+	# contract's observable pair, so a deferral that is never served fails the run.
+	$deferredStarts = ([regex]::Matches($logText, 'start streaming deferred')).Count
+	$servedStarts = ([regex]::Matches($logText, 'serving the streaming start')).Count
+	pg_check ($servedStarts -ge $deferredStarts) (
+		"every streaming start deferred by a winding-down session was served ($deferredStarts deferred, $servedStarts served)")
+	if ($minDeferredStarts -gt 0) {
+		pg_check ($deferredStarts -ge $minDeferredStarts) (
+			"this case entered the wind-down window at least $minDeferredStarts time(s): the log shows $deferredStarts deferral(s)")
 	}
 
 	# How long a stop takes to come home. A fan-out session has to walk every one of its connections down;
@@ -546,7 +576,7 @@ function pg_session {
 		[int]$ExpectLive = 0, [string]$Server = '', [switch]$Reconnect = $true,
 		[int]$LiveTimeoutSec = 30, [int]$ExpectStreamStarts = 0, [int]$ExpectStreamStops = 0,
 		[int]$ExpectRecStarts = 0, [int]$ExpectRecStops = 0, [double]$MaxStopLatencySec = 0,
-		[switch]$AllowRefusedStarts)
+		[switch]$AllowRefusedStarts, [int]$ExpectDeferredStarts = 0)
 
 	pg_prepare_tree
 	if (-not $Server) { $Server = pg_rtmp_url }
@@ -570,7 +600,7 @@ function pg_session {
 	$session = $null
 	if ($Ingest) {
 		pg_say "  ingst starting the ingest ($($PG.MtxExe))"
-		$session = pg_ingest_start
+		$session = pg_ingest_start $Case
 		pg_say "  ingst ingest is up (pid $($session.proc.Id), RTMP on $($session.port)), log $($session.log)"
 	}
 	pg_say "  run   profile=$profile destinations=$Destinations actions='$Actions'"
@@ -583,7 +613,8 @@ function pg_session {
 	# shutdown checks get to look.
 	if ($ExpectLive -gt 0) {
 		$live = pg_wait_live -LogsBefore $logsBefore -Want $ExpectLive -TimeoutSec $LiveTimeoutSec
-		pg_check $live ("the session was really uploading: $ExpectLive destination(s) reached 'is live' within $LiveTimeoutSec s")
+		if ($live.note) { pg_say ("  note  " + $live.note) }
+		pg_check $live.ok ("the session was really uploading: $ExpectLive destination(s) reached 'is live' within $LiveTimeoutSec s")
 	}
 
 	$exited = pg_wait_self_exit $proc $ExitTimeoutSec
@@ -597,6 +628,9 @@ function pg_session {
 	Start-Sleep -Seconds 2
 
 	$log = pg_newest_log $logsBefore
+	# Keep the case's own OBS log. libobs retains only the ten newest logs, so a 19-case suite rotates its
+	# evidence out before it finishes: a delivery red on a case that ran early had no log left to read.
+	pg_save_log -Log $log -Name $Case
 	if (-not $log) { pg_ingest_stop $session; pg_check $false 'OBS wrote a log file'; return }
 	$text = [System.IO.File]::ReadAllText($log.FullName)
 	pg_check_shutdown -logText $text -crashes (pg_new_crashes $crashesBefore) -exitCode $exitCode -selfExited $exited
@@ -605,7 +639,7 @@ function pg_session {
 	# them all run near their time is the liveness proof; the cycle counts only mean something when given.
 	pg_check_cycles -logText $text -streamStarts $ExpectStreamStarts -streamStops $ExpectStreamStops `
 		-recStarts $ExpectRecStarts -recStops $ExpectRecStops -maxStopLatencySec $MaxStopLatencySec `
-		-AllowRefusedStarts:$AllowRefusedStarts
+		-AllowRefusedStarts:$AllowRefusedStarts -minDeferredStarts $ExpectDeferredStarts
 
 	if ($ExpectLive -gt 0) {
 		$live = ([regex]::Matches($text, "is live \(\d+ of \d+ enabled destinations up\)")).Count
@@ -662,7 +696,7 @@ function pg_tcp_open([string]$host_, [int]$port) {
 	}
 }
 
-function pg_ingest_start {
+function pg_ingest_start([string]$Case = 'case') {
 	New-Item -ItemType Directory -Force -Path $PG.Work | Out-Null
 
 	# An orphaned ingest would pass the API check below while refusing the RTMP port, and the case would then
@@ -685,7 +719,13 @@ function pg_ingest_start {
 		}
 	}
 
-	$mtxLog = Join-Path $PG.Work 'mediamtx.log'
+	# One log per case, named after it, and the previous run's copies are swept: the shared file was
+	# overwritten by the next case, so the ingest side of a starved run - the only witness that a
+	# "delivered 13 of 295 frames" red came from the listener closing the publisher (a 10 s write timeout,
+	# which the client then reports as "WriteN, RTMP send error 10053") and not from the code under test -
+	# never outlived the case that produced it. The file of a case is replaced by that case's next run, so
+	# the directory holds one log per case, not a growing history.
+	$mtxLog = Join-Path $PG.Work ('mediamtx-' + $Case + '.log')
 	if (Test-Path $mtxLog) { Remove-Item $mtxLog -Force -ErrorAction SilentlyContinue }
 	$p = Start-Process -FilePath $PG.MtxExe -ArgumentList "`"$conf`"" -WorkingDirectory $PG.Work `
 		-RedirectStandardOutput $mtxLog -RedirectStandardError "$mtxLog.err" -PassThru -WindowStyle Hidden
@@ -808,7 +848,8 @@ function pg_bitrate_case {
 	$proc = pg_start_obs -Profile "pregate-$Case" -Collection "pregate-$Case" `
 		-Actions "quit@$quitAt" -Stream
 	$live = pg_wait_live -LogsBefore $logsBefore -Want $Destinations -TimeoutSec 30
-	pg_check $live "the session was really uploading before anything was sampled ($Destinations destination(s) live)"
+	if ($live.note) { pg_say ("  note  " + $live.note) }
+	pg_check $live.ok "the session was really uploading before anything was sampled ($Destinations destination(s) live)"
 	pg_say "  meas  sampling both paths together for $SampleSeconds s after a ${warmup}s warm-up"
 
 	$names = @('live/pregate-a')
@@ -828,6 +869,7 @@ function pg_bitrate_case {
 	}
 	Start-Sleep -Seconds 2
 	$log = pg_newest_log $logsBefore
+	pg_save_log -Log $log -Name $Case
 	if (-not $log) { pg_ingest_stop $ingest; pg_check $false 'OBS wrote a log file'; return }
 	$text = [System.IO.File]::ReadAllText($log.FullName)
 	pg_check_shutdown -logText $text -crashes (pg_new_crashes $crashesBefore) -exitCode $exitCode -selfExited $exited

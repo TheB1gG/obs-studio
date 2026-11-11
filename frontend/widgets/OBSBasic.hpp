@@ -1430,6 +1430,14 @@ private:
 	std::shared_future<void> setupStreamingGuard;
 	bool streamingStopping = false;
 	bool streamingStarting = false;
+	/* A Start that arrives while the session of the previous Start is still winding down is not a mis-click:
+	 * it is the user asking for the next session, and ServeDeferredStreamStart() runs it once the session
+	 * has really released its encoders. A Stop (of any kind, including the one on quit) clears the request,
+	 * so the user's last word wins. The deadline is when the request was armed, which is what bounds the
+	 * retries of the serve. */
+	bool pendingStreamStart = false;
+	qint64 pendingStreamStartMs = 0;
+	void ServeDeferredStreamStart();
 	// The ungraceful-kill request is kept per destination (StreamDestinationRuntime::killRequested) rather
 	// than as one flag for the whole session: killing one connection must not silence the failure report of
 	// another connection that dies at the same moment.

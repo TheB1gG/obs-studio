@@ -67,12 +67,13 @@ separate cases and only the first one has a live gate.
 | `t13-rapid-stream-cycles` | last session stopped, then quit | four stop/start pairs two seconds apart: every cycle really starts and really stops, nothing is refused |
 | `t14-rapid-recording-cycles` | recorder restarted four times | the muxer and the recording encoders rebuilt under the same rapid cycling |
 | `t15-mixed-stream-and-recording-cycles` | both cycled, three seconds apart | stream and recorder going down and up close to each other on top of a live fan-out |
-| `t16-restart-inside-a-pending-stop` | the same at two seconds, a start landing inside a stop | the wind-down window: stops still come home, a refused start is logged rather than lost, nothing stays attached to a dead output |
+| `t16-restart-inside-a-pending-stop` | the same at two seconds, a start landing inside a stop | the wind-down window: stops still come home, a start landing inside the window is deferred and served (never dropped), nothing stays attached to a dead output |
+| `t17-start-inside-a-wind-down` | a start one second after a stop, so it lands in the wind-down | the deferral contract: the refused request is remembered and served by the stop handler, and the session it asked for comes up |
 | `t07-two-destinations-one-encoder` | two uploading | both keys really reach the ingest, both cost the profile bitrate |
 | `t08-backup-own-bitrate` | two uploading | the destination with an override pays for its own encoder, the other keeps the shared one |
 | `t09-primary-own-bitrate` | two uploading | the shared encoder is not retuned when the primary overrides its bitrate |
 
-The cycle cases (`t13`-`t16`) add three checks on top of the shutdown ones, because a clean exit proves
+The cycle cases (`t13`-`t17`) add three checks on top of the shutdown ones, because a clean exit proves
 nothing about the cycling itself: every scripted action has to be seen running and within three seconds of
 its timer (the actions are timers on the main window, so a late or missing one is the log record of an
 unresponsive UI thread); every start and stop has to appear in the log as a real output transition, which is
@@ -116,6 +117,43 @@ session separator is reported instead of scored as nothing. It exists because a 
 passes - which is exactly what the first version of this accounting did, and OBS keeps only the ten newest
 logs, so the pre-fix evidence that would have caught it rotates out of the rundir within a suite run.
 
+### Reading a red on the delivery check
+
+A delivery red names the worst run, so the first question is whether that run's encoder stopped *producing* or
+stopped *sending*. Two lines in the case's own OBS log decide it. `WriteN, RTMP send error 10053` about ten
+seconds after the previous line means the **listener** closed the publisher - mediamtx writes with a 10 s timeout
+and aborts a publisher it cannot read from, so the client had sent nothing for those ten seconds - and
+`adding N milliseconds of audio buffering` at the far end of the silent window is libobs compensating for an
+audio path that stalled. Both point at a starved connection, which is what the 2026-11-10 22:53 gate's `t15`/`t16`
+red showed (`b delivered 13 of 295 drawn over a 10 s run`), and six runs of the same three cases on the same
+build - and on the batch's base - produced no such line and no red.
+
+The ingest's own account is the witness, and the suite keeps one per case:
+`scratch/tmp/pregate/mediamtx-<case>.log`, the path the transcript prints on the `ingst ingest is up` line.
+`scratch/tmp/log-gaps.ps1 -Gap 8.0` lists, per OBS log, every window of at least 8 s in which nothing was
+logged: a window that ends in `10053` is an aborted publisher, a window that ends on the next scripted action is
+normal - these cases log nothing while a session simply runs.
+
+A third shape, from the `t03` red of the 2026-11-11 03:36 gate: the ingest accepts a connection, that connection
+**never reaches `is publishing`**, and it closes at exactly 10.0 s with `i/o timeout` (mediamtx's `readTimeout`)
+- while the session's other destination publishes normally, and a few seconds later the starved one comes back as
+a *second* connection that does publish. The delivery check scores the dead attempt as the run's loss
+(`b delivered 12 of 304 drawn`), and `mediamtx-t03-*.log` is the witness:
+
+    03:38:12 conn 57946 is publishing to path 'live/pregate-a'
+    03:38:19 conn 57948 closed: read tcp 127.0.0.1:1935->...: i/o timeout     (open 10.0 s, never published)
+    03:38:24 conn 57974 is publishing to path 'live/pregate-b'               (the reconnect)
+
+That is a publisher stalled inside its **header phase**: the RTMP publish command is flushed by the send thread
+only after the header phase has been written, so a codec header that never becomes available leaves a silent
+connection the ingest is obliged to time out. The encoder is not at fault - its `drawn` counter runs at full rate
+- and the case's OBS log shows a reconnect rather than a `10053`, which is how the two shapes are told apart.
+
+The suite keeps each case's OBS log beside the ingest's account: `pg_save_log()` copies it to
+`scratch/tmp/pregate/<logname>.<case>.log`, because libobs keeps only the ten newest logs and a 19-case suite
+rotates the evidence of its early cases out before the run finishes (the `t03` red of the 03:36 gate had no log
+left to read, and the fix had to be argued from the ingest).
+
 ## Environment
 
 Nothing outside the rundir and `scratch/` is touched: the runs use `--portable`, fresh
@@ -139,3 +177,11 @@ Write `cases/tNN-<name>.ps1`: dot-source `../lib/pregate.ps1`, call `pg_kill_str
 `exit $global:PGCODE`. Give a streaming case `-ExpectLive <n>` so it fails loudly when the session
 never went live - a case that streamed into nothing tests nothing. Name the case for the state OBS
 is in when it is asked to quit.
+Assert that the case *entered* the state it exists for: `t17` demands the deferral with
+`-ExpectDeferredStarts 1` as well as its serving, because a case that never reaches its window is a hole that
+reads as a pass. The same discipline applies to the helpers: `pg_say` writes to the pipeline, so a function
+whose result is handed to `pg_check` must emit exactly one object - the hashtable shape `pg_ingest_start` and
+`pg_wait_live` use - and changing such a return shape means sweeping every call site
+(`Select-String -Pattern '<function>' test/pre-gate`), because a missed one ERRORs its cases within seconds:
+the gate run at 21:38 died in `t07`, `t08` and `t09` at 8 s each for exactly that.
+
